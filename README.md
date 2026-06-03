@@ -44,6 +44,8 @@ spore-core's `PetriSandboxProvider` delegates all tool execution to a running Pe
 
 ## How It Works
 
+See [ADR 0001: Petri Architecture](docs/adr/0001-petri-architecture.md) for the initial host/guest responsibility split, platform backend contract, VM lifecycle model, trust boundaries, and spore-core integration point.
+
 ### Host ↔ Guest communication
 
 Tool dispatch crosses the VM boundary over **vsock** (virtual socket — VM-native IPC, low latency, no network stack required). The protocol is newline-delimited JSON:
