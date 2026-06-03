@@ -1,0 +1,7 @@
+[policy]
+network_enabled = false
+allowed_commands = ["cargo", "rustc", "git", "ls", "cat"]
+max_runtime_secs = 60
+max_output_bytes = 1048576
+workspace_path = "/workspace"
+
