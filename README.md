@@ -129,6 +129,8 @@ Petri's isolation guarantee depends on the VM boundary, not convention:
 - **Workspace is the only shared surface** — nothing else crosses the VM boundary except vsock dispatch results.
 - **Guest agent is minimal and auditable** — a small static Rust binary with no runtime dependencies. Read it in an afternoon.
 
+See [Sandbox Safety Model](docs/sandbox-safety-model.md) for the threat model, VM isolation guarantee, shared workspace risks, vsock result surface, network posture, non-goals, and host assumptions.
+
 ---
 
 ## License
