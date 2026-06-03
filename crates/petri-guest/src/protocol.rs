@@ -75,18 +75,50 @@ pub struct ErrorFrame {
 }
 
 impl ResultFrame {
-    pub fn placeholder_success(id: String, elapsed_ms: u128) -> Self {
+    pub fn process(
+        id: String,
+        status: Status,
+        elapsed_ms: u128,
+        stdout: String,
+        stderr: String,
+        exit_code: Option<i32>,
+        output_truncated: bool,
+    ) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
             id: Some(id),
-            status: Status::Success,
+            status,
             elapsed_ms,
-            stdout: Some("petri-guest placeholder response\n".to_string()),
-            stderr: Some(String::new()),
-            exit_code: Some(Some(0)),
-            output_truncated: Some(false),
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            exit_code: Some(exit_code),
+            output_truncated: Some(output_truncated),
             error: None,
         }
+    }
+
+    pub fn timeout(
+        id: String,
+        elapsed_ms: u128,
+        stdout: String,
+        stderr: String,
+        output_truncated: bool,
+    ) -> Self {
+        let mut result = Self::process(
+            id,
+            Status::Timeout,
+            elapsed_ms,
+            stdout,
+            stderr,
+            None,
+            output_truncated,
+        );
+        result.error = Some(ErrorFrame {
+            code: "timeout_exceeded",
+            message: "request exceeded effective timeout".to_string(),
+            details: None,
+        });
+        result
     }
 
     pub fn rejected(
