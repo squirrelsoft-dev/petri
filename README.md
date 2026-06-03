@@ -52,21 +52,26 @@ Tool dispatch crosses the VM boundary over **vsock** (virtual socket — VM-nati
 // Dispatch request
 {
   "id": "abc123",
+  "protocol_version": 1,
   "tool": "bash_command",
-  "args": { "command": "cargo test", "cwd": "/workspace" },
-  "policy": { "network": false, "max_runtime_secs": 30 }
+  "args": { "command": "cargo", "argv": ["test"], "cwd": "/workspace" },
+  "limits": { "timeout_ms": 30000 }
 }
 
 // Result
 {
+  "protocol_version": 1,
   "id": "abc123",
   "status": "success",
   "stdout": "running 42 tests...\ntest result: ok",
   "stderr": "",
   "exit_code": 0,
-  "elapsed_ms": 4821
+  "elapsed_ms": 4821,
+  "output_truncated": false
 }
 ```
+
+See [Vsock Dispatch Protocol](docs/vsock-dispatch-protocol.md) for the canonical request and result schemas, framing rules, error shape, timeout and cancellation behavior, output limits, versioning, and compatibility rules.
 
 ### Workspace sync
 
