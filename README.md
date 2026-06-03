@@ -74,7 +74,7 @@ The host and guest share a `/workspace` directory via **virtio-fs**. Writes insi
 
 ### Policy config
 
-Each VM boots with a policy that governs what it may do:
+Each VM boots with an immutable policy that governs what it may do:
 
 ```toml
 [policy]
@@ -85,7 +85,7 @@ max_output_bytes = 1_048_576
 workspace_path = "/workspace"
 ```
 
-The guest agent enforces policy independently. A request that violates policy is rejected even if the host asks for it.
+The guest agent enforces policy independently. A request that violates policy is rejected even if the host asks for it. See [Immutable Policy Config](docs/policy-config.md) for the canonical TOML schema, examples, and invalid config cases.
 
 ---
 
