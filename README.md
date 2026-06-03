@@ -1,7 +1,3 @@
-Here's the README:
-
----
-
 # Petri
 
 > **An isolated execution environment for autonomous agents.**
