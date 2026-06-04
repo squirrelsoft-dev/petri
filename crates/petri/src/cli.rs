@@ -1,6 +1,8 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::backend::HostBackend;
 use crate::dispatch::{DispatchRequest, RequestLimits};
@@ -37,11 +39,25 @@ pub struct ImageBuildCommand {
     pub disk_size: Option<String>,
     pub skip_guest_build: bool,
     pub guest_binary: Option<PathBuf>,
+    pub builder: ImageBuilder,
+    pub builder_image: Option<PathBuf>,
+    pub builder_source: Option<String>,
+    pub builder_source_sha256: Option<String>,
+    pub builder_source_checksums: Option<String>,
+    pub builder_cache_dir: Option<PathBuf>,
+    pub prepare_builder: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceCommand {
     pub instance_id: InstanceId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageBuilder {
+    Auto,
+    Linux,
+    Vm,
 }
 
 pub fn run(args: impl IntoIterator<Item = OsString>, backend: &impl HostBackend) -> Result<String> {
@@ -57,7 +73,7 @@ pub fn run(args: impl IntoIterator<Item = OsString>, backend: &impl HostBackend)
             let result = backend.dispatch(&command.instance_id, command.request)?;
             serde_json::to_string(&result).map_err(|err| PetriError::Cli(err.to_string()))
         }
-        Command::ImageBuild(command) => run_image_build(command),
+        Command::ImageBuild(command) => run_image_build(command, backend),
         Command::Stop(command) => {
             backend.stop(&command.instance_id)?;
             Ok(format!("stopped instance {}", command.instance_id))
@@ -116,6 +132,13 @@ fn parse_image_build(mut args: impl Iterator<Item = String>) -> Result<Command> 
         disk_size: None,
         skip_guest_build: false,
         guest_binary: None,
+        builder: ImageBuilder::Auto,
+        builder_image: None,
+        builder_source: None,
+        builder_source_sha256: None,
+        builder_source_checksums: None,
+        builder_cache_dir: None,
+        prepare_builder: false,
     };
 
     while let Some(arg) = args.next() {
@@ -130,6 +153,28 @@ fn parse_image_build(mut args: impl Iterator<Item = String>) -> Result<Command> 
             "--guest-binary" => {
                 command.guest_binary = Some(PathBuf::from(next_arg(&mut args, "--guest-binary")?))
             }
+            "--builder" => {
+                command.builder = parse_image_builder(next_arg(&mut args, "--builder")?)?
+            }
+            "--builder-image" => {
+                command.builder_image = Some(PathBuf::from(next_arg(&mut args, "--builder-image")?))
+            }
+            "--builder-source" => {
+                command.builder_source = Some(next_arg(&mut args, "--builder-source")?)
+            }
+            "--builder-source-sha256" => {
+                command.builder_source_sha256 =
+                    Some(next_arg(&mut args, "--builder-source-sha256")?)
+            }
+            "--builder-source-checksums" => {
+                command.builder_source_checksums =
+                    Some(next_arg(&mut args, "--builder-source-checksums")?)
+            }
+            "--builder-cache-dir" => {
+                command.builder_cache_dir =
+                    Some(PathBuf::from(next_arg(&mut args, "--builder-cache-dir")?))
+            }
+            "--prepare-builder" => command.prepare_builder = true,
             "--help" | "-h" => return Err(PetriError::Cli(image_build_usage())),
             _ => {
                 return Err(PetriError::Cli(format!(
@@ -140,6 +185,19 @@ fn parse_image_build(mut args: impl Iterator<Item = String>) -> Result<Command> 
     }
 
     Ok(Command::ImageBuild(command))
+}
+
+fn parse_image_builder(value: String) -> Result<ImageBuilder> {
+    match value.as_str() {
+        "auto" => Ok(ImageBuilder::Auto),
+        "linux" => Ok(ImageBuilder::Linux),
+        "vm" => Ok(ImageBuilder::Vm),
+        _ => Err(PetriError::InvalidArgument {
+            flag: "--builder",
+            value,
+            message: "expected auto, linux, or vm".to_string(),
+        }),
+    }
 }
 
 fn parse_create(mut args: impl Iterator<Item = String>) -> Result<Command> {
@@ -296,34 +354,656 @@ fn parse_u64(value: String, flag: &'static str) -> Result<u64> {
         })
 }
 
-fn run_image_build(command: ImageBuildCommand) -> Result<String> {
+fn run_image_build(command: ImageBuildCommand, backend: &impl HostBackend) -> Result<String> {
+    if command.prepare_builder {
+        return run_prepare_builder(command, backend);
+    }
+
+    match selected_image_builder(command.builder)? {
+        ImageBuilder::Linux => run_linux_image_build(command),
+        ImageBuilder::Vm => run_vm_image_build(command, backend),
+        ImageBuilder::Auto => unreachable!("selected_image_builder resolves auto"),
+    }
+}
+
+const DEFAULT_BUILDER_SOURCE: &str =
+    "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-nocloud-arm64.raw";
+const DEFAULT_BUILDER_SOURCE_CHECKSUMS: &str =
+    "https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS";
+const BUILDER_IMAGE_VERSION: u32 = 1;
+const DEFAULT_BUILDER_DISK_SIZE: u64 = 16 * 1024 * 1024 * 1024;
+const BUILDER_PACKAGES: &[&str] = &[
+    "bash",
+    "ca-certificates",
+    "coreutils",
+    "git",
+    "jq",
+    "libguestfs-tools",
+    "mmdebstrap",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifiedBuilderSource {
+    source: String,
+    path: PathBuf,
+    checksum_algorithm: String,
+    checksum_hex: String,
+}
+
+fn run_prepare_builder(command: ImageBuildCommand, backend: &impl HostBackend) -> Result<String> {
+    let builder_image = command
+        .builder_image
+        .clone()
+        .or_else(|| std::env::var_os("PETRI_BUILDER_IMAGE").map(PathBuf::from))
+        .ok_or_else(|| {
+            PetriError::Cli(
+                "builder preparation requires --builder-image <bundle> or PETRI_BUILDER_IMAGE"
+                    .to_string(),
+            )
+        })?;
+
+    if !cfg!(target_os = "macos") {
+        return Err(PetriError::Cli(
+            "builder preparation currently requires macOS Virtualization.framework".to_string(),
+        ));
+    }
+
+    if command.skip_guest_build || command.guest_binary.is_some() {
+        return Err(PetriError::Cli(
+            "builder preparation builds petri-guest on the host; do not pass --skip-guest-build or --guest-binary".to_string(),
+        ));
+    }
+
+    let repo_root = repo_root()?;
+    let target = command
+        .target
+        .clone()
+        .unwrap_or_else(|| configured_guest_target(command.config.as_deref()));
+    build_host_guest_binary(&repo_root, &target)?;
+
+    let guest_binary = repo_root
+        .join("target")
+        .join(&target)
+        .join("release")
+        .join("petri-guest");
+    let guest_binary_in_vm = guest_path_for_repo_file(&repo_root, &guest_binary)?;
+    let cache_dir = absolute_out_dir(
+        &repo_root,
+        command
+            .builder_cache_dir
+            .clone()
+            .unwrap_or_else(|| repo_root.join("target").join("petri-builder-cache")),
+    );
+    fs::create_dir_all(&cache_dir).map_err(|source| PetriError::Io {
+        path: cache_dir.clone(),
+        source,
+    })?;
+
+    let source = acquire_builder_source(&command, &cache_dir)?;
+    let parent = builder_image
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    fs::create_dir_all(&parent).map_err(|source| PetriError::Io {
+        path: parent.clone(),
+        source,
+    })?;
+
+    let build_id = unique_build_id()?;
+    let staging = parent.join(format!(
+        ".{}-staging-{build_id}",
+        builder_image
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("petri-builder")
+    ));
+    if staging.exists() {
+        fs::remove_dir_all(&staging).map_err(|source| PetriError::Io {
+            path: staging.clone(),
+            source,
+        })?;
+    }
+    fs::create_dir_all(&staging).map_err(|source| PetriError::Io {
+        path: staging.clone(),
+        source,
+    })?;
+
+    let root_img = staging.join("root.img");
+    fs::copy(&source.path, &root_img).map_err(|source| PetriError::Io {
+        path: root_img.clone(),
+        source,
+    })?;
+    let disk_size = command
+        .disk_size
+        .as_deref()
+        .map(parse_disk_size)
+        .transpose()?
+        .unwrap_or(DEFAULT_BUILDER_DISK_SIZE);
+    expand_file(&root_img, disk_size)?;
+
+    let seed_iso = staging.join("seed.iso");
+    write_cloud_init_seed(&staging, &seed_iso, &guest_binary_in_vm, &source, disk_size)?;
+    write_builder_manifest(&staging, true)?;
+
+    let policy = write_builder_policy(&repo_root)?;
+    let instance_id = InstanceId::new(format!("petri-bootstrap-{}", unique_build_id()?))?;
+    let config = InstanceConfig::new(
+        instance_id.clone(),
+        "macos",
+        repo_root.clone(),
+        policy.clone(),
+    )
+    .with_image(staging.clone());
+
+    let _ = backend.teardown(&instance_id);
+    backend.create(config).inspect_err(|_| {
+        eprintln!(
+            "builder provisioning failed while booting {}; staging bundle left at {}",
+            source.source,
+            staging.display()
+        );
+    })?;
+
+    let validation = DispatchRequest::bash_command(
+        "builder-validation",
+        "bash",
+        vec![
+            "-lc".to_string(),
+            "test -f /var/lib/petri-builder/provisioned.json && command -v mmdebstrap jq virt-make-fs git sha256sum"
+                .to_string(),
+        ],
+        PathBuf::from("/workspace"),
+        Some(RequestLimits {
+            timeout_ms: Some(5 * 60 * 1000),
+            max_output_bytes: Some(256 * 1024),
+        }),
+    );
+
+    let result = backend.dispatch(&instance_id, validation);
+    let _ = backend.teardown(&instance_id);
+    let result = result?;
+    if result.status != crate::dispatch::Status::Success || result.exit_code != Some(Some(0)) {
+        return Err(PetriError::Cli(format!(
+            "builder validation failed; staging bundle left at {}\nstdout:\n{}\nstderr:\n{}",
+            staging.display(),
+            result.stdout.unwrap_or_default(),
+            result.stderr.unwrap_or_default()
+        )));
+    }
+
+    fs::remove_file(&seed_iso).map_err(|source| PetriError::Io {
+        path: seed_iso.clone(),
+        source,
+    })?;
+    write_builder_manifest(&staging, false)?;
+    write_builder_build_info(&staging, &source, disk_size)?;
+    write_sha256sums(
+        &staging,
+        &["petri-image.json", "root.img", "build-info.json"],
+    )?;
+    atomic_replace_dir(&staging, &builder_image)?;
+
+    Ok(format!(
+        "builder image prepared: {}",
+        builder_image.display()
+    ))
+}
+
+fn acquire_builder_source(
+    command: &ImageBuildCommand,
+    cache_dir: &Path,
+) -> Result<VerifiedBuilderSource> {
+    let source = command
+        .builder_source
+        .clone()
+        .unwrap_or_else(|| DEFAULT_BUILDER_SOURCE.to_string());
+    if !source.ends_with(".raw") {
+        return Err(PetriError::Cli(format!(
+            "unsupported builder source format for {source}; only .raw is supported"
+        )));
+    }
+
+    let path = if is_url(&source) {
+        let dest = cache_dir.join(url_file_name(&source)?);
+        if !dest.is_file() {
+            run_status(
+                ProcessCommand::new("curl")
+                    .arg("-fL")
+                    .arg("--retry")
+                    .arg("3")
+                    .arg("-o")
+                    .arg(&dest)
+                    .arg(&source),
+                format!("failed to download builder source {source}"),
+            )?;
+        }
+        dest
+    } else {
+        fs::canonicalize(&source).map_err(|source_err| PetriError::Io {
+            path: PathBuf::from(&source),
+            source: source_err,
+        })?
+    };
+
+    let checksum = if let Some(hex) = &command.builder_source_sha256 {
+        ("sha256".to_string(), hex.to_ascii_lowercase())
+    } else {
+        let checksum_source = command
+            .builder_source_checksums
+            .clone()
+            .or_else(|| (source == DEFAULT_BUILDER_SOURCE).then(|| DEFAULT_BUILDER_SOURCE_CHECKSUMS.to_string()))
+            .ok_or_else(|| {
+                PetriError::Cli(
+                    "builder source verification requires --builder-source-sha256 or --builder-source-checksums"
+                        .to_string(),
+                )
+            })?;
+        checksum_from_file_or_url(&checksum_source, cache_dir, &path)?
+    };
+
+    verify_checksum(&path, &checksum.0, &checksum.1)?;
+    Ok(VerifiedBuilderSource {
+        source,
+        path,
+        checksum_algorithm: checksum.0,
+        checksum_hex: checksum.1,
+    })
+}
+
+fn checksum_from_file_or_url(
+    source: &str,
+    cache_dir: &Path,
+    image_path: &Path,
+) -> Result<(String, String)> {
+    let path = if is_url(source) {
+        let dest = cache_dir.join(url_file_name(source)?);
+        if !dest.is_file() {
+            run_status(
+                ProcessCommand::new("curl")
+                    .arg("-fL")
+                    .arg("--retry")
+                    .arg("3")
+                    .arg("-o")
+                    .arg(&dest)
+                    .arg(source),
+                format!("failed to download builder checksum file {source}"),
+            )?;
+        }
+        dest
+    } else {
+        PathBuf::from(source)
+    };
+    let input = fs::read_to_string(&path).map_err(|source| PetriError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let image_name = image_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| PetriError::Cli(format!("invalid image path {}", image_path.display())))?;
+    parse_checksum_file(&input, image_name).ok_or_else(|| {
+        PetriError::Cli(format!(
+            "checksum file {} does not contain an entry for {image_name}",
+            path.display()
+        ))
+    })
+}
+
+fn parse_checksum_file(input: &str, image_name: &str) -> Option<(String, String)> {
+    input.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let hex = fields.next()?.trim_start_matches('\\');
+        let filename = fields.next()?.trim_start_matches('*');
+        if Path::new(filename).file_name()?.to_str()? != image_name {
+            return None;
+        }
+        let algorithm = match hex.len() {
+            64 => "sha256",
+            128 => "sha512",
+            _ => return None,
+        };
+        Some((algorithm.to_string(), hex.to_ascii_lowercase()))
+    })
+}
+
+fn verify_checksum(path: &Path, algorithm: &str, expected: &str) -> Result<()> {
+    let actual = file_checksum(path, algorithm)?;
+    if actual != expected.to_ascii_lowercase() {
+        return Err(PetriError::Cli(format!(
+            "{algorithm} mismatch for {}: expected {expected}, got {actual}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn file_checksum(path: &Path, algorithm: &str) -> Result<String> {
+    let bits = match algorithm {
+        "sha256" => "256",
+        "sha512" => "512",
+        _ => {
+            return Err(PetriError::Cli(format!(
+                "unsupported checksum algorithm {algorithm}"
+            )));
+        }
+    };
+    let output = ProcessCommand::new("shasum")
+        .arg("-a")
+        .arg(bits)
+        .arg(path)
+        .output()
+        .map_err(|source| PetriError::Io {
+            path: PathBuf::from("shasum"),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(PetriError::Cli(format!(
+            "failed to compute {algorithm} for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .map(|value| value.to_ascii_lowercase())
+        .ok_or_else(|| PetriError::Cli(format!("shasum produced no output for {}", path.display())))
+}
+
+fn write_cloud_init_seed(
+    staging: &Path,
+    seed_iso: &Path,
+    guest_binary_in_vm: &Path,
+    source: &VerifiedBuilderSource,
+    disk_size: u64,
+) -> Result<()> {
+    let seed_dir = staging.join("seed");
+    fs::create_dir_all(&seed_dir).map_err(|source| PetriError::Io {
+        path: seed_dir.clone(),
+        source,
+    })?;
+    fs::write(
+        seed_dir.join("meta-data"),
+        "instance-id: petri-builder\nlocal-hostname: petri-builder\n",
+    )
+    .map_err(|source| PetriError::Io {
+        path: seed_dir.join("meta-data"),
+        source,
+    })?;
+    fs::write(
+        seed_dir.join("user-data"),
+        builder_cloud_init(guest_binary_in_vm, source, disk_size),
+    )
+    .map_err(|source| PetriError::Io {
+        path: seed_dir.join("user-data"),
+        source,
+    })?;
+    run_status(
+        ProcessCommand::new("hdiutil")
+            .arg("makehybrid")
+            .arg("-iso")
+            .arg("-joliet")
+            .arg("-default-volume-name")
+            .arg("cidata")
+            .arg("-o")
+            .arg(seed_iso)
+            .arg(&seed_dir),
+        format!(
+            "failed to create cloud-init seed image {}",
+            seed_iso.display()
+        ),
+    )?;
+    fs::remove_dir_all(&seed_dir).map_err(|source| PetriError::Io {
+        path: seed_dir,
+        source,
+    })
+}
+
+fn builder_cloud_init(
+    guest_binary_in_vm: &Path,
+    source: &VerifiedBuilderSource,
+    disk_size: u64,
+) -> String {
+    let packages = BUILDER_PACKAGES
+        .iter()
+        .map(|package| format!("  - {package}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        r#"#cloud-config
+package_update: true
+package_upgrade: false
+packages:
+{packages}
+write_files:
+  - path: /etc/systemd/system/workspace.mount
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Petri workspace virtiofs mount
+      [Mount]
+      What=workspace
+      Where=/workspace
+      Type=virtiofs
+      Options=defaults
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/run-petri.mount
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Petri config virtiofs mount
+      [Mount]
+      What=petri-config
+      Where=/run/petri
+      Type=virtiofs
+      Options=defaults
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/petri-guest.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Petri guest dispatch service
+      After=workspace.mount run-petri.mount network-online.target
+      Requires=workspace.mount run-petri.mount
+      [Service]
+      ExecStart=/usr/local/bin/petri-guest --policy /run/petri/policy.toml --transport vsock --vsock-port 7777
+      Restart=always
+      RestartSec=1
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - [ mkdir, -p, /workspace, /run/petri, /var/lib/petri-builder ]
+  - [ systemctl, daemon-reload ]
+  - [ mount, -t, virtiofs, workspace, /workspace ]
+  - [ install, -m, "0755", "{guest_binary}", /usr/local/bin/petri-guest ]
+  - [ systemctl, enable, workspace.mount, run-petri.mount, petri-guest.service ]
+  - [ systemctl, start, workspace.mount, run-petri.mount, petri-guest.service ]
+  - [ bash, -lc, "command -v mmdebstrap jq virt-make-fs git sha256sum" ]
+  - [ bash, -lc, "printf '%s\n' '{{\"schema\":1,\"source\":\"{source_url}\",\"checksum\":\"{checksum_algorithm}:{checksum_hex}\",\"disk_size_bytes\":{disk_size}}}' > /var/lib/petri-builder/provisioned.json" ]
+"#,
+        packages = packages,
+        guest_binary = guest_binary_in_vm.display(),
+        source_url = source.source.replace('"', "\\\""),
+        checksum_algorithm = source.checksum_algorithm,
+        checksum_hex = source.checksum_hex,
+        disk_size = disk_size,
+    )
+}
+
+fn write_builder_manifest(staging: &Path, include_seed: bool) -> Result<()> {
+    let auxiliary = if include_seed {
+        ",\n  \"ready_timeout_secs\": 1800,\n  \"auxiliary_disks\": [\"seed.iso\"]"
+    } else {
+        ""
+    };
+    fs::write(
+        staging.join("petri-image.json"),
+        format!(
+            "{{\n  \"architecture\": \"aarch64\",\n  \"boot_mode\": \"efi\",\n  \"disk\": \"root.img\",\n  \"dispatch_port\": 7777{auxiliary}\n}}\n"
+        ),
+    )
+    .map_err(|source| PetriError::Io {
+        path: staging.join("petri-image.json"),
+        source,
+    })
+}
+
+fn write_builder_build_info(
+    staging: &Path,
+    source: &VerifiedBuilderSource,
+    disk_size: u64,
+) -> Result<()> {
+    let payload = serde_json::json!({
+        "schema": BUILDER_IMAGE_VERSION,
+        "kind": "petri-builder",
+        "architecture": "aarch64",
+        "boot_mode": "efi",
+        "upstream_source": source.source,
+        "upstream_cache_path": source.path,
+        "upstream_checksum": {
+            "algorithm": source.checksum_algorithm,
+            "hex": source.checksum_hex,
+        },
+        "provisioned_packages": BUILDER_PACKAGES,
+        "disk_size_bytes": disk_size,
+        "petri_git": git_revision_info().unwrap_or_else(|err| serde_json::json!({ "error": err.to_string() })),
+        "build_timestamp_unix_ms": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default(),
+    });
+    let path = staging.join("build-info.json");
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&payload)
+            .map_err(|err| PetriError::Cli(format!("failed to encode build info: {err}")))?,
+    )
+    .map_err(|source| PetriError::Io { path, source })
+}
+
+fn git_revision_info() -> Result<serde_json::Value> {
+    let repo = repo_root()?;
+    let revision = command_stdout(
+        ProcessCommand::new("git")
+            .arg("rev-parse")
+            .arg("HEAD")
+            .current_dir(&repo),
+        "failed to read git revision".to_string(),
+    )?;
+    let status = command_stdout(
+        ProcessCommand::new("git")
+            .arg("status")
+            .arg("--porcelain")
+            .current_dir(&repo),
+        "failed to read git status".to_string(),
+    )?;
+    Ok(serde_json::json!({
+        "revision": revision.trim(),
+        "dirty": !status.trim().is_empty(),
+    }))
+}
+
+fn write_sha256sums(dir: &Path, files: &[&str]) -> Result<()> {
+    let mut output = String::new();
+    for file in files {
+        let checksum = file_checksum(&dir.join(file), "sha256")?;
+        output.push_str(&format!("{checksum}  {file}\n"));
+    }
+    let path = dir.join("SHA256SUMS");
+    fs::write(&path, output).map_err(|source| PetriError::Io { path, source })
+}
+
+fn run_status(command: &mut ProcessCommand, message: String) -> Result<()> {
+    let status = command.status().map_err(|source| PetriError::Io {
+        path: PathBuf::from(command.get_program()),
+        source,
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(PetriError::Cli(format!("{message}: {status}")))
+    }
+}
+
+fn command_stdout(command: &mut ProcessCommand, message: String) -> Result<String> {
+    let output = command.output().map_err(|source| PetriError::Io {
+        path: PathBuf::from(command.get_program()),
+        source,
+    })?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(PetriError::Cli(format!(
+            "{message}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )))
+    }
+}
+
+fn parse_disk_size(value: &str) -> Result<u64> {
+    let value = value.trim();
+    let (digits, multiplier) = match value.as_bytes().last().copied() {
+        Some(b'G') | Some(b'g') => (&value[..value.len() - 1], 1024_u64.pow(3)),
+        Some(b'M') | Some(b'm') => (&value[..value.len() - 1], 1024_u64.pow(2)),
+        Some(b'K') | Some(b'k') => (&value[..value.len() - 1], 1024_u64),
+        _ => (value, 1),
+    };
+    let number = digits
+        .parse::<u64>()
+        .map_err(|_| PetriError::InvalidArgument {
+            flag: "--disk-size",
+            value: value.to_string(),
+            message: "expected bytes or a K, M, or G suffix".to_string(),
+        })?;
+    number
+        .checked_mul(multiplier)
+        .ok_or_else(|| PetriError::InvalidArgument {
+            flag: "--disk-size",
+            value: value.to_string(),
+            message: "size is too large".to_string(),
+        })
+}
+
+fn expand_file(path: &Path, size: u64) -> Result<()> {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|source| PetriError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let current = file.metadata().map_err(|source| PetriError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if current.len() < size {
+        file.set_len(size).map_err(|source| PetriError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+fn is_url(value: &str) -> bool {
+    value.starts_with("https://") || value.starts_with("http://")
+}
+
+fn url_file_name(url: &str) -> Result<String> {
+    url.rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| PetriError::Cli(format!("URL has no file name: {url}")))
+}
+
+fn run_linux_image_build(command: ImageBuildCommand) -> Result<String> {
     let script = image_build_script();
     let mut process = ProcessCommand::new(&script);
 
-    if let Some(config) = command.config {
-        process.arg("--config").arg(config);
-    }
-    if let Some(out_dir) = command.out_dir {
-        process.arg("--out-dir").arg(out_dir);
-    }
-    if let Some(arch) = command.arch {
-        process.arg("--arch").arg(arch);
-    }
-    if let Some(debian_arch) = command.debian_arch {
-        process.arg("--debian-arch").arg(debian_arch);
-    }
-    if let Some(target) = command.target {
-        process.arg("--target").arg(target);
-    }
-    if let Some(disk_size) = command.disk_size {
-        process.arg("--disk-size").arg(disk_size);
-    }
-    if command.skip_guest_build {
-        process.arg("--skip-guest-build");
-    }
-    if let Some(guest_binary) = command.guest_binary {
-        process.arg("--guest-binary").arg(guest_binary);
-    }
+    append_image_build_script_args(&mut process, &command);
 
     let status = process.status().map_err(|source| PetriError::Io {
         path: script.clone(),
@@ -335,6 +1015,393 @@ fn run_image_build(command: ImageBuildCommand) -> Result<String> {
     }
 
     Ok("image build completed".to_string())
+}
+
+fn append_image_build_script_args(process: &mut ProcessCommand, command: &ImageBuildCommand) {
+    if let Some(config) = &command.config {
+        process.arg("--config").arg(config);
+    }
+    if let Some(out_dir) = &command.out_dir {
+        process.arg("--out-dir").arg(out_dir);
+    }
+    if let Some(arch) = &command.arch {
+        process.arg("--arch").arg(arch);
+    }
+    if let Some(debian_arch) = &command.debian_arch {
+        process.arg("--debian-arch").arg(debian_arch);
+    }
+    if let Some(target) = &command.target {
+        process.arg("--target").arg(target);
+    }
+    if let Some(disk_size) = &command.disk_size {
+        process.arg("--disk-size").arg(disk_size);
+    }
+    if command.skip_guest_build {
+        process.arg("--skip-guest-build");
+    }
+    if let Some(guest_binary) = &command.guest_binary {
+        process.arg("--guest-binary").arg(guest_binary);
+    }
+}
+
+fn selected_image_builder(builder: ImageBuilder) -> Result<ImageBuilder> {
+    match builder {
+        ImageBuilder::Auto if cfg!(target_os = "macos") => Ok(ImageBuilder::Vm),
+        ImageBuilder::Auto => Ok(ImageBuilder::Linux),
+        ImageBuilder::Vm if !cfg!(target_os = "macos") => Err(PetriError::Cli(
+            "the VM image builder is currently supported only on macOS".to_string(),
+        )),
+        builder => Ok(builder),
+    }
+}
+
+fn run_vm_image_build(command: ImageBuildCommand, backend: &impl HostBackend) -> Result<String> {
+    if command.skip_guest_build || command.guest_binary.is_some() {
+        return Err(PetriError::Cli(
+            "the VM image builder builds petri-guest on the host and passes it into the builder; do not pass --skip-guest-build or --guest-binary".to_string(),
+        ));
+    }
+
+    let builder_image = command
+        .builder_image
+        .clone()
+        .or_else(|| std::env::var_os("PETRI_BUILDER_IMAGE").map(PathBuf::from))
+        .ok_or_else(|| {
+            PetriError::Cli(
+                "macOS image builds require --builder-image <bundle> or PETRI_BUILDER_IMAGE"
+                    .to_string(),
+            )
+        })?;
+
+    let repo_root = repo_root()?;
+    let target = command
+        .target
+        .clone()
+        .unwrap_or_else(|| configured_guest_target(command.config.as_deref()));
+    build_host_guest_binary(&repo_root, &target)?;
+
+    let guest_binary = repo_root
+        .join("target")
+        .join(&target)
+        .join("release")
+        .join("petri-guest");
+    let guest_binary_in_vm = guest_path_for_repo_file(&repo_root, &guest_binary)?;
+    let out_dir = absolute_out_dir(
+        &repo_root,
+        command
+            .out_dir
+            .clone()
+            .unwrap_or_else(|| repo_root.join("target").join("petri-images").join("base")),
+    );
+    let staged_out_dir = repo_root
+        .join("target")
+        .join("petri-builder-output")
+        .join(unique_build_id()?);
+    let staged_out_dir_in_vm = guest_path_for_repo_file(&repo_root, &staged_out_dir)?;
+
+    if staged_out_dir.exists() {
+        fs::remove_dir_all(&staged_out_dir).map_err(|source| PetriError::Io {
+            path: staged_out_dir.clone(),
+            source,
+        })?;
+    }
+    fs::create_dir_all(&staged_out_dir).map_err(|source| PetriError::Io {
+        path: staged_out_dir.clone(),
+        source,
+    })?;
+
+    let policy = write_builder_policy(&repo_root)?;
+    let instance_id = InstanceId::new(format!("petri-builder-{}", unique_build_id()?))?;
+    let config = InstanceConfig::new(
+        instance_id.clone(),
+        "macos",
+        repo_root.clone(),
+        policy.clone(),
+    )
+    .with_image(builder_image);
+
+    let _ = backend.teardown(&instance_id);
+    backend.create(config)?;
+
+    let dispatch = DispatchRequest::bash_command(
+        "image-build",
+        "bash",
+        vec![
+            "-lc".to_string(),
+            vm_build_script(&command, &staged_out_dir_in_vm, &guest_binary_in_vm)?,
+        ],
+        PathBuf::from("/workspace"),
+        Some(RequestLimits {
+            timeout_ms: Some(3 * 60 * 60 * 1000),
+            max_output_bytes: Some(4 * 1024 * 1024),
+        }),
+    );
+
+    let result = backend.dispatch(&instance_id, dispatch);
+    let _ = backend.teardown(&instance_id);
+    result.and_then(|result| {
+        if result.status == crate::dispatch::Status::Success && result.exit_code == Some(Some(0)) {
+            replace_dir(&staged_out_dir, &out_dir)?;
+            Ok(format!("image build completed: {}", out_dir.display()))
+        } else {
+            Err(PetriError::Cli(format!(
+                "VM image build failed: status={:?} exit_code={:?}\nstdout:\n{}\nstderr:\n{}",
+                result.status,
+                result.exit_code,
+                result.stdout.unwrap_or_default(),
+                result.stderr.unwrap_or_default()
+            )))
+        }
+    })
+}
+
+fn configured_guest_target(config: Option<&Path>) -> String {
+    let config = config
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root_fallback().join("images/base/petri-base-image.toml"));
+
+    fs::read_to_string(config)
+        .ok()
+        .and_then(|input| read_toml_scalar(&input, "target"))
+        .unwrap_or_else(|| "aarch64-unknown-linux-musl".to_string())
+}
+
+fn read_toml_scalar(input: &str, key: &str) -> Option<String> {
+    input.lines().find_map(|line| {
+        let (candidate, value) = line.split_once('=')?;
+        (candidate.trim() == key).then(|| value.trim().trim_matches('"').to_string())
+    })
+}
+
+fn absolute_out_dir(repo_root: &Path, out_dir: PathBuf) -> PathBuf {
+    if out_dir.is_absolute() {
+        out_dir
+    } else {
+        repo_root.join(out_dir)
+    }
+}
+
+fn build_host_guest_binary(repo_root: &Path, target: &str) -> Result<()> {
+    let mut rustup = ProcessCommand::new("rustup");
+    rustup.arg("target").arg("add").arg(target);
+    let status = rustup.status().map_err(|source| PetriError::Io {
+        path: PathBuf::from("rustup"),
+        source,
+    })?;
+    if !status.success() {
+        return Err(PetriError::Cli(format!(
+            "failed to install Rust target {target}: {status}"
+        )));
+    }
+
+    let mut cargo = ProcessCommand::new("cargo");
+    cargo
+        .arg("build")
+        .arg("-p")
+        .arg("petri-guest")
+        .arg("--release")
+        .arg("--target")
+        .arg(target)
+        .current_dir(repo_root);
+    let status = cargo.status().map_err(|source| PetriError::Io {
+        path: PathBuf::from("cargo"),
+        source,
+    })?;
+    if !status.success() {
+        return Err(PetriError::Cli(format!(
+            "failed to build petri-guest for {target}: {status}"
+        )));
+    }
+
+    Ok(())
+}
+
+fn vm_build_script(
+    command: &ImageBuildCommand,
+    staged_out_dir: &Path,
+    guest_binary: &Path,
+) -> Result<String> {
+    let mut args = vec![
+        "scripts/build-base-image.sh".to_string(),
+        "--out-dir".to_string(),
+        shell_quote(staged_out_dir),
+        "--skip-guest-build".to_string(),
+        "--guest-binary".to_string(),
+        shell_quote(guest_binary),
+    ];
+
+    if let Some(config) = &command.config {
+        args.push("--config".to_string());
+        args.push(shell_quote(&host_path_to_guest_repo_path(config)?));
+    }
+    if let Some(arch) = &command.arch {
+        args.push("--arch".to_string());
+        args.push(shell_quote_str(arch));
+    }
+    if let Some(debian_arch) = &command.debian_arch {
+        args.push("--debian-arch".to_string());
+        args.push(shell_quote_str(debian_arch));
+    }
+    if let Some(target) = &command.target {
+        args.push("--target".to_string());
+        args.push(shell_quote_str(target));
+    }
+    if let Some(disk_size) = &command.disk_size {
+        args.push("--disk-size".to_string());
+        args.push(shell_quote_str(disk_size));
+    }
+
+    Ok(format!("set -euo pipefail; {}", args.join(" ")))
+}
+
+fn write_builder_policy(repo_root: &Path) -> Result<PathBuf> {
+    let policy_dir = repo_root.join("target").join("petri-builder");
+    fs::create_dir_all(&policy_dir).map_err(|source| PetriError::Io {
+        path: policy_dir.clone(),
+        source,
+    })?;
+    let policy = policy_dir.join("policy.toml");
+    fs::write(
+        &policy,
+        r#"[policy]
+network_enabled = true
+allowed_commands = ["bash"]
+max_runtime_secs = 10800
+max_output_bytes = 4194304
+workspace_path = "/workspace"
+"#,
+    )
+    .map_err(|source| PetriError::Io {
+        path: policy.clone(),
+        source,
+    })?;
+    Ok(policy)
+}
+
+fn replace_dir(from: &Path, to: &Path) -> Result<()> {
+    if to.exists() {
+        fs::remove_dir_all(to).map_err(|source| PetriError::Io {
+            path: to.to_path_buf(),
+            source,
+        })?;
+    }
+    copy_dir(from, to)
+}
+
+fn atomic_replace_dir(from: &Path, to: &Path) -> Result<()> {
+    let parent = to
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let backup = parent.join(format!(
+        ".{}-old-{}",
+        to.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("petri-builder"),
+        unique_build_id()?
+    ));
+
+    if to.exists() {
+        fs::rename(to, &backup).map_err(|source| PetriError::Io {
+            path: to.to_path_buf(),
+            source,
+        })?;
+    }
+
+    match fs::rename(from, to) {
+        Ok(()) => {
+            if backup.exists() {
+                fs::remove_dir_all(&backup).map_err(|source| PetriError::Io {
+                    path: backup,
+                    source,
+                })?;
+            }
+            Ok(())
+        }
+        Err(source) => {
+            if backup.exists() {
+                let _ = fs::rename(&backup, to);
+            }
+            Err(PetriError::Io {
+                path: from.to_path_buf(),
+                source,
+            })
+        }
+    }
+}
+
+fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to).map_err(|source| PetriError::Io {
+        path: to.to_path_buf(),
+        source,
+    })?;
+    for entry in fs::read_dir(from).map_err(|source| PetriError::Io {
+        path: from.to_path_buf(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| PetriError::Io {
+            path: from.to_path_buf(),
+            source,
+        })?;
+        let source_path = entry.path();
+        let dest_path = to.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_dir(&source_path, &dest_path)?;
+        } else {
+            fs::copy(&source_path, &dest_path).map_err(|source| PetriError::Io {
+                path: dest_path,
+                source,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn host_path_to_guest_repo_path(path: &Path) -> Result<PathBuf> {
+    let repo_root = repo_root()?;
+    let host_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    };
+    guest_path_for_repo_file(&repo_root, &host_path)
+}
+
+fn guest_path_for_repo_file(repo_root: &Path, path: &Path) -> Result<PathBuf> {
+    let relative = path.strip_prefix(repo_root).map_err(|_| {
+        PetriError::Cli(format!(
+            "VM image builder can only use paths under the repo workspace: {}",
+            path.display()
+        ))
+    })?;
+    Ok(PathBuf::from("/workspace").join(relative))
+}
+
+fn repo_root() -> Result<PathBuf> {
+    fs::canonicalize(repo_root_fallback()).map_err(|source| PetriError::Io {
+        path: repo_root_fallback(),
+        source,
+    })
+}
+
+fn repo_root_fallback() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn unique_build_id() -> Result<String> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| PetriError::Cli(format!("system clock is before UNIX epoch: {err}")))?
+        .as_millis();
+    Ok(format!("{millis}"))
+}
+
+fn shell_quote(path: &Path) -> String {
+    shell_quote_str(&path.to_string_lossy())
+}
+
+fn shell_quote_str(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn image_build_script() -> PathBuf {
@@ -382,7 +1449,7 @@ fn image_usage() -> String {
 }
 
 fn image_build_usage() -> String {
-    "usage: petri image build [--config <path>] [--out-dir <path>] [--arch <arch>] [--debian-arch <arch>] [--target <triple>] [--disk-size <size>] [--skip-guest-build --guest-binary <path>]".to_string()
+    "usage: petri image build [--builder auto|linux|vm] [--builder-image <bundle>] [--prepare-builder] [--builder-source <url-or-path>] [--builder-source-sha256 <hex>|--builder-source-checksums <path-or-url>] [--builder-cache-dir <path>] [--config <path>] [--out-dir <path>] [--arch <arch>] [--debian-arch <arch>] [--target <triple>] [--disk-size <size>] [--skip-guest-build --guest-binary <path>]".to_string()
 }
 
 fn stop_usage() -> String {
@@ -509,5 +1576,79 @@ mod tests {
             command.guest_binary,
             Some(PathBuf::from("target/petri-guest"))
         );
+        assert_eq!(command.builder, ImageBuilder::Auto);
+        assert_eq!(command.builder_image, None);
+        assert!(!command.prepare_builder);
+    }
+
+    #[test]
+    fn parses_image_build_builder_options() {
+        let command = parse(args(&[
+            "image",
+            "build",
+            "--builder",
+            "vm",
+            "--builder-image",
+            "target/petri-builder",
+            "--builder-source",
+            "debian.raw",
+            "--builder-source-sha256",
+            "abc123",
+            "--builder-source-checksums",
+            "SHA256SUMS",
+            "--builder-cache-dir",
+            "target/builder-cache",
+            "--prepare-builder",
+        ]))
+        .unwrap();
+
+        let Command::ImageBuild(command) = command else {
+            panic!("expected image build command");
+        };
+
+        assert_eq!(command.builder, ImageBuilder::Vm);
+        assert_eq!(
+            command.builder_image,
+            Some(PathBuf::from("target/petri-builder"))
+        );
+        assert_eq!(command.builder_source.as_deref(), Some("debian.raw"));
+        assert_eq!(command.builder_source_sha256.as_deref(), Some("abc123"));
+        assert_eq!(
+            command.builder_source_checksums.as_deref(),
+            Some("SHA256SUMS")
+        );
+        assert_eq!(
+            command.builder_cache_dir,
+            Some(PathBuf::from("target/builder-cache"))
+        );
+        assert!(command.prepare_builder);
+    }
+
+    #[test]
+    fn parses_checksum_file_entry() {
+        let input = "abc  ignored\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  debian.raw\n";
+
+        assert_eq!(
+            parse_checksum_file(input, "debian.raw"),
+            Some((
+                "sha256".to_string(),
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_disk_size_suffixes() {
+        assert_eq!(parse_disk_size("16G").unwrap(), 16 * 1024 * 1024 * 1024);
+        assert_eq!(parse_disk_size("512M").unwrap(), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn rejects_unknown_image_builder() {
+        let err = parse(args(&["image", "build", "--builder", "container"]))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("expected auto, linux, or vm"));
     }
 }

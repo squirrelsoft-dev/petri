@@ -45,7 +45,7 @@ is not the normal `macos` backend behavior.
 ```text
 petri create --id <id> --workspace <path> --policy <path> [--image <path>] [--backend macos|stub]
 petri dispatch --id <id> --command <name> --cwd <path> [--request-id <id>] [--arg <value>]... [--timeout-ms <ms>] [--max-output-bytes <bytes>]
-petri image build [--config <path>] [--out-dir <path>] [--disk-size <size>]
+petri image build [--builder auto|linux|vm] [--builder-image <bundle>] [--prepare-builder] [--builder-source <url-or-path>] [--config <path>] [--out-dir <path>] [--disk-size <size>]
 petri stop --id <id>
 petri teardown --id <id>
 ```
@@ -73,3 +73,15 @@ target/debug/petri teardown --id dev-1
 `dispatch` currently models protocol version 1 `bash_command` requests. Backend
 implementations are responsible for opening the guest transport, sending the
 NDJSON frame, and returning the structured result.
+
+On macOS, `petri image build` can use a Petri builder VM with
+`--builder vm --builder-image <bundle>` or `PETRI_BUILDER_IMAGE`. The builder VM
+uses a slim Linux image with image-building tools only; the host builds
+`petri-guest` and passes that binary into the guest build script.
+
+Create the reusable builder bundle from a fresh checkout with
+`./scripts/build-image-builder.sh`. It builds `petri-vz`, builds the host CLI,
+then runs `petri image build --prepare-builder --builder-image <bundle>`. The
+default bootstrap source is the official Debian 12 ARM64 NoCloud raw image;
+custom sources must be raw images and must be verified with
+`--builder-source-sha256` or `--builder-source-checksums`.

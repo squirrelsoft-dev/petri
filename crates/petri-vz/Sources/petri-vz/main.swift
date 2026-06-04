@@ -16,9 +16,12 @@ enum HelperState: String {
 struct Args {
     var instanceID: String?
     var controlSocket: String?
+    var bootMode: String = "linux"
     var kernel: String?
     var initrd: String?
     var disk: String?
+    var auxiliaryDisks: [String] = []
+    var efiVariableStore: String?
     var workspace: String?
     var configDir: String?
     var commandLine: String?
@@ -41,12 +44,18 @@ struct Args {
                 args.instanceID = try next(arg)
             case "--control-socket":
                 args.controlSocket = try next(arg)
+            case "--boot-mode":
+                args.bootMode = try next(arg)
             case "--kernel":
                 args.kernel = try next(arg)
             case "--initrd":
                 args.initrd = try next(arg)
             case "--disk":
                 args.disk = try next(arg)
+            case "--auxiliary-disk":
+                args.auxiliaryDisks.append(try next(arg))
+            case "--efi-variable-store":
+                args.efiVariableStore = try next(arg)
             case "--workspace":
                 args.workspace = try next(arg)
             case "--config-dir":
@@ -72,15 +81,34 @@ struct Args {
         for (name, value) in [
             ("--instance-id", instanceID),
             ("--control-socket", controlSocket),
-            ("--kernel", kernel),
             ("--disk", disk),
             ("--workspace", workspace),
             ("--config-dir", configDir),
-            ("--command-line", commandLine),
         ] {
             if value?.isEmpty ?? true {
                 throw HelperError("\(name) is required")
             }
+        }
+
+        switch bootMode {
+        case "linux":
+            for (name, value) in [
+                ("--kernel", kernel),
+                ("--command-line", commandLine),
+            ] {
+                if value?.isEmpty ?? true {
+                    throw HelperError("\(name) is required for linux boot mode")
+                }
+            }
+        case "efi":
+            if efiVariableStore?.isEmpty ?? true {
+                throw HelperError("--efi-variable-store is required for efi boot mode")
+            }
+            if kernel != nil || initrd != nil || commandLine != nil {
+                throw HelperError("efi boot mode does not accept --kernel, --initrd, or --command-line")
+            }
+        default:
+            throw HelperError("invalid --boot-mode '\(bootMode)'")
         }
     }
 }
@@ -329,28 +357,64 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
         configuration.cpuCount = 2
         configuration.memorySize = 1_073_741_824
 
-        let bootLoader = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: args.kernel!))
-        bootLoader.commandLine = args.commandLine!
-        if let initrd = args.initrd {
-            bootLoader.initialRamdiskURL = URL(fileURLWithPath: initrd)
-        }
-        configuration.bootLoader = bootLoader
+        configuration.bootLoader = try bootLoader()
 
-        let diskAttachment = try VZDiskImageStorageDeviceAttachment(
-            url: URL(fileURLWithPath: args.disk!),
-            readOnly: false
-        )
-        configuration.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: diskAttachment)]
+        var storageDevices: [VZStorageDeviceConfiguration] = [
+            VZVirtioBlockDeviceConfiguration(attachment: try diskAttachment(path: args.disk!, readOnly: false))
+        ]
+        for auxiliaryDisk in args.auxiliaryDisks {
+            storageDevices.append(
+                VZVirtioBlockDeviceConfiguration(attachment: try diskAttachment(path: auxiliaryDisk, readOnly: true))
+            )
+        }
+        configuration.storageDevices = storageDevices
         configuration.directorySharingDevices = [
             directoryShare(tag: workspaceTag, path: args.workspace!, readOnly: false),
             directoryShare(tag: configTag, path: args.configDir!, readOnly: true),
         ]
         configuration.socketDevices = [VZVirtioSocketDeviceConfiguration()]
+        configuration.networkDevices = [networkDevice()]
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         configuration.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
 
         try configuration.validate()
         return VZVirtualMachine(configuration: configuration)
+    }
+
+    private func bootLoader() throws -> VZBootLoader {
+        switch args.bootMode {
+        case "linux":
+            let bootLoader = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: args.kernel!))
+            bootLoader.commandLine = args.commandLine!
+            if let initrd = args.initrd {
+                bootLoader.initialRamdiskURL = URL(fileURLWithPath: initrd)
+            }
+            return bootLoader
+        case "efi":
+            let bootLoader = VZEFIBootLoader()
+            let storeURL = URL(fileURLWithPath: args.efiVariableStore!)
+            if FileManager.default.fileExists(atPath: storeURL.path) {
+                bootLoader.variableStore = VZEFIVariableStore(url: storeURL)
+            } else {
+                bootLoader.variableStore = try VZEFIVariableStore(creatingVariableStoreAt: storeURL, options: [])
+            }
+            return bootLoader
+        default:
+            throw HelperError("invalid boot mode '\(args.bootMode)'")
+        }
+    }
+
+    private func diskAttachment(path: String, readOnly: Bool) throws -> VZDiskImageStorageDeviceAttachment {
+        try VZDiskImageStorageDeviceAttachment(
+            url: URL(fileURLWithPath: path),
+            readOnly: readOnly
+        )
+    }
+
+    private func networkDevice() -> VZVirtioNetworkDeviceConfiguration {
+        let config = VZVirtioNetworkDeviceConfiguration()
+        config.attachment = VZNATNetworkDeviceAttachment()
+        return config
     }
 
     private func directoryShare(tag: String, path: String, readOnly: Bool) -> VZVirtioFileSystemDeviceConfiguration {

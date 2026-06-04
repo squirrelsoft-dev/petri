@@ -1,6 +1,9 @@
 # Rust
 /target/
 
+# SwiftPM
+/crates/petri-vz/.build/
+
 # Local environment
 .env
 .env.*

@@ -22,7 +22,7 @@ target/petri-images/base/
 paths relative to the bundle so the whole directory can move as one artifact.
 `build-info.json` is audit metadata and is not required to boot the VM.
 
-## Rebuild
+## Rebuild On Linux
 
 Install the image build prerequisites on a Linux builder:
 
@@ -52,6 +52,80 @@ petri image build \
 The CLI delegates to `scripts/build-base-image.sh`. Set
 `PETRI_IMAGE_BUILD_SCRIPT=/path/to/build-base-image.sh` if the script is
 installed outside the source checkout.
+
+## Rebuild On macOS With A Builder VM
+
+On macOS, `petri image build --builder vm` runs the same Linux image build
+script inside a Petri-managed Linux builder VM. The builder VM is intentionally
+kept slim: it needs Linux image-building tools, `bash`, `git`, and
+`petri-guest`, but it does not need Rust, Cargo, or rustup. The host builds
+`petri-guest` for the configured Linux target and passes that binary into the
+builder script with `--skip-guest-build`.
+
+Provide a prepared builder bundle with `--builder-image` or
+`PETRI_BUILDER_IMAGE`:
+
+```sh
+petri image build \
+  --builder vm \
+  --builder-image target/petri-builder \
+  --out-dir target/petri-images/base-dev
+```
+
+`--builder auto` is the default. It selects the direct Linux path on Linux and
+the VM builder path on macOS. On macOS, auto mode still requires
+`--builder-image` or `PETRI_BUILDER_IMAGE`.
+
+The VM builder mounts the source checkout as `/workspace`, runs
+`scripts/build-base-image.sh` inside the guest, stages the bundle under
+`target/petri-builder-output`, then copies the completed bundle to the requested
+macOS `--out-dir`. Paths passed to `--config` must live under the source
+checkout so they are visible to the builder VM.
+
+Petri tears down the transient builder VM after each build. Staged output is
+left under `target/petri-builder-output` only while the build is running; the
+requested `--out-dir` is replaced after the guest build exits successfully. If
+the guest exits non-zero, Petri reports the dispatch status, exit code, stdout,
+and stderr from the builder command.
+
+Prepare the reusable builder bundle on macOS with:
+
+```sh
+./scripts/build-image-builder.sh
+```
+
+By default Petri downloads the official Debian 12 Bookworm ARM64 NoCloud raw
+image from `cloud.debian.org`, verifies it against the upstream `SHA512SUMS`,
+expands the copy to the requested `--disk-size` or 16 GiB, and provisions it on
+first boot. Downloads are cached in `target/petri-builder-cache`; override the
+source with `--builder-source <url-or-path>` and provide
+`--builder-source-sha256 <hex>` or `--builder-source-checksums <path-or-url>`
+for non-default sources.
+
+The script builds `crates/petri-vz`, builds the `petri` host CLI, sets
+`PETRI_VZ_BIN` to the freshly built helper, then runs
+`petri image build --prepare-builder --builder-image target/petri-builder`.
+
+The prepared builder bundle is a slim EFI-boot image provisioned with:
+
+- `petri-guest` plus the systemd units/mounts needed for Petri dispatch
+- `bash`, `git`, `jq`, `mmdebstrap`, `libguestfs-tools`, and `sha256sum`
+- network access for Debian package downloads during image builds
+
+Petri stages the bundle next to the requested output path, boots and validates
+the staged image, removes the transient NoCloud seed disk, writes
+`build-info.json` and `SHA256SUMS`, then atomically replaces the output bundle.
+On failure, the previous output bundle is left untouched and the staging path is
+reported for debugging.
+
+Do not install Rust tooling into the default builder bundle unless you
+explicitly want in-guest guest-agent compilation. Keeping Rust on the host avoids
+adding multiple gigabytes to the reusable builder image.
+
+The reusable builder image acts as the cache boundary. Debian package caches,
+guest-side tool caches, and any other persistent builder state should live on
+that image; the source checkout mount should be treated as build input/output
+only.
 
 ## Guest Installation
 

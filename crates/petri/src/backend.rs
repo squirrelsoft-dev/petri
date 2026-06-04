@@ -253,24 +253,36 @@ impl MacosBackend {
             .arg(config.id.as_str())
             .arg("--control-socket")
             .arg(&control_socket)
-            .arg("--kernel")
-            .arg(&image.kernel)
+            .arg("--boot-mode")
+            .arg(image.manifest.boot_mode.as_str())
             .arg("--disk")
             .arg(&image.disk)
             .arg("--workspace")
             .arg(&workspace)
             .arg("--config-dir")
             .arg(&config_dir)
-            .arg("--command-line")
-            .arg(&image.manifest.kernel_command_line)
             .arg("--dispatch-port")
             .arg(image.manifest.dispatch_port.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
+        if let Some(kernel) = &image.kernel {
+            command.arg("--kernel").arg(kernel);
+        }
         if let Some(initrd) = &image.initrd {
             command.arg("--initrd").arg(initrd);
+        }
+        if let Some(command_line) = &image.manifest.kernel_command_line {
+            command.arg("--command-line").arg(command_line);
+        }
+        if image.manifest.boot_mode == BootMode::Efi {
+            command
+                .arg("--efi-variable-store")
+                .arg(self.instance_dir(&config.id).join("efi-variable-store"));
+        }
+        for disk in &image.auxiliary_disks {
+            command.arg("--auxiliary-disk").arg(disk);
         }
 
         #[cfg(unix)]
@@ -296,7 +308,11 @@ impl MacosBackend {
         };
         self.write_state(&state)?;
 
-        wait_for_helper_ready(&control_socket, Duration::from_secs(90)).inspect_err(|_| {
+        wait_for_helper_ready(
+            &control_socket,
+            Duration::from_secs(image.manifest.ready_timeout_secs),
+        )
+        .inspect_err(|_| {
             let _ = terminate_process(child.id());
             let _ = self.remove_state(&config.id);
         })?;
@@ -543,9 +559,10 @@ impl MacosVmSpec {
 struct ImageBundle {
     bundle_dir: PathBuf,
     manifest: ImageManifest,
-    kernel: PathBuf,
+    kernel: Option<PathBuf>,
     disk: PathBuf,
     initrd: Option<PathBuf>,
+    auxiliary_disks: Vec<PathBuf>,
 }
 
 impl ImageBundle {
@@ -574,13 +591,25 @@ impl ImageBundle {
         })?;
         manifest.validate()?;
 
-        let kernel = canonical_bundle_file(&bundle_dir, &manifest.kernel, "kernel")?;
+        let kernel = manifest
+            .kernel
+            .as_ref()
+            .map(|path| canonical_bundle_file(&bundle_dir, path, "kernel"))
+            .transpose()?;
         let disk = canonical_bundle_file(&bundle_dir, &manifest.disk, "disk")?;
         let initrd = manifest
             .initrd
             .as_ref()
             .map(|path| canonical_bundle_file(&bundle_dir, path, "initrd"))
             .transpose()?;
+        let auxiliary_disks = manifest
+            .auxiliary_disks
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                canonical_bundle_file(&bundle_dir, path, &format!("auxiliary_disks[{index}]"))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
             bundle_dir,
@@ -588,6 +617,7 @@ impl ImageBundle {
             kernel,
             disk,
             initrd,
+            auxiliary_disks,
         })
     }
 }
@@ -595,13 +625,21 @@ impl ImageBundle {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ImageManifest {
     architecture: String,
-    kernel: PathBuf,
+    #[serde(default)]
+    boot_mode: BootMode,
+    #[serde(default)]
+    kernel: Option<PathBuf>,
     disk: PathBuf,
     #[serde(default)]
     initrd: Option<PathBuf>,
-    kernel_command_line: String,
+    #[serde(default)]
+    kernel_command_line: Option<String>,
     #[serde(default = "default_dispatch_port")]
     dispatch_port: u32,
+    #[serde(default = "default_ready_timeout_secs")]
+    ready_timeout_secs: u64,
+    #[serde(default)]
+    auxiliary_disks: Vec<PathBuf>,
 }
 
 impl ImageManifest {
@@ -611,9 +649,28 @@ impl ImageManifest {
                 "image architecture must be non-empty".to_string(),
             ));
         }
-        if self.kernel.as_os_str().is_empty() {
+        if self.boot_mode == BootMode::Linux {
+            if self
+                .kernel
+                .as_ref()
+                .map(|path| path.as_os_str().is_empty())
+                .unwrap_or(true)
+            {
+                return Err(PetriError::InvalidConfig(
+                    "linux boot image kernel path must be non-empty".to_string(),
+                ));
+            }
+            if self.kernel_command_line.as_deref().unwrap_or("").is_empty() {
+                return Err(PetriError::InvalidConfig(
+                    "linux boot image kernel_command_line must be non-empty".to_string(),
+                ));
+            }
+        } else if self.kernel.is_some()
+            || self.initrd.is_some()
+            || self.kernel_command_line.is_some()
+        {
             return Err(PetriError::InvalidConfig(
-                "image kernel path must be non-empty".to_string(),
+                "efi boot image must not set kernel, initrd, or kernel_command_line".to_string(),
             ));
         }
         if self.disk.as_os_str().is_empty() {
@@ -626,7 +683,34 @@ impl ImageManifest {
                 "image dispatch_port must be positive".to_string(),
             ));
         }
+        if self.ready_timeout_secs == 0 {
+            return Err(PetriError::InvalidConfig(
+                "image ready_timeout_secs must be positive".to_string(),
+            ));
+        }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BootMode {
+    Linux,
+    Efi,
+}
+
+impl Default for BootMode {
+    fn default() -> Self {
+        Self::Linux
+    }
+}
+
+impl BootMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Linux => "linux",
+            Self::Efi => "efi",
+        }
     }
 }
 
@@ -700,6 +784,10 @@ fn default_guest_binary() -> PathBuf {
 
 fn default_dispatch_port() -> u32 {
     DEFAULT_DISPATCH_PORT
+}
+
+fn default_ready_timeout_secs() -> u64 {
+    90
 }
 
 fn loopback_fallback_enabled() -> bool {
@@ -925,9 +1013,49 @@ mod tests {
         assert_eq!(bundle.manifest.dispatch_port, DEFAULT_DISPATCH_PORT);
         assert_eq!(
             bundle.kernel,
-            fs::canonicalize(dir.join("vmlinuz")).unwrap()
+            Some(fs::canonicalize(dir.join("vmlinuz")).unwrap())
         );
         assert_eq!(bundle.disk, fs::canonicalize(dir.join("root.img")).unwrap());
+    }
+
+    #[test]
+    fn image_bundle_loads_efi_manifest() {
+        let dir = temp_dir("image-bundle-efi");
+        fs::write(dir.join("root.img"), b"disk").unwrap();
+        fs::write(
+            dir.join("petri-image.json"),
+            r#"{
+                "architecture": "aarch64",
+                "boot_mode": "efi",
+                "disk": "root.img",
+                "dispatch_port": 7777
+            }"#,
+        )
+        .unwrap();
+
+        let bundle = ImageBundle::load(&dir).unwrap();
+
+        assert_eq!(bundle.manifest.boot_mode, BootMode::Efi);
+        assert_eq!(bundle.kernel, None);
+        assert_eq!(bundle.disk, fs::canonicalize(dir.join("root.img")).unwrap());
+    }
+
+    #[test]
+    fn image_bundle_rejects_efi_manifest_without_disk() {
+        let dir = temp_dir("image-bundle-efi-missing-disk");
+        fs::write(
+            dir.join("petri-image.json"),
+            r#"{
+                "architecture": "aarch64",
+                "boot_mode": "efi",
+                "disk": ""
+            }"#,
+        )
+        .unwrap();
+
+        let err = ImageBundle::load(&dir).unwrap_err().to_string();
+
+        assert!(err.contains("disk path must be non-empty"));
     }
 
     #[test]
@@ -953,11 +1081,14 @@ mod tests {
     fn macos_vm_spec_records_required_mvp_surfaces() {
         let manifest = ImageManifest {
             architecture: "aarch64".to_string(),
-            kernel: PathBuf::from("vmlinuz"),
+            boot_mode: BootMode::Linux,
+            kernel: Some(PathBuf::from("vmlinuz")),
             disk: PathBuf::from("root.img"),
             initrd: None,
-            kernel_command_line: "console=hvc0".to_string(),
+            kernel_command_line: Some("console=hvc0".to_string()),
             dispatch_port: DEFAULT_DISPATCH_PORT,
+            ready_timeout_secs: default_ready_timeout_secs(),
+            auxiliary_disks: Vec::new(),
         };
 
         let spec = MacosVmSpec::from_image(&manifest);
