@@ -19,6 +19,10 @@ pub enum PetriError {
         backend: String,
         operation: &'static str,
     },
+    Backend {
+        backend: String,
+        message: String,
+    },
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -42,6 +46,7 @@ impl std::fmt::Display for PetriError {
             Self::BackendUnavailable { backend, operation } => {
                 write!(f, "backend '{backend}' does not implement {operation} yet")
             }
+            Self::Backend { backend, message } => write!(f, "backend '{backend}': {message}"),
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
         }
     }

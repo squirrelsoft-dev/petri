@@ -1,9 +1,9 @@
 use std::process::ExitCode;
 
-use petri::StubBackend;
+use petri::PetriBackend;
 
 fn main() -> ExitCode {
-    let backend = StubBackend;
+    let backend = PetriBackend::default();
     match petri::cli::run(std::env::args_os().skip(1), &backend) {
         Ok(output) => {
             println!("{output}");

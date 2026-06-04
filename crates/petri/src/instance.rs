@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{PetriError, Result};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct InstanceId(String);
 
 impl InstanceId {

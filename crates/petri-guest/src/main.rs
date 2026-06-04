@@ -54,7 +54,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Transport::Vsock { port } => {
             let listener = VsockListenerConfig { port };
-            listener.bind()?;
+            eprintln!("petri-guest: listening on vsock port {port}");
+            #[cfg(target_os = "linux")]
+            {
+                let listener = listener.bind()?;
+                for stream in listener.incoming() {
+                    let stream = stream?;
+                    let reader = BufReader::new(stream.try_clone()?);
+                    let writer = BufWriter::new(stream);
+                    server::serve_lines(reader, writer, &policy)?;
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                listener.bind()?;
+            }
         }
     }
 

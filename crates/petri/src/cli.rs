@@ -77,7 +77,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
 
 fn parse_create(mut args: impl Iterator<Item = String>) -> Result<Command> {
     let mut id = None;
-    let mut backend = "stub".to_string();
+    let mut backend = "macos".to_string();
     let mut image = None;
     let mut workspace = None;
     let mut policy = None;
@@ -248,7 +248,7 @@ pub fn usage() -> String {
 }
 
 fn create_usage() -> String {
-    "usage: petri create --id <id> --workspace <path> --policy <path> [--image <path>] [--backend stub]".to_string()
+    "usage: petri create --id <id> --workspace <path> --policy <path> [--image <path>] [--backend macos|stub]".to_string()
 }
 
 fn dispatch_usage() -> String {
