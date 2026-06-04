@@ -114,6 +114,10 @@ The guest agent enforces policy independently. A request that violates policy is
 
 **Base VM images** — pre-built images with `petri-guest` installed, ready to layer a workspace on top. Build tooling provided for teams that want custom or auditable images.
 
+See [Base VM Images](docs/base-vm-images.md) for the reproducible image build
+pipeline, `petri image build`, bundle layout, guest installation details, and
+audit metadata.
+
 ---
 
 ## Status

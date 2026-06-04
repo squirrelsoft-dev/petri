@@ -1,0 +1,28 @@
+[image]
+name = "petri-base"
+architecture = "aarch64"
+distro = "debian"
+debian_arch = "arm64"
+suite = "bookworm"
+mirror = "https://snapshot.debian.org/archive/debian/20240601T000000Z"
+security_mirror = "https://snapshot.debian.org/archive/debian-security/20240601T000000Z"
+disk_size = "2G"
+
+[guest]
+crate = "petri-guest"
+target = "aarch64-unknown-linux-musl"
+install_path = "/usr/local/bin/petri-guest"
+policy_path = "/run/petri/policy.toml"
+workspace_path = "/workspace"
+dispatch_port = 7777
+
+[packages]
+base = [
+  "ca-certificates",
+  "linux-image-arm64",
+  "systemd",
+  "systemd-sysv",
+  "udev",
+  "mount",
+  "procps",
+]

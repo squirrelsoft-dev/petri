@@ -32,7 +32,9 @@ disk image:
 ```
 
 The `initrd` field is optional. Image build reproducibility is owned by the
-base image pipeline; this backend consumes a compatible bundle.
+base image pipeline; this backend consumes a compatible bundle. See
+[Base VM Images](../../docs/base-vm-images.md) for rebuild commands, artifact
+layout, and audit metadata.
 
 For local development only, `PETRI_MACOS_BACKEND_FALLBACK=loopback` keeps the
 previous non-VM path that starts `petri-guest` as a host process. That fallback
@@ -43,6 +45,7 @@ is not the normal `macos` backend behavior.
 ```text
 petri create --id <id> --workspace <path> --policy <path> [--image <path>] [--backend macos|stub]
 petri dispatch --id <id> --command <name> --cwd <path> [--request-id <id>] [--arg <value>]... [--timeout-ms <ms>] [--max-output-bytes <bytes>]
+petri image build [--config <path>] [--out-dir <path>] [--disk-size <size>]
 petri stop --id <id>
 petri teardown --id <id>
 ```

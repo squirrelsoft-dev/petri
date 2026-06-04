@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 
 use crate::backend::HostBackend;
 use crate::dispatch::{DispatchRequest, RequestLimits};
@@ -10,6 +11,7 @@ use crate::instance::{InstanceConfig, InstanceId};
 pub enum Command {
     Create(CreateCommand),
     Dispatch(DispatchCommand),
+    ImageBuild(ImageBuildCommand),
     Stop(InstanceCommand),
     Teardown(InstanceCommand),
 }
@@ -23,6 +25,18 @@ pub struct CreateCommand {
 pub struct DispatchCommand {
     pub instance_id: InstanceId,
     pub request: DispatchRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageBuildCommand {
+    pub config: Option<PathBuf>,
+    pub out_dir: Option<PathBuf>,
+    pub arch: Option<String>,
+    pub debian_arch: Option<String>,
+    pub target: Option<String>,
+    pub disk_size: Option<String>,
+    pub skip_guest_build: bool,
+    pub guest_binary: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +57,7 @@ pub fn run(args: impl IntoIterator<Item = OsString>, backend: &impl HostBackend)
             let result = backend.dispatch(&command.instance_id, command.request)?;
             serde_json::to_string(&result).map_err(|err| PetriError::Cli(err.to_string()))
         }
+        Command::ImageBuild(command) => run_image_build(command),
         Command::Stop(command) => {
             backend.stop(&command.instance_id)?;
             Ok(format!("stopped instance {}", command.instance_id))
@@ -65,6 +80,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
     match command.as_str() {
         "create" => parse_create(args),
         "dispatch" => parse_dispatch(args),
+        "image" => parse_image(args),
         "stop" => parse_instance_command(args, CommandKind::Stop),
         "teardown" => parse_instance_command(args, CommandKind::Teardown),
         "--help" | "-h" | "help" => Err(PetriError::Cli(usage())),
@@ -73,6 +89,57 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
             usage()
         ))),
     }
+}
+
+fn parse_image(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let Some(subcommand) = args.next() else {
+        return Err(PetriError::Cli(image_usage()));
+    };
+
+    match subcommand.as_str() {
+        "build" => parse_image_build(args),
+        "--help" | "-h" | "help" => Err(PetriError::Cli(image_usage())),
+        _ => Err(PetriError::Cli(format!(
+            "unknown image command '{subcommand}'\n{}",
+            image_usage()
+        ))),
+    }
+}
+
+fn parse_image_build(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let mut command = ImageBuildCommand {
+        config: None,
+        out_dir: None,
+        arch: None,
+        debian_arch: None,
+        target: None,
+        disk_size: None,
+        skip_guest_build: false,
+        guest_binary: None,
+    };
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" => command.config = Some(PathBuf::from(next_arg(&mut args, "--config")?)),
+            "--out-dir" => command.out_dir = Some(PathBuf::from(next_arg(&mut args, "--out-dir")?)),
+            "--arch" => command.arch = Some(next_arg(&mut args, "--arch")?),
+            "--debian-arch" => command.debian_arch = Some(next_arg(&mut args, "--debian-arch")?),
+            "--target" => command.target = Some(next_arg(&mut args, "--target")?),
+            "--disk-size" => command.disk_size = Some(next_arg(&mut args, "--disk-size")?),
+            "--skip-guest-build" => command.skip_guest_build = true,
+            "--guest-binary" => {
+                command.guest_binary = Some(PathBuf::from(next_arg(&mut args, "--guest-binary")?))
+            }
+            "--help" | "-h" => return Err(PetriError::Cli(image_build_usage())),
+            _ => {
+                return Err(PetriError::Cli(format!(
+                    "unknown image build argument '{arg}'"
+                )));
+            }
+        }
+    }
+
+    Ok(Command::ImageBuild(command))
 }
 
 fn parse_create(mut args: impl Iterator<Item = String>) -> Result<Command> {
@@ -229,6 +296,55 @@ fn parse_u64(value: String, flag: &'static str) -> Result<u64> {
         })
 }
 
+fn run_image_build(command: ImageBuildCommand) -> Result<String> {
+    let script = image_build_script();
+    let mut process = ProcessCommand::new(&script);
+
+    if let Some(config) = command.config {
+        process.arg("--config").arg(config);
+    }
+    if let Some(out_dir) = command.out_dir {
+        process.arg("--out-dir").arg(out_dir);
+    }
+    if let Some(arch) = command.arch {
+        process.arg("--arch").arg(arch);
+    }
+    if let Some(debian_arch) = command.debian_arch {
+        process.arg("--debian-arch").arg(debian_arch);
+    }
+    if let Some(target) = command.target {
+        process.arg("--target").arg(target);
+    }
+    if let Some(disk_size) = command.disk_size {
+        process.arg("--disk-size").arg(disk_size);
+    }
+    if command.skip_guest_build {
+        process.arg("--skip-guest-build");
+    }
+    if let Some(guest_binary) = command.guest_binary {
+        process.arg("--guest-binary").arg(guest_binary);
+    }
+
+    let status = process.status().map_err(|source| PetriError::Io {
+        path: script.clone(),
+        source,
+    })?;
+
+    if !status.success() {
+        return Err(PetriError::Cli(format!("image build failed with {status}")));
+    }
+
+    Ok("image build completed".to_string())
+}
+
+fn image_build_script() -> PathBuf {
+    std::env::var_os("PETRI_IMAGE_BUILD_SCRIPT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/build-base-image.sh")
+        })
+}
+
 pub fn usage() -> String {
     [
         "usage: petri <command> [options]",
@@ -236,11 +352,13 @@ pub fn usage() -> String {
         "commands:",
         "  create    create a configured Petri instance",
         "  dispatch  send a protocol v1 dispatch request",
+        "  image     build and inspect Petri VM images",
         "  stop      stop a running instance",
         "  teardown  remove instance runtime state",
         "",
         &create_usage(),
         &dispatch_usage(),
+        &image_usage(),
         &stop_usage(),
         &teardown_usage(),
     ]
@@ -253,6 +371,18 @@ fn create_usage() -> String {
 
 fn dispatch_usage() -> String {
     "usage: petri dispatch --id <id> --command <name> --cwd <path> [--request-id <id>] [--arg <value>]... [--timeout-ms <ms>] [--max-output-bytes <bytes>]".to_string()
+}
+
+fn image_usage() -> String {
+    format!(
+        "usage: petri image <command> [options]\n\ncommands:\n  build  {}\n\n{}",
+        image_build_usage(),
+        "Set PETRI_IMAGE_BUILD_SCRIPT to override the bundled builder path."
+    )
+}
+
+fn image_build_usage() -> String {
+    "usage: petri image build [--config <path>] [--out-dir <path>] [--arch <arch>] [--debian-arch <arch>] [--target <triple>] [--disk-size <size>] [--skip-guest-build --guest-binary <path>]".to_string()
 }
 
 fn stop_usage() -> String {
@@ -342,5 +472,42 @@ mod tests {
         .to_string();
 
         assert!(err.contains("only bash_command"));
+    }
+
+    #[test]
+    fn parses_image_build_command() {
+        let command = parse(args(&[
+            "image",
+            "build",
+            "--config",
+            "images/base/petri-base-image.toml",
+            "--out-dir",
+            "target/petri-images/custom",
+            "--disk-size",
+            "4G",
+            "--skip-guest-build",
+            "--guest-binary",
+            "target/petri-guest",
+        ]))
+        .unwrap();
+
+        let Command::ImageBuild(command) = command else {
+            panic!("expected image build command");
+        };
+
+        assert_eq!(
+            command.config,
+            Some(PathBuf::from("images/base/petri-base-image.toml"))
+        );
+        assert_eq!(
+            command.out_dir,
+            Some(PathBuf::from("target/petri-images/custom"))
+        );
+        assert_eq!(command.disk_size.as_deref(), Some("4G"));
+        assert!(command.skip_guest_build);
+        assert_eq!(
+            command.guest_binary,
+            Some(PathBuf::from("target/petri-guest"))
+        );
     }
 }
