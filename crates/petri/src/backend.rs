@@ -289,6 +289,8 @@ impl MacosBackend {
             .arg(&config_dir)
             .arg("--dispatch-port")
             .arg(image.manifest.dispatch_port.to_string())
+            .arg("--guest-ready-timeout-secs")
+            .arg(image.manifest.ready_timeout_secs.to_string())
             .arg("--console-log")
             .arg(&guest_console_path)
             .stdin(Stdio::null())

@@ -32,6 +32,7 @@ struct Args {
     var consoleLog: String?
     var commandLine: String?
     var dispatchPort: UInt32 = dispatchPortDefault
+    var guestReadyTimeoutSecs: TimeInterval = 60
 
     static func parse(_ values: ArraySlice<String>) throws -> Args {
         var args = Args()
@@ -76,6 +77,12 @@ struct Args {
                     throw HelperError("invalid --dispatch-port '\(value)'")
                 }
                 args.dispatchPort = port
+            case "--guest-ready-timeout-secs":
+                let value = try next(arg)
+                guard let timeout = TimeInterval(value), timeout > 0 else {
+                    throw HelperError("invalid --guest-ready-timeout-secs '\(value)'")
+                }
+                args.guestReadyTimeoutSecs = timeout
             default:
                 throw HelperError("unknown argument '\(arg)'")
             }
@@ -458,7 +465,7 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
     }
 
     private func waitForGuestVsock() throws {
-        let deadline = Date().addingTimeInterval(60)
+        let deadline = Date().addingTimeInterval(args.guestReadyTimeoutSecs)
         var lastError: Error?
 
         while Date() < deadline {
