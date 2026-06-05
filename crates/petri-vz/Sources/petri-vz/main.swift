@@ -258,26 +258,25 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
                 vm.delegate = self
 
                 log("starting VM")
-                let semaphore = DispatchSemaphore(value: 0)
-                var startError: Error?
                 vm.start { result in
                     if case .failure(let error) = result {
-                        startError = error
+                        log("failed to start VM: \(error)")
+                        self.fail("failed to start VM: \(error)")
+                        return
                     }
-                    semaphore.signal()
-                }
-                semaphore.wait()
 
-                if let startError {
-                    log("failed to start VM: \(startError)")
-                    self.fail("failed to start VM: \(startError)")
-                    return
+                    log("VM started; waiting for guest vsock port \(self.args.dispatchPort)")
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        do {
+                            try self.waitForGuestVsock()
+                            log("guest vsock port is ready")
+                            self.setState(.ready)
+                        } catch {
+                            log("guest vsock wait failed: \(error)")
+                            self.fail("\(error)")
+                        }
+                    }
                 }
-
-                log("VM started; waiting for guest vsock port \(self.args.dispatchPort)")
-                try self.waitForGuestVsock()
-                log("guest vsock port is ready")
-                self.setState(.ready)
             } catch {
                 log("VM startup failed: \(error)")
                 self.fail("\(error)")
