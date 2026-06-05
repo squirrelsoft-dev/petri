@@ -6,6 +6,11 @@ let dispatchPortDefault: UInt32 = 7777
 let workspaceTag = "workspace"
 let configTag = "petri-config"
 
+func log(_ message: String) {
+    fputs("petri-vz: \(message)\n", stderr)
+    fflush(stderr)
+}
+
 enum HelperState: String {
     case starting
     case ready
@@ -247,10 +252,12 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
     func start() {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
+                log("creating VM configuration")
                 let vm = try self.createVirtualMachine()
                 self.virtualMachine = vm
                 vm.delegate = self
 
+                log("starting VM")
                 let semaphore = DispatchSemaphore(value: 0)
                 var startError: Error?
                 vm.start { result in
@@ -262,13 +269,17 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
                 semaphore.wait()
 
                 if let startError {
+                    log("failed to start VM: \(startError)")
                     self.fail("failed to start VM: \(startError)")
                     return
                 }
 
+                log("VM started; waiting for guest vsock port \(self.args.dispatchPort)")
                 try self.waitForGuestVsock()
+                log("guest vsock port is ready")
                 self.setState(.ready)
             } catch {
+                log("VM startup failed: \(error)")
                 self.fail("\(error)")
             }
         }
@@ -349,6 +360,7 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
     }
 
     private func fail(_ message: String) {
+        log("failed: \(message)")
         lock.lock()
         state = .failed
         failureMessage = message
@@ -528,6 +540,7 @@ final class ControlServer {
             throw POSIXError("listen")
         }
 
+        log("control socket listening at \(socketPath)")
         while true {
             let client = accept(fd, nil, nil)
             if client < 0 {
@@ -638,7 +651,9 @@ func readLine(fd: Int32) throws -> Data {
 }
 
 do {
+    setbuf(stderr, nil)
     let args = try Args.parse(CommandLine.arguments.dropFirst())
+    log("starting helper for instance \(args.instanceID ?? "<unknown>")")
     let controller = VMController(args: args)
     let server = ControlServer(socketPath: args.controlSocket!, controller: controller)
     controller.start()

@@ -316,7 +316,7 @@ impl MacosBackend {
         #[cfg(unix)]
         command.process_group(0);
 
-        let child = command.spawn().map_err(|source| PetriError::Io {
+        let mut child = command.spawn().map_err(|source| PetriError::Io {
             path: helper_binary.clone(),
             source,
         })?;
@@ -339,6 +339,7 @@ impl MacosBackend {
         wait_for_helper_ready(
             &control_socket,
             Duration::from_secs(image.manifest.ready_timeout_secs),
+            &mut child,
         )
         .inspect_err(|_| {
             let _ = terminate_process(child.id());
@@ -893,9 +894,22 @@ fn required_dispatch_addr(state: &RuntimeState) -> Result<&str> {
         .ok_or_else(|| backend_error("runtime state is missing dispatch address".to_string()))
 }
 
-fn wait_for_helper_ready(control_socket: &Path, timeout: Duration) -> Result<()> {
+fn wait_for_helper_ready(
+    control_socket: &Path,
+    timeout: Duration,
+    child: &mut std::process::Child,
+) -> Result<()> {
     let started = Instant::now();
     loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| backend_error(format!("failed to poll helper process: {source}")))?
+        {
+            return Err(backend_error(format!(
+                "helper process exited before VM became ready: {status}"
+            )));
+        }
+
         match send_helper_request::<HelperResponse>(control_socket, &HelperRequest::Status) {
             Ok(HelperResponse::Ready) => return Ok(()),
             Ok(HelperResponse::Error { message }) => return Err(backend_error(message)),
