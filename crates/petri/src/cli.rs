@@ -984,7 +984,7 @@ fn parse_hdiutil_attach(output: &str) -> Result<HdiutilAttach> {
         if !device.starts_with("/dev/disk") {
             continue;
         }
-        if !device.contains('s') {
+        if is_hdiutil_whole_disk(device) {
             disk = Some((*device).to_string());
         }
         if fields.iter().any(|field| *field == "EFI") {
@@ -1004,6 +1004,13 @@ fn parse_hdiutil_attach(output: &str) -> Result<HdiutilAttach> {
             ))
         })?,
     })
+}
+
+fn is_hdiutil_whole_disk(device: &str) -> bool {
+    let Some(suffix) = device.strip_prefix("/dev/disk") else {
+        return false;
+    };
+    !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn parse_grub_root_uuid(input: &str) -> Result<String> {
@@ -1850,6 +1857,16 @@ mod tests {
     fn parses_disk_size_suffixes() {
         assert_eq!(parse_disk_size("16G").unwrap(), 16 * 1024 * 1024 * 1024);
         assert_eq!(parse_disk_size("512M").unwrap(), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parses_hdiutil_attach_output() {
+        let output = "/dev/disk8              GUID_partition_scheme\n/dev/disk8s1            B921B045-1DF0-41C3-AF44-4C6F280\n/dev/disk8s15           EFI\n";
+
+        let attach = parse_hdiutil_attach(output).unwrap();
+
+        assert_eq!(attach.disk, "/dev/disk8");
+        assert_eq!(attach.efi_partition, "/dev/disk8s15");
     }
 
     #[test]
