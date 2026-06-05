@@ -21,7 +21,7 @@ Defaults:
 
 - `--prepare-builder` writes a builder bundle to `--builder-image`, or to
   `$PETRI_BUILDER_IMAGE` when the flag is omitted.
-- The bootstrap source is an official Debian ARM64 RAW cloud/nocloud image.
+- The bootstrap source is an official Debian ARM64 RAW genericcloud image.
 - The default builder image does not install Rust, Cargo, or rustup.
 - The host remains responsible for building `petri-guest`; the builder VM only
   runs Linux image-building tools.

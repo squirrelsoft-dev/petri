@@ -367,9 +367,9 @@ fn run_image_build(command: ImageBuildCommand, backend: &impl HostBackend) -> Re
 }
 
 const DEFAULT_BUILDER_SOURCE: &str =
-    "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-nocloud-arm64.raw";
+    "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.raw";
 const DEFAULT_BUILDER_SOURCE_CHECKSUMS: &str =
-    "https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS";
+    "https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS";
 const BUILDER_IMAGE_VERSION: u32 = 1;
 const DEFAULT_BUILDER_DISK_SIZE: u64 = 16 * 1024 * 1024 * 1024;
 const BUILDER_PACKAGES: &[&str] = &[
