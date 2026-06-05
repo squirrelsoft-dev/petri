@@ -864,6 +864,18 @@ fn canonical_bundle_file(bundle_dir: &Path, relative: &Path, name: &str) -> Resu
 }
 
 fn resolve_helper_binary(configured: &Path) -> Result<PathBuf> {
+    if configured.components().count() <= 1 && !configured.is_absolute() {
+        let repo_helper = repo_root_fallback()
+            .join("crates")
+            .join("petri-vz")
+            .join(".build")
+            .join("debug")
+            .join(configured);
+        if repo_helper.is_file() {
+            return Ok(repo_helper);
+        }
+    }
+
     resolve_sibling_binary(configured)
 }
 
@@ -886,6 +898,10 @@ fn resolve_sibling_binary(configured: &Path) -> Result<PathBuf> {
     }
 
     Ok(configured.to_path_buf())
+}
+
+fn repo_root_fallback() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 fn required_control_socket(state: &RuntimeState) -> Result<PathBuf> {
