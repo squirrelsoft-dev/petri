@@ -123,9 +123,12 @@ need_tool codesign
 need_tool curl
 need_tool git
 need_tool hdiutil
+need_tool mount
 need_tool rustup
 need_tool shasum
+need_tool strings
 need_tool swift
+need_tool umount
 
 cd "$repo_root"
 

@@ -483,6 +483,7 @@ fn run_prepare_builder(command: ImageBuildCommand, backend: &impl HostBackend) -
         .transpose()?
         .unwrap_or(DEFAULT_BUILDER_DISK_SIZE);
     expand_file(&root_img, disk_size)?;
+    configure_builder_efi_console(&root_img)?;
 
     let seed_iso = staging.join("seed.iso");
     write_cloud_init_seed(
@@ -864,6 +865,188 @@ fn write_builder_manifest(staging: &Path, include_seed: bool) -> Result<()> {
     .map_err(|source| PetriError::Io {
         path: staging.join("petri-image.json"),
         source,
+    })
+}
+
+fn configure_builder_efi_console(root_img: &Path) -> Result<()> {
+    let Some(parent) = root_img.parent() else {
+        return Err(PetriError::Cli(format!(
+            "builder root image has no parent directory: {}",
+            root_img.display()
+        )));
+    };
+    let kernel_version = detect_builder_kernel_version(root_img)?;
+    let attach_output = command_stdout(
+        ProcessCommand::new("hdiutil")
+            .arg("attach")
+            .arg("-nomount")
+            .arg("-imagekey")
+            .arg("diskimage-class=CRawDiskImage")
+            .arg(root_img),
+        format!("failed to attach builder root image {}", root_img.display()),
+    )?;
+
+    let attach = parse_hdiutil_attach(&attach_output)?;
+    let mount_dir = parent.join("efi");
+    fs::create_dir_all(&mount_dir).map_err(|source| PetriError::Io {
+        path: mount_dir.clone(),
+        source,
+    })?;
+
+    let result = (|| {
+        run_status(
+            ProcessCommand::new("mount")
+                .arg("-t")
+                .arg("msdos")
+                .arg(&attach.efi_partition)
+                .arg(&mount_dir),
+            format!(
+                "failed to mount builder EFI partition {}",
+                attach.efi_partition
+            ),
+        )?;
+
+        let grub_cfg = mount_dir.join("EFI").join("debian").join("grub.cfg");
+        let original = fs::read_to_string(&grub_cfg).map_err(|source| PetriError::Io {
+            path: grub_cfg.clone(),
+            source,
+        })?;
+        let root_uuid = parse_grub_root_uuid(&original)?;
+        let fallback = mount_dir
+            .join("EFI")
+            .join("debian")
+            .join("grub-petri-original.cfg");
+        if !fallback.exists() {
+            fs::write(&fallback, original).map_err(|source| PetriError::Io {
+                path: fallback.clone(),
+                source,
+            })?;
+        }
+
+        let grub = format!(
+            r#"search.fs_uuid {root_uuid} root
+set default=0
+set timeout=0
+
+menuentry 'Petri builder bootstrap' {{
+    linux /boot/vmlinuz-{kernel_version} root=UUID={root_uuid} ro console=hvc0 console=tty0 systemd.journald.forward_to_console=1 ds=nocloud
+    initrd /boot/initrd.img-{kernel_version}
+}}
+
+menuentry 'Debian original GRUB config' {{
+    configfile ($root)/boot/grub/grub.cfg
+}}
+"#,
+            root_uuid = root_uuid,
+            kernel_version = kernel_version,
+        );
+        fs::write(&grub_cfg, grub).map_err(|source| PetriError::Io {
+            path: grub_cfg,
+            source,
+        })
+    })();
+
+    let unmount = run_status(
+        ProcessCommand::new("umount").arg(&mount_dir),
+        format!(
+            "failed to unmount builder EFI partition at {}",
+            mount_dir.display()
+        ),
+    );
+    let detach = run_status(
+        ProcessCommand::new("hdiutil")
+            .arg("detach")
+            .arg(&attach.disk),
+        format!("failed to detach builder root image {}", attach.disk),
+    );
+
+    result?;
+    unmount?;
+    detach?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HdiutilAttach {
+    disk: String,
+    efi_partition: String,
+}
+
+fn parse_hdiutil_attach(output: &str) -> Result<HdiutilAttach> {
+    let mut disk = None;
+    let mut efi_partition = None;
+
+    for line in output.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        let Some(device) = fields.first() else {
+            continue;
+        };
+        if !device.starts_with("/dev/disk") {
+            continue;
+        }
+        if !device.contains('s') {
+            disk = Some((*device).to_string());
+        }
+        if fields.iter().any(|field| *field == "EFI") {
+            efi_partition = Some((*device).to_string());
+        }
+    }
+
+    Ok(HdiutilAttach {
+        disk: disk.ok_or_else(|| {
+            PetriError::Cli(format!(
+                "failed to parse hdiutil attach disk from output:\n{output}"
+            ))
+        })?,
+        efi_partition: efi_partition.ok_or_else(|| {
+            PetriError::Cli(format!(
+                "failed to parse hdiutil attach EFI partition from output:\n{output}"
+            ))
+        })?,
+    })
+}
+
+fn parse_grub_root_uuid(input: &str) -> Result<String> {
+    input
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            if fields.next()? == "search.fs_uuid" {
+                fields.next().map(ToOwned::to_owned)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            PetriError::Cli("failed to parse root filesystem UUID from EFI grub.cfg".to_string())
+        })
+}
+
+fn detect_builder_kernel_version(root_img: &Path) -> Result<String> {
+    let output = command_stdout(
+        ProcessCommand::new("strings").arg("-a").arg(root_img),
+        format!(
+            "failed to scan builder root image for kernel version: {}",
+            root_img.display()
+        ),
+    )?;
+    let mut versions = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("vmlinuz-"))
+        .filter(|version| {
+            version
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '+'))
+        })
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    versions.sort();
+    versions.dedup();
+    versions.pop().ok_or_else(|| {
+        PetriError::Cli(format!(
+            "failed to detect Debian kernel version in {}",
+            root_img.display()
+        ))
     })
 }
 
