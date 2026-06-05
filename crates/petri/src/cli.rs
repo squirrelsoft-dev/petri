@@ -929,7 +929,7 @@ set default=0
 set timeout=0
 
 menuentry 'Petri builder bootstrap' {{
-    linux /boot/vmlinuz-{kernel_version} root=UUID={root_uuid} ro console=hvc0 console=tty0 systemd.journald.forward_to_console=1 ds=nocloud
+    linux /boot/vmlinuz-{kernel_version} root=UUID={root_uuid} ro console=tty0 console=hvc0 systemd.show_status=1 systemd.log_target=console systemd.journald.forward_to_console=1 cloud-init=enabled ds=nocloud
     initrd /boot/initrd.img-{kernel_version}
 }}
 
