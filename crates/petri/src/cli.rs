@@ -1195,6 +1195,7 @@ fn build_host_guest_binary(repo_root: &Path, target: &str) -> Result<()> {
     }
 
     let mut cargo = ProcessCommand::new("cargo");
+    configure_guest_target_linker(&mut cargo, target);
     cargo
         .arg("build")
         .arg("-p")
@@ -1214,6 +1215,14 @@ fn build_host_guest_binary(repo_root: &Path, target: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn configure_guest_target_linker(command: &mut ProcessCommand, target: &str) {
+    if target == "aarch64-unknown-linux-musl"
+        && std::env::var_os("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER").is_none()
+    {
+        command.env("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER", "rust-lld");
+    }
 }
 
 fn vm_build_script(

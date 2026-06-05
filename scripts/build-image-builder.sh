@@ -142,6 +142,11 @@ fi
 echo "building petri CLI"
 cargo "${cargo_args[@]}"
 
+if [ "${target:-aarch64-unknown-linux-musl}" = "aarch64-unknown-linux-musl" ] &&
+  [ -z "${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER:-}" ]; then
+  export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+fi
+
 petri_args=(
   image build
   --prepare-builder
