@@ -27,7 +27,7 @@ paths relative to the bundle so the whole directory can move as one artifact.
 Install the image build prerequisites on a Linux builder:
 
 ```sh
-sudo apt-get install -y jq mmdebstrap libguestfs-tools
+sudo apt-get install -y e2fsprogs mmdebstrap python3
 rustup target add aarch64-unknown-linux-musl
 ```
 
@@ -109,7 +109,7 @@ The script builds `crates/petri-vz`, builds the `petri` host CLI, sets
 The prepared builder bundle is a slim EFI-boot image provisioned with:
 
 - `petri-guest` plus the systemd units/mounts needed for Petri dispatch
-- `bash`, `git`, `jq`, `mmdebstrap`, `libguestfs-tools`, and `sha256sum`
+- `bash`, `e2fsprogs`, `git`, `mmdebstrap`, `python3`, and `sha256sum`
 - network access for Debian package downloads during image builds
 
 Petri stages the bundle next to the requested output path, boots and validates

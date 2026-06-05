@@ -376,9 +376,9 @@ const BUILDER_PACKAGES: &[&str] = &[
     "bash",
     "ca-certificates",
     "coreutils",
+    "e2fsprogs",
     "git",
     "jq",
-    "libguestfs-tools",
     "mmdebstrap",
 ];
 
@@ -519,12 +519,33 @@ fn run_prepare_builder(command: ImageBuildCommand, backend: &impl HostBackend) -
         );
     })?;
 
+    let package_install = DispatchRequest::bash_command(
+        "builder-package-install",
+        "bash",
+        vec!["-lc".to_string(), builder_package_install_script()],
+        PathBuf::from("/workspace"),
+        Some(RequestLimits {
+            timeout_ms: Some(30 * 60 * 1000),
+            max_output_bytes: Some(2 * 1024 * 1024),
+        }),
+    );
+    let result = backend.dispatch(&instance_id, package_install)?;
+    if result.status != crate::dispatch::Status::Success || result.exit_code != Some(Some(0)) {
+        let _ = backend.teardown(&instance_id);
+        return Err(PetriError::Cli(format!(
+            "builder package installation failed; staging bundle left at {}\nstdout:\n{}\nstderr:\n{}",
+            staging.display(),
+            result.stdout.unwrap_or_default(),
+            result.stderr.unwrap_or_default()
+        )));
+    }
+
     let validation = DispatchRequest::bash_command(
         "builder-validation",
         "bash",
         vec![
             "-lc".to_string(),
-            "test -f /var/lib/petri-builder/provisioned.json && command -v mmdebstrap jq virt-make-fs git sha256sum"
+            "test -f /var/lib/petri-builder/provisioned.json && for tool in mmdebstrap python3 mke2fs sha256sum; do command -v \"$tool\"; done && systemctl is-enabled workspace.mount run-petri.mount petri-guest.service && systemctl is-active workspace.mount run-petri.mount petri-guest.service"
                 .to_string(),
         ],
         PathBuf::from("/workspace"),
@@ -534,12 +555,36 @@ fn run_prepare_builder(command: ImageBuildCommand, backend: &impl HostBackend) -
         }),
     );
 
-    let result = backend.dispatch(&instance_id, validation);
+    let result = backend.dispatch(&instance_id, validation)?;
+    if result.status != crate::dispatch::Status::Success || result.exit_code != Some(Some(0)) {
+        return Err(PetriError::Cli(format!(
+            "builder validation failed; staging bundle left at {}\nstdout:\n{}\nstderr:\n{}",
+            staging.display(),
+            result.stdout.unwrap_or_default(),
+            result.stderr.unwrap_or_default()
+        )));
+    }
+
+    let finalization = DispatchRequest::bash_command(
+        "builder-finalization",
+        "bash",
+        vec![
+            "-lc".to_string(),
+            "set -euo pipefail; systemctl disable --now cloud-init.service cloud-init-local.service cloud-config.service cloud-final.service cloud-init-main.service cloud-init-hotplugd.socket 2>/dev/null || true; cloud-init clean --logs --seed || true; rm -rf /var/lib/cloud/instances /var/lib/cloud/seed; sync"
+                .to_string(),
+        ],
+        PathBuf::from("/workspace"),
+        Some(RequestLimits {
+            timeout_ms: Some(5 * 60 * 1000),
+            max_output_bytes: Some(256 * 1024),
+        }),
+    );
+    let result = backend.dispatch(&instance_id, finalization);
     let _ = backend.teardown(&instance_id);
     let result = result?;
     if result.status != crate::dispatch::Status::Success || result.exit_code != Some(Some(0)) {
         return Err(PetriError::Cli(format!(
-            "builder validation failed; staging bundle left at {}\nstdout:\n{}\nstderr:\n{}",
+            "builder finalization failed; staging bundle left at {}\nstdout:\n{}\nstderr:\n{}",
             staging.display(),
             result.stdout.unwrap_or_default(),
             result.stderr.unwrap_or_default()
@@ -550,6 +595,7 @@ fn run_prepare_builder(command: ImageBuildCommand, backend: &impl HostBackend) -
         path: seed_iso.clone(),
         source,
     })?;
+    restore_builder_efi_grub(&root_img)?;
     write_builder_manifest(&staging, false)?;
     write_builder_build_info(&staging, &source, disk_size)?;
     write_sha256sums(
@@ -562,6 +608,17 @@ fn run_prepare_builder(command: ImageBuildCommand, backend: &impl HostBackend) -
         "builder image prepared: {}",
         builder_image.display()
     ))
+}
+
+fn builder_package_install_script() -> String {
+    let packages = BUILDER_PACKAGES
+        .iter()
+        .map(|package| shell_quote_str(package))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "set -euo pipefail; cat > /etc/systemd/network/10-petri-builder.network <<'EOF'\n[Match]\nName=en*\n\n[Network]\nDHCP=yes\nIPv6AcceptRA=yes\nEOF\nsystemctl enable systemd-networkd.service systemd-resolved.service; systemctl restart systemd-networkd.service; sleep 3; rm -f /etc/resolv.conf; printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\noptions timeout:2 attempts:3\\n' > /etc/resolv.conf; export DEBIAN_FRONTEND=noninteractive; apt-get update -o Acquire::Retries=5; apt-get install -y --no-install-recommends {packages}; for tool in mmdebstrap python3 mke2fs sha256sum; do command -v \"$tool\"; done"
+    )
 }
 
 fn acquire_builder_source(
@@ -854,7 +911,7 @@ write_files:
       [Install]
       WantedBy=multi-user.target
 runcmd:
-  - [ bash, -lc, "set -euxo pipefail; mkdir -p /workspace /run/petri /var/lib/petri-builder; mountpoint -q /workspace || mount -t virtiofs workspace /workspace; mkdir -p \"$(dirname '{bootstrap_log}')\"; echo petri builder provisioning started; systemctl daemon-reload; install -m 0755 '{guest_binary}' /usr/local/bin/petri-guest; systemctl enable workspace.mount run-petri.mount petri-guest.service; systemctl start workspace.mount run-petri.mount petri-guest.service; command -v mmdebstrap jq virt-make-fs git sha256sum; printf '%s\n' '{{\"schema\":1,\"source\":\"{source_url}\",\"checksum\":\"{checksum_algorithm}:{checksum_hex}\",\"disk_size_bytes\":{disk_size}}}' > /var/lib/petri-builder/provisioned.json; echo petri builder provisioning complete" ]
+  - [ bash, -lc, "set -euxo pipefail; mkdir -p /workspace /run/petri /var/lib/petri-builder; mountpoint -q /workspace || mount -t virtiofs workspace /workspace; mkdir -p \"$(dirname '{bootstrap_log}')\"; echo petri builder provisioning started; systemctl daemon-reload; install -m 0755 '{guest_binary}' /usr/local/bin/petri-guest; systemctl enable workspace.mount run-petri.mount petri-guest.service; systemctl start workspace.mount run-petri.mount petri-guest.service; printf '%s\n' '{{\"schema\":1,\"source\":\"{source_url}\",\"checksum\":\"{checksum_algorithm}:{checksum_hex}\",\"disk_size_bytes\":{disk_size}}}' > /var/lib/petri-builder/provisioned.json; echo petri builder provisioning complete" ]
 "#,
         packages = packages,
         guest_binary = guest_binary_in_vm.display(),
@@ -957,6 +1014,78 @@ menuentry 'Debian original GRUB config' {{
             kernel_version = kernel_version,
         );
         fs::write(&grub_cfg, grub).map_err(|source| PetriError::Io {
+            path: grub_cfg,
+            source,
+        })
+    })();
+
+    let unmount = run_status(
+        ProcessCommand::new("umount").arg(&mount_dir),
+        format!(
+            "failed to unmount builder EFI partition at {}",
+            mount_dir.display()
+        ),
+    );
+    let detach = run_status(
+        ProcessCommand::new("hdiutil")
+            .arg("detach")
+            .arg(&attach.disk),
+        format!("failed to detach builder root image {}", attach.disk),
+    );
+
+    result?;
+    unmount?;
+    detach?;
+    Ok(())
+}
+
+fn restore_builder_efi_grub(root_img: &Path) -> Result<()> {
+    let Some(parent) = root_img.parent() else {
+        return Err(PetriError::Cli(format!(
+            "builder root image has no parent directory: {}",
+            root_img.display()
+        )));
+    };
+    let attach_output = command_stdout(
+        ProcessCommand::new("hdiutil")
+            .arg("attach")
+            .arg("-nomount")
+            .arg("-imagekey")
+            .arg("diskimage-class=CRawDiskImage")
+            .arg(root_img),
+        format!("failed to attach builder root image {}", root_img.display()),
+    )?;
+
+    let attach = parse_hdiutil_attach(&attach_output)?;
+    let mount_dir = parent.join("efi");
+    fs::create_dir_all(&mount_dir).map_err(|source| PetriError::Io {
+        path: mount_dir.clone(),
+        source,
+    })?;
+
+    let result = (|| {
+        run_status(
+            ProcessCommand::new("mount")
+                .arg("-t")
+                .arg("msdos")
+                .arg(&attach.efi_partition)
+                .arg(&mount_dir),
+            format!(
+                "failed to mount builder EFI partition {}",
+                attach.efi_partition
+            ),
+        )?;
+
+        let grub_cfg = mount_dir.join("EFI").join("debian").join("grub.cfg");
+        let fallback = mount_dir
+            .join("EFI")
+            .join("debian")
+            .join("grub-petri-original.cfg");
+        let original = fs::read(&fallback).map_err(|source| PetriError::Io {
+            path: fallback.clone(),
+            source,
+        })?;
+        fs::write(&grub_cfg, original).map_err(|source| PetriError::Io {
             path: grub_cfg,
             source,
         })
@@ -1483,7 +1612,10 @@ fn vm_build_script(
         args.push(shell_quote_str(disk_size));
     }
 
-    Ok(format!("set -euo pipefail; {}", args.join(" ")))
+    Ok(format!(
+        "set -euo pipefail; rm -f /etc/resolv.conf; printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\noptions timeout:2 attempts:3\\n' > /etc/resolv.conf; export TMPDIR=/var/tmp/petri-builder-tmp; mkdir -p \"$TMPDIR\"; {}",
+        args.join(" ")
+    ))
 }
 
 fn write_builder_policy(repo_root: &Path) -> Result<PathBuf> {

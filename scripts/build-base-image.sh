@@ -116,12 +116,9 @@ read_toml_array() {
 }
 
 need_tool awk
-need_tool cargo
-need_tool git
-need_tool jq
 need_tool mmdebstrap
-need_tool rustup
-need_tool virt-make-fs
+need_tool mke2fs
+need_tool python3
 need_tool sha256sum
 
 if [ ! -f "$config" ]; then
@@ -149,6 +146,8 @@ if [ -z "$name" ] || [ -z "$arch" ] || [ -z "$debian_arch" ] || [ -z "$suite" ] 
 fi
 
 if [ "$skip_guest_build" -eq 0 ]; then
+  need_tool cargo
+  need_tool rustup
   rustup target add "$target"
   cargo build -p petri-guest --release --target "$target"
   guest_binary="$repo_root/target/$target/release/petri-guest"
@@ -260,75 +259,102 @@ if [ -n "$initrd" ]; then
   cp "$initrd" "$out_dir/initrd.img"
 fi
 
-virt-make-fs \
-  --type=ext4 \
-  --size="$disk_size" \
-  --format=raw \
-  "$rootfs" \
-  "$out_dir/root.img"
+truncate -s "$disk_size" "$out_dir/root.img"
+mke2fs -t ext4 -F -d "$rootfs" "$out_dir/root.img"
 
 kernel_command_line="console=hvc0 root=/dev/vda rw systemd.unit=multi-user.target"
-
-jq -n \
-  --arg architecture "$arch" \
-  --arg kernel "vmlinuz" \
-  --arg disk "root.img" \
-  --arg initrd "initrd.img" \
-  --arg kernel_command_line "$kernel_command_line" \
-  --argjson dispatch_port "$dispatch_port" \
-  '{
-    architecture: $architecture,
-    kernel: $kernel,
-    disk: $disk,
-    initrd: $initrd,
-    kernel_command_line: $kernel_command_line,
-    dispatch_port: $dispatch_port
-  }' > "$out_dir/petri-image.json"
-
-if [ ! -f "$out_dir/initrd.img" ]; then
-  jq 'del(.initrd)' "$out_dir/petri-image.json" > "$out_dir/petri-image.json.tmp"
-  mv "$out_dir/petri-image.json.tmp" "$out_dir/petri-image.json"
+initrd_manifest=""
+if [ -f "$out_dir/initrd.img" ]; then
+  initrd_manifest="initrd.img"
 fi
 
-guest_sha="$(sha256sum "$guest_binary" | awk '{print $1}')"
-git_rev="$(git -C "$repo_root" rev-parse HEAD)"
-git_dirty="$(git -C "$repo_root" status --porcelain)"
+python3 - "$out_dir/petri-image.json" "$arch" "vmlinuz" "root.img" "$initrd_manifest" "$kernel_command_line" "$dispatch_port" <<'PY'
+import json
+import sys
 
-jq -n \
-  --arg name "$name" \
-  --arg config "$(realpath "$config")" \
-  --arg git_revision "$git_rev" \
-  --arg git_dirty "$([ -n "$git_dirty" ] && echo true || echo false)" \
-  --arg architecture "$arch" \
-  --arg suite "$suite" \
-  --arg debian_arch "$debian_arch" \
-  --arg mirror "$mirror" \
-  --arg security_mirror "$security_mirror" \
-  --arg rust_target "$target" \
-  --arg petri_guest_sha256 "$guest_sha" \
-  --arg disk_size "$disk_size" \
-  --arg build_time_utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  '{
-    name: $name,
-    config: $config,
-    source: {
-      git_revision: $git_revision,
-      git_dirty: ($git_dirty == "true")
+path, architecture, kernel, disk, initrd, kernel_command_line, dispatch_port = sys.argv[1:]
+payload = {
+    "architecture": architecture,
+    "kernel": kernel,
+    "disk": disk,
+    "kernel_command_line": kernel_command_line,
+    "dispatch_port": int(dispatch_port),
+}
+if initrd:
+    payload["initrd"] = initrd
+with open(path, "w", encoding="utf-8") as output:
+    json.dump(payload, output, indent=2)
+    output.write("\n")
+PY
+
+guest_sha="$(sha256sum "$guest_binary" | awk '{print $1}')"
+if command -v git >/dev/null 2>&1; then
+  git_rev="$(git -C "$repo_root" rev-parse HEAD)"
+  git_dirty="$(git -C "$repo_root" status --porcelain)"
+else
+  git_rev="unknown"
+  git_dirty="unknown"
+fi
+
+python3 - "$out_dir/build-info.json" \
+  "$name" \
+  "$(realpath "$config")" \
+  "$git_rev" \
+  "$git_dirty" \
+  "$arch" \
+  "$suite" \
+  "$debian_arch" \
+  "$mirror" \
+  "$security_mirror" \
+  "$target" \
+  "$guest_sha" \
+  "$disk_size" \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" <<'PY'
+import json
+import sys
+
+(
+    path,
+    name,
+    config,
+    git_revision,
+    git_dirty,
+    architecture,
+    suite,
+    debian_arch,
+    mirror,
+    security_mirror,
+    rust_target,
+    petri_guest_sha256,
+    disk_size,
+    build_time_utc,
+) = sys.argv[1:]
+
+payload = {
+    "name": name,
+    "config": config,
+    "source": {
+        "git_revision": git_revision,
+        "git_dirty": None if git_dirty == "unknown" else bool(git_dirty),
     },
-    image: {
-      architecture: $architecture,
-      debian_arch: $debian_arch,
-      suite: $suite,
-      mirror: $mirror,
-      security_mirror: $security_mirror,
-      disk_size: $disk_size
+    "image": {
+        "architecture": architecture,
+        "debian_arch": debian_arch,
+        "suite": suite,
+        "mirror": mirror,
+        "security_mirror": security_mirror,
+        "disk_size": disk_size,
     },
-    guest: {
-      rust_target: $rust_target,
-      sha256: $petri_guest_sha256
+    "guest": {
+        "rust_target": rust_target,
+        "sha256": petri_guest_sha256,
     },
-    build_time_utc: $build_time_utc
-  }' > "$out_dir/build-info.json"
+    "build_time_utc": build_time_utc,
+}
+with open(path, "w", encoding="utf-8") as output:
+    json.dump(payload, output, indent=2)
+    output.write("\n")
+PY
 
 (
   cd "$out_dir"
