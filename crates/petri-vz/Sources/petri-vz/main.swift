@@ -250,7 +250,7 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
     }
 
     func start() {
-        DispatchQueue.global(qos: .userInitiated).async {
+        DispatchQueue.main.async {
             do {
                 log("creating VM configuration")
                 let vm = try self.createVirtualMachine()
@@ -656,8 +656,16 @@ do {
     log("starting helper for instance \(args.instanceID ?? "<unknown>")")
     let controller = VMController(args: args)
     let server = ControlServer(socketPath: args.controlSocket!, controller: controller)
+    DispatchQueue.global(qos: .userInitiated).async {
+        do {
+            try server.run()
+        } catch {
+            fputs("petri-vz: \(error)\n", stderr)
+            exit(1)
+        }
+    }
     controller.start()
-    try server.run()
+    RunLoop.main.run()
 } catch {
     fputs("petri-vz: \(error)\n", stderr)
     exit(1)
