@@ -61,7 +61,7 @@ pub struct DispatchResult {
     pub protocol_version: u64,
     pub id: Option<String>,
     pub status: Status,
-    pub elapsed_ms: u128,
+    pub elapsed_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stdout: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

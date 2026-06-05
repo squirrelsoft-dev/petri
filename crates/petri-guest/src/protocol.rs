@@ -53,7 +53,7 @@ pub struct ResultFrame {
     pub protocol_version: u64,
     pub id: Option<String>,
     pub status: Status,
-    pub elapsed_ms: u128,
+    pub elapsed_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stdout: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,7 +78,7 @@ impl ResultFrame {
     pub fn process(
         id: String,
         status: Status,
-        elapsed_ms: u128,
+        elapsed_ms: u64,
         stdout: String,
         stderr: String,
         exit_code: Option<i32>,
@@ -99,7 +99,7 @@ impl ResultFrame {
 
     pub fn timeout(
         id: String,
-        elapsed_ms: u128,
+        elapsed_ms: u64,
         stdout: String,
         stderr: String,
         output_truncated: bool,
@@ -123,7 +123,7 @@ impl ResultFrame {
 
     pub fn rejected(
         id: Option<String>,
-        elapsed_ms: u128,
+        elapsed_ms: u64,
         code: &'static str,
         message: impl Into<String>,
         details: Option<Map<String, Value>>,
@@ -133,7 +133,7 @@ impl ResultFrame {
 
     pub fn malformed(
         id: Option<String>,
-        elapsed_ms: u128,
+        elapsed_ms: u64,
         code: &'static str,
         message: impl Into<String>,
     ) -> Self {
@@ -143,7 +143,7 @@ impl ResultFrame {
     fn error(
         status: Status,
         id: Option<String>,
-        elapsed_ms: u128,
+        elapsed_ms: u64,
         code: &'static str,
         message: impl Into<String>,
         details: Option<Map<String, Value>>,

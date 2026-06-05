@@ -37,7 +37,7 @@ pub fn handle_frame(line: &str, policy: &Policy) -> ResultFrame {
     if line.is_empty() {
         return ResultFrame::malformed(
             None,
-            started.elapsed().as_millis(),
+            elapsed_ms(started.elapsed()),
             "malformed_frame",
             "empty dispatch frame",
         );
@@ -48,7 +48,7 @@ pub fn handle_frame(line: &str, policy: &Policy) -> ResultFrame {
         Ok(_) => {
             return ResultFrame::malformed(
                 None,
-                started.elapsed().as_millis(),
+                elapsed_ms(started.elapsed()),
                 "malformed_frame",
                 "dispatch frame must be a JSON object",
             );
@@ -56,7 +56,7 @@ pub fn handle_frame(line: &str, policy: &Policy) -> ResultFrame {
         Err(_) => {
             return ResultFrame::malformed(
                 None,
-                started.elapsed().as_millis(),
+                elapsed_ms(started.elapsed()),
                 "malformed_frame",
                 "dispatch frame is not valid JSON",
             );
@@ -69,7 +69,7 @@ pub fn handle_frame(line: &str, policy: &Policy) -> ResultFrame {
         Err(err) => {
             return ResultFrame::rejected(
                 id,
-                started.elapsed().as_millis(),
+                elapsed_ms(started.elapsed()),
                 "invalid_request",
                 format!("invalid dispatch request: {err}"),
                 None,
@@ -80,7 +80,7 @@ pub fn handle_frame(line: &str, policy: &Policy) -> ResultFrame {
     if request.id.is_empty() {
         return ResultFrame::rejected(
             None,
-            started.elapsed().as_millis(),
+            elapsed_ms(started.elapsed()),
             "invalid_request",
             "request id must be non-empty",
             None,
@@ -95,7 +95,7 @@ pub fn handle_frame(line: &str, policy: &Policy) -> ResultFrame {
         );
         return ResultFrame::rejected(
             Some(request.id),
-            started.elapsed().as_millis(),
+            elapsed_ms(started.elapsed()),
             "unsupported_protocol_version",
             "unsupported protocol version",
             Some(details),
@@ -105,7 +105,7 @@ pub fn handle_frame(line: &str, policy: &Policy) -> ResultFrame {
     if request.control.as_deref() == Some("cancel") {
         return ResultFrame::rejected(
             Some(request.id),
-            started.elapsed().as_millis(),
+            elapsed_ms(started.elapsed()),
             "invalid_request",
             "cancellation is not implemented in the skeleton guest",
             None,
@@ -115,7 +115,7 @@ pub fn handle_frame(line: &str, policy: &Policy) -> ResultFrame {
     if request.control.is_some() || request.target_id.is_some() {
         return ResultFrame::rejected(
             Some(request.id),
-            started.elapsed().as_millis(),
+            elapsed_ms(started.elapsed()),
             "invalid_request",
             "unsupported control request",
             None,
@@ -126,7 +126,7 @@ pub fn handle_frame(line: &str, policy: &Policy) -> ResultFrame {
         if matches!(limits.timeout_ms, Some(0)) || matches!(limits.max_output_bytes, Some(0)) {
             return ResultFrame::rejected(
                 Some(request.id),
-                started.elapsed().as_millis(),
+                elapsed_ms(started.elapsed()),
                 "invalid_request",
                 "request limits must be positive",
                 None,
@@ -137,7 +137,7 @@ pub fn handle_frame(line: &str, policy: &Policy) -> ResultFrame {
         {
             return policy_denied(
                 request.id,
-                started.elapsed().as_millis(),
+                elapsed_ms(started.elapsed()),
                 "limits.timeout_ms",
                 "request timeout exceeds policy runtime cap",
             );
@@ -147,7 +147,7 @@ pub fn handle_frame(line: &str, policy: &Policy) -> ResultFrame {
         {
             return policy_denied(
                 request.id,
-                started.elapsed().as_millis(),
+                elapsed_ms(started.elapsed()),
                 "limits.max_output_bytes",
                 "request output cap exceeds policy output cap",
             );
@@ -158,14 +158,14 @@ pub fn handle_frame(line: &str, policy: &Policy) -> ResultFrame {
         Some("bash_command") => handle_bash_command(request, policy, started),
         Some(_) => ResultFrame::rejected(
             Some(request.id),
-            started.elapsed().as_millis(),
+            elapsed_ms(started.elapsed()),
             "unknown_tool",
             "unknown tool",
             None,
         ),
         None => ResultFrame::rejected(
             Some(request.id),
-            started.elapsed().as_millis(),
+            elapsed_ms(started.elapsed()),
             "invalid_request",
             "tool is required",
             None,
@@ -180,7 +180,7 @@ fn handle_bash_command(request: DispatchRequest, policy: &Policy, started: Insta
     let Some(args) = request.args else {
         return ResultFrame::rejected(
             Some(request.id),
-            started.elapsed().as_millis(),
+            elapsed_ms(started.elapsed()),
             "invalid_request",
             "args is required",
             None,
@@ -192,7 +192,7 @@ fn handle_bash_command(request: DispatchRequest, policy: &Policy, started: Insta
         Err(err) => {
             return ResultFrame::rejected(
                 Some(request.id),
-                started.elapsed().as_millis(),
+                elapsed_ms(started.elapsed()),
                 "invalid_request",
                 format!("invalid bash_command args: {err}"),
                 None,
@@ -203,7 +203,7 @@ fn handle_bash_command(request: DispatchRequest, policy: &Policy, started: Insta
     if !is_executable_name(&args.command) {
         return ResultFrame::rejected(
             Some(request.id),
-            started.elapsed().as_millis(),
+            elapsed_ms(started.elapsed()),
             "invalid_request",
             "args.command must be an executable name",
             None,
@@ -216,7 +216,7 @@ fn handle_bash_command(request: DispatchRequest, policy: &Policy, started: Insta
         details.insert("command".to_string(), Value::from(args.command));
         return ResultFrame::rejected(
             Some(request.id),
-            started.elapsed().as_millis(),
+            elapsed_ms(started.elapsed()),
             "policy_denied",
             "command is not allowed by policy",
             Some(details),
@@ -228,7 +228,7 @@ fn handle_bash_command(request: DispatchRequest, policy: &Policy, started: Insta
         Err(message) => {
             return policy_denied(
                 request.id,
-                started.elapsed().as_millis(),
+                elapsed_ms(started.elapsed()),
                 "args.cwd",
                 message,
             );
@@ -315,7 +315,7 @@ fn execute_command(
         Err(err) => {
             return guest_error(
                 id,
-                started.elapsed().as_millis(),
+                elapsed_ms(started.elapsed()),
                 format!("failed to start command: {err}"),
             );
         }
@@ -343,7 +343,7 @@ fn execute_command(
                 return ResultFrame::process(
                     id,
                     result_status,
-                    started.elapsed().as_millis(),
+                    elapsed_ms(started.elapsed()),
                     output.stdout,
                     output.stderr,
                     status.code(),
@@ -358,7 +358,7 @@ fn execute_command(
                 let output = finish_output(output);
                 return ResultFrame::timeout(
                     id,
-                    started.elapsed().as_millis(),
+                    elapsed_ms(started.elapsed()),
                     output.stdout,
                     output.stderr,
                     output.truncated,
@@ -372,7 +372,7 @@ fn execute_command(
                 join_reader(stderr_handle);
                 return guest_error(
                     id,
-                    started.elapsed().as_millis(),
+                    elapsed_ms(started.elapsed()),
                     format!("failed to wait for command: {err}"),
                 );
             }
@@ -380,7 +380,7 @@ fn execute_command(
     }
 }
 
-fn guest_error(id: String, elapsed_ms: u128, message: String) -> ResultFrame {
+fn guest_error(id: String, elapsed_ms: u64, message: String) -> ResultFrame {
     ResultFrame {
         protocol_version: PROTOCOL_VERSION,
         id: Some(id),
@@ -510,7 +510,7 @@ fn bytes_to_string_preserving_utf8(mut bytes: Vec<u8>) -> String {
 
 fn policy_denied(
     id: String,
-    elapsed_ms: u128,
+    elapsed_ms: u64,
     field: &'static str,
     message: &'static str,
 ) -> ResultFrame {
@@ -523,6 +523,10 @@ fn policy_denied(
         message,
         Some(details),
     )
+}
+
+fn elapsed_ms(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
