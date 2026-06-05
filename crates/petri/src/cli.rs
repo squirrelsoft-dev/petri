@@ -631,7 +631,7 @@ fn checksum_from_file_or_url(
     image_path: &Path,
 ) -> Result<(String, String)> {
     let path = if is_url(source) {
-        let dest = cache_dir.join(url_file_name(source)?);
+        let dest = cache_dir.join(url_cache_file_name(source)?);
         if !dest.is_file() {
             run_status(
                 ProcessCommand::new("curl")
@@ -679,6 +679,22 @@ fn parse_checksum_file(input: &str, image_name: &str) -> Option<(String, String)
         };
         Some((algorithm.to_string(), hex.to_ascii_lowercase()))
     })
+}
+
+fn url_cache_file_name(source: &str) -> Result<String> {
+    if !is_url(source) {
+        return Err(PetriError::Cli(format!("not a URL: {source}")));
+    }
+    Ok(source
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect())
 }
 
 fn verify_checksum(path: &Path, algorithm: &str, expected: &str) -> Result<()> {
@@ -1867,6 +1883,15 @@ mod tests {
 
         assert_eq!(attach.disk, "/dev/disk8");
         assert_eq!(attach.efi_partition, "/dev/disk8s15");
+    }
+
+    #[test]
+    fn url_cache_file_name_includes_full_url() {
+        assert_eq!(
+            url_cache_file_name("https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS")
+                .unwrap(),
+            "https___cloud.debian.org_images_cloud_trixie_latest_SHA512SUMS"
+        );
     }
 
     #[test]
