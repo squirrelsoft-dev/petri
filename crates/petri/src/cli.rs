@@ -484,6 +484,10 @@ fn run_prepare_builder(command: ImageBuildCommand, backend: &impl HostBackend) -
     let seed_iso = staging.join("seed.iso");
     write_cloud_init_seed(&staging, &seed_iso, &guest_binary_in_vm, &source, disk_size)?;
     write_builder_manifest(&staging, true)?;
+    eprintln!(
+        "booting builder VM for first-boot provisioning; staging bundle: {}",
+        staging.display()
+    );
 
     let policy = write_builder_policy(&repo_root)?;
     let instance_id = InstanceId::new(format!("petri-bootstrap-{}", unique_build_id()?))?;
@@ -775,6 +779,8 @@ package_update: true
 package_upgrade: false
 packages:
 {packages}
+output:
+  all: "| tee -a /var/log/cloud-init-output.log /dev/hvc0"
 write_files:
   - path: /etc/systemd/system/workspace.mount
     permissions: "0644"
@@ -815,6 +821,7 @@ write_files:
       WantedBy=multi-user.target
 runcmd:
   - [ mkdir, -p, /workspace, /run/petri, /var/lib/petri-builder ]
+  - [ bash, -lc, "if [ -e /dev/hvc0 ]; then exec > >(tee -a /var/log/petri-builder-provision.log /dev/hvc0) 2>&1; fi; echo petri builder provisioning started" ]
   - [ systemctl, daemon-reload ]
   - [ mount, -t, virtiofs, workspace, /workspace ]
   - [ install, -m, "0755", "{guest_binary}", /usr/local/bin/petri-guest ]

@@ -24,6 +24,7 @@ struct Args {
     var efiVariableStore: String?
     var workspace: String?
     var configDir: String?
+    var consoleLog: String?
     var commandLine: String?
     var dispatchPort: UInt32 = dispatchPortDefault
 
@@ -60,6 +61,8 @@ struct Args {
                 args.workspace = try next(arg)
             case "--config-dir":
                 args.configDir = try next(arg)
+            case "--console-log":
+                args.consoleLog = try next(arg)
             case "--command-line":
                 args.commandLine = try next(arg)
             case "--dispatch-port":
@@ -84,6 +87,7 @@ struct Args {
             ("--disk", disk),
             ("--workspace", workspace),
             ("--config-dir", configDir),
+            ("--console-log", consoleLog),
         ] {
             if value?.isEmpty ?? true {
                 throw HelperError("\(name) is required")
@@ -374,6 +378,7 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
         ]
         configuration.socketDevices = [VZVirtioSocketDeviceConfiguration()]
         configuration.networkDevices = [networkDevice()]
+        configuration.serialPorts = [try serialPort(path: args.consoleLog!)]
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         configuration.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
 
@@ -414,6 +419,13 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
     private func networkDevice() -> VZVirtioNetworkDeviceConfiguration {
         let config = VZVirtioNetworkDeviceConfiguration()
         config.attachment = VZNATNetworkDeviceAttachment()
+        return config
+    }
+
+    private func serialPort(path: String) throws -> VZVirtioConsoleDeviceSerialPortConfiguration {
+        let config = VZVirtioConsoleDeviceSerialPortConfiguration()
+        let url = URL(fileURLWithPath: path)
+        config.attachment = try VZFileSerialPortAttachment(url: url, append: false)
         return config
     }
 

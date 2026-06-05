@@ -184,6 +184,18 @@ impl MacosBackend {
         self.config_dir(instance_id).join("policy.toml")
     }
 
+    fn helper_stdout_path(&self, instance_id: &InstanceId) -> PathBuf {
+        self.instance_dir(instance_id).join("petri-vz.stdout.log")
+    }
+
+    fn helper_stderr_path(&self, instance_id: &InstanceId) -> PathBuf {
+        self.instance_dir(instance_id).join("petri-vz.stderr.log")
+    }
+
+    fn guest_console_path(&self, instance_id: &InstanceId) -> PathBuf {
+        self.instance_dir(instance_id).join("guest-console.log")
+    }
+
     fn load_state(&self, instance_id: &InstanceId) -> Result<RuntimeState> {
         let path = self.state_path(instance_id);
         let input = fs::read_to_string(&path).map_err(|source| PetriError::Io {
@@ -244,6 +256,20 @@ impl MacosBackend {
             source,
         })?;
 
+        let helper_stdout_path = self.helper_stdout_path(&config.id);
+        let helper_stderr_path = self.helper_stderr_path(&config.id);
+        let guest_console_path = self.guest_console_path(&config.id);
+        let helper_stdout =
+            fs::File::create(&helper_stdout_path).map_err(|source| PetriError::Io {
+                path: helper_stdout_path.clone(),
+                source,
+            })?;
+        let helper_stderr =
+            fs::File::create(&helper_stderr_path).map_err(|source| PetriError::Io {
+                path: helper_stderr_path.clone(),
+                source,
+            })?;
+
         let control_socket = self.control_socket_path(&config.id);
         let _ = fs::remove_file(&control_socket);
         let helper_binary = resolve_helper_binary(&self.helper_binary)?;
@@ -263,9 +289,11 @@ impl MacosBackend {
             .arg(&config_dir)
             .arg("--dispatch-port")
             .arg(image.manifest.dispatch_port.to_string())
+            .arg("--console-log")
+            .arg(&guest_console_path)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::from(helper_stdout))
+            .stderr(Stdio::from(helper_stderr));
 
         if let Some(kernel) = &image.kernel {
             command.arg("--kernel").arg(kernel);
@@ -314,7 +342,14 @@ impl MacosBackend {
         )
         .inspect_err(|_| {
             let _ = terminate_process(child.id());
-            let _ = self.remove_state(&config.id);
+        })
+        .map_err(|err| {
+            backend_error(format!(
+                "{err}; helper stdout: {}; helper stderr: {}; guest console: {}",
+                helper_stdout_path.display(),
+                helper_stderr_path.display(),
+                guest_console_path.display()
+            ))
         })?;
 
         Ok(InstanceHandle {
