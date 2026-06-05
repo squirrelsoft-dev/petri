@@ -329,9 +329,11 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
 
         let semaphore = DispatchSemaphore(value: 0)
         var stopError: Error?
-        virtualMachine.stop { error in
-            stopError = error
-            semaphore.signal()
+        DispatchQueue.main.async {
+            virtualMachine.stop { error in
+                stopError = error
+                semaphore.signal()
+            }
         }
         semaphore.wait()
 
@@ -482,13 +484,20 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
     }
 
     private func connectToGuest() throws -> VZVirtioSocketConnection {
-        let device = try socketDevice()
         let semaphore = DispatchSemaphore(value: 0)
         var output: Result<VZVirtioSocketConnection, Error>?
 
-        device.connect(toPort: args.dispatchPort) { result in
-            output = result
-            semaphore.signal()
+        DispatchQueue.main.async {
+            do {
+                let device = try self.socketDevice()
+                device.connect(toPort: self.args.dispatchPort) { result in
+                    output = result
+                    semaphore.signal()
+                }
+            } catch {
+                output = .failure(error)
+                semaphore.signal()
+            }
         }
         semaphore.wait()
 
