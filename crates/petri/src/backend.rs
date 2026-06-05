@@ -4,7 +4,7 @@ use crate::instance::{InstanceConfig, InstanceHandle, InstanceId, LifecycleState
 
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -259,6 +259,7 @@ impl MacosBackend {
         let helper_stdout_path = self.helper_stdout_path(&config.id);
         let helper_stderr_path = self.helper_stderr_path(&config.id);
         let guest_console_path = self.guest_console_path(&config.id);
+        let bootstrap_log_path = workspace.join("target").join("petri-builder-bootstrap.log");
         let helper_stdout =
             fs::File::create(&helper_stdout_path).map_err(|source| PetriError::Io {
                 path: helper_stdout_path.clone(),
@@ -342,6 +343,11 @@ impl MacosBackend {
             &control_socket,
             Duration::from_secs(image.manifest.ready_timeout_secs),
             &mut child,
+            &HelperReadyProgress {
+                helper_stderr_path: &helper_stderr_path,
+                guest_console_path: &guest_console_path,
+                bootstrap_log_path: &bootstrap_log_path,
+            },
         )
         .inspect_err(|_| {
             let _ = terminate_process(child.id());
@@ -900,8 +906,13 @@ fn wait_for_helper_ready(
     control_socket: &Path,
     timeout: Duration,
     child: &mut std::process::Child,
+    progress: &HelperReadyProgress<'_>,
 ) -> Result<()> {
     let started = Instant::now();
+    let mut next_progress = Instant::now() + Duration::from_secs(5);
+    let mut helper_stderr_offset = file_len(&progress.helper_stderr_path).unwrap_or(0);
+    let mut guest_console_offset = file_len(&progress.guest_console_path).unwrap_or(0);
+    let mut bootstrap_log_offset = 0;
     loop {
         if let Some(status) = child
             .try_wait()
@@ -912,7 +923,37 @@ fn wait_for_helper_ready(
             )));
         }
 
-        match send_helper_request::<HelperResponse>(control_socket, &HelperRequest::Status) {
+        let response =
+            send_helper_request::<HelperResponse>(control_socket, &HelperRequest::Status);
+        if Instant::now() >= next_progress {
+            let status = match &response {
+                Ok(response) => format!("{response:?}"),
+                Err(err) => format!("status unavailable: {err}"),
+            };
+            eprintln!(
+                "waiting for guest vsock readiness ({:.0}s/{:.0}s); helper status: {status}",
+                started.elapsed().as_secs_f64(),
+                timeout.as_secs_f64(),
+            );
+            print_new_log_lines(
+                "petri-builder",
+                progress.bootstrap_log_path,
+                &mut bootstrap_log_offset,
+            );
+            print_new_log_lines(
+                "guest-console",
+                progress.guest_console_path,
+                &mut guest_console_offset,
+            );
+            print_new_log_lines(
+                "petri-vz",
+                progress.helper_stderr_path,
+                &mut helper_stderr_offset,
+            );
+            next_progress = Instant::now() + Duration::from_secs(10);
+        }
+
+        match response {
             Ok(HelperResponse::Ready) => return Ok(()),
             Ok(HelperResponse::Error { message }) => return Err(backend_error(message)),
             Ok(_) | Err(_) if started.elapsed() < timeout => {
@@ -929,6 +970,42 @@ fn wait_for_helper_ready(
                 )));
             }
         }
+    }
+}
+
+struct HelperReadyProgress<'a> {
+    helper_stderr_path: &'a Path,
+    guest_console_path: &'a Path,
+    bootstrap_log_path: &'a Path,
+}
+
+fn file_len(path: &Path) -> std::io::Result<u64> {
+    fs::metadata(path).map(|metadata| metadata.len())
+}
+
+fn print_new_log_lines(label: &str, path: &Path, offset: &mut u64) {
+    let Ok(mut file) = fs::File::open(path) else {
+        return;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return;
+    };
+    if metadata.len() < *offset {
+        *offset = 0;
+    }
+    if metadata.len() == *offset {
+        return;
+    }
+    if file.seek(SeekFrom::Start(*offset)).is_err() {
+        return;
+    }
+    let mut output = String::new();
+    if file.read_to_string(&mut output).is_err() {
+        return;
+    }
+    *offset = metadata.len();
+    for line in output.lines() {
+        eprintln!("[{label}] {line}");
     }
 }
 

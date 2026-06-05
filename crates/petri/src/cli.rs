@@ -427,6 +427,9 @@ fn run_prepare_builder(command: ImageBuildCommand, backend: &impl HostBackend) -
         .join("release")
         .join("petri-guest");
     let guest_binary_in_vm = guest_path_for_repo_file(&repo_root, &guest_binary)?;
+    let bootstrap_log = repo_root.join("target").join("petri-builder-bootstrap.log");
+    let bootstrap_log_in_vm = guest_path_for_repo_file(&repo_root, &bootstrap_log)?;
+    let _ = fs::remove_file(&bootstrap_log);
     let cache_dir = absolute_out_dir(
         &repo_root,
         command
@@ -482,7 +485,14 @@ fn run_prepare_builder(command: ImageBuildCommand, backend: &impl HostBackend) -
     expand_file(&root_img, disk_size)?;
 
     let seed_iso = staging.join("seed.iso");
-    write_cloud_init_seed(&staging, &seed_iso, &guest_binary_in_vm, &source, disk_size)?;
+    write_cloud_init_seed(
+        &staging,
+        &seed_iso,
+        &guest_binary_in_vm,
+        &bootstrap_log_in_vm,
+        &source,
+        disk_size,
+    )?;
     write_builder_manifest(&staging, true)?;
     eprintln!(
         "booting builder VM for first-boot provisioning; staging bundle: {}",
@@ -718,6 +728,7 @@ fn write_cloud_init_seed(
     staging: &Path,
     seed_iso: &Path,
     guest_binary_in_vm: &Path,
+    bootstrap_log_in_vm: &Path,
     source: &VerifiedBuilderSource,
     disk_size: u64,
 ) -> Result<()> {
@@ -736,7 +747,7 @@ fn write_cloud_init_seed(
     })?;
     fs::write(
         seed_dir.join("user-data"),
-        builder_cloud_init(guest_binary_in_vm, source, disk_size),
+        builder_cloud_init(guest_binary_in_vm, bootstrap_log_in_vm, source, disk_size),
     )
     .map_err(|source| PetriError::Io {
         path: seed_dir.join("user-data"),
@@ -765,6 +776,7 @@ fn write_cloud_init_seed(
 
 fn builder_cloud_init(
     guest_binary_in_vm: &Path,
+    bootstrap_log_in_vm: &Path,
     source: &VerifiedBuilderSource,
     disk_size: u64,
 ) -> String {
@@ -779,8 +791,13 @@ package_update: true
 package_upgrade: false
 packages:
 {packages}
+bootcmd:
+  - [ mkdir, -p, /workspace, /var/log ]
+  - [ bash, -lc, "mountpoint -q /workspace || mount -t virtiofs workspace /workspace || true" ]
+  - [ bash, -lc, "mkdir -p \"$(dirname '{bootstrap_log}')\" || true" ]
+  - [ bash, -lc, "printf '%s\n' 'petri builder bootcmd started' | tee -a /var/log/petri-builder-provision.log '{bootstrap_log}' /dev/hvc0 || true" ]
 output:
-  all: "| tee -a /var/log/cloud-init-output.log /dev/hvc0"
+  all: "| tee -a /var/log/cloud-init-output.log /var/log/petri-builder-provision.log {bootstrap_log} /dev/hvc0"
 write_files:
   - path: /etc/systemd/system/workspace.mount
     permissions: "0644"
@@ -820,18 +837,11 @@ write_files:
       [Install]
       WantedBy=multi-user.target
 runcmd:
-  - [ mkdir, -p, /workspace, /run/petri, /var/lib/petri-builder ]
-  - [ bash, -lc, "if [ -e /dev/hvc0 ]; then exec > >(tee -a /var/log/petri-builder-provision.log /dev/hvc0) 2>&1; fi; echo petri builder provisioning started" ]
-  - [ systemctl, daemon-reload ]
-  - [ mount, -t, virtiofs, workspace, /workspace ]
-  - [ install, -m, "0755", "{guest_binary}", /usr/local/bin/petri-guest ]
-  - [ systemctl, enable, workspace.mount, run-petri.mount, petri-guest.service ]
-  - [ systemctl, start, workspace.mount, run-petri.mount, petri-guest.service ]
-  - [ bash, -lc, "command -v mmdebstrap jq virt-make-fs git sha256sum" ]
-  - [ bash, -lc, "printf '%s\n' '{{\"schema\":1,\"source\":\"{source_url}\",\"checksum\":\"{checksum_algorithm}:{checksum_hex}\",\"disk_size_bytes\":{disk_size}}}' > /var/lib/petri-builder/provisioned.json" ]
+  - [ bash, -lc, "set -euxo pipefail; mkdir -p /workspace /run/petri /var/lib/petri-builder; mountpoint -q /workspace || mount -t virtiofs workspace /workspace; mkdir -p \"$(dirname '{bootstrap_log}')\"; echo petri builder provisioning started; systemctl daemon-reload; install -m 0755 '{guest_binary}' /usr/local/bin/petri-guest; systemctl enable workspace.mount run-petri.mount petri-guest.service; systemctl start workspace.mount run-petri.mount petri-guest.service; command -v mmdebstrap jq virt-make-fs git sha256sum; printf '%s\n' '{{\"schema\":1,\"source\":\"{source_url}\",\"checksum\":\"{checksum_algorithm}:{checksum_hex}\",\"disk_size_bytes\":{disk_size}}}' > /var/lib/petri-builder/provisioned.json; echo petri builder provisioning complete" ]
 "#,
         packages = packages,
         guest_binary = guest_binary_in_vm.display(),
+        bootstrap_log = bootstrap_log_in_vm.display(),
         source_url = source.source.replace('"', "\\\""),
         checksum_algorithm = source.checksum_algorithm,
         checksum_hex = source.checksum_hex,
