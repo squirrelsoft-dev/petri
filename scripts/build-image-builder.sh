@@ -119,6 +119,7 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 need_tool cargo
+need_tool codesign
 need_tool curl
 need_tool git
 need_tool hdiutil
@@ -131,6 +132,7 @@ cd "$repo_root"
 echo "building petri-vz helper"
 swift build --package-path crates/petri-vz
 petri_vz_bin="$repo_root/crates/petri-vz/.build/debug/petri-vz"
+codesign --force --sign - --entitlements "$repo_root/crates/petri-vz/petri-vz.entitlements" "$petri_vz_bin"
 
 cargo_args=(build -p petri)
 petri_bin="$repo_root/target/debug/petri"
