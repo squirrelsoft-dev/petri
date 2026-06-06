@@ -1,7 +1,10 @@
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{PetriError, Result};
+
+pub const GUEST_WORKSPACE_PATH: &str = "/workspace";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct InstanceId(String);
@@ -107,6 +110,13 @@ pub struct InstanceConfig {
     pub policy: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceContract {
+    pub host_path: PathBuf,
+    pub guest_path: PathBuf,
+    pub persists_after_teardown: bool,
+}
+
 impl InstanceConfig {
     pub fn new(
         id: InstanceId,
@@ -129,7 +139,7 @@ impl InstanceConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        validate_path("workspace", &self.workspace)?;
+        self.workspace_contract()?;
         validate_path("policy", &self.policy)?;
 
         if self.backend.is_empty() {
@@ -143,6 +153,14 @@ impl InstanceConfig {
         }
 
         Ok(())
+    }
+
+    pub fn workspace_contract(&self) -> Result<WorkspaceContract> {
+        Ok(WorkspaceContract {
+            host_path: validate_workspace_path(&self.workspace)?,
+            guest_path: PathBuf::from(GUEST_WORKSPACE_PATH),
+            persists_after_teardown: true,
+        })
     }
 }
 
@@ -173,9 +191,65 @@ fn validate_path(name: &str, path: &Path) -> Result<()> {
     }
 }
 
+fn validate_workspace_path(path: &Path) -> Result<PathBuf> {
+    validate_path("workspace", path)?;
+
+    if !path.is_absolute() {
+        return Err(PetriError::InvalidConfig(
+            "workspace path must be absolute".to_string(),
+        ));
+    }
+
+    let metadata = fs::metadata(path).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            PetriError::InvalidConfig(format!("workspace path does not exist: {}", path.display()))
+        } else {
+            PetriError::Io {
+                path: path.to_path_buf(),
+                source,
+            }
+        }
+    })?;
+
+    if !metadata.is_dir() {
+        return Err(PetriError::InvalidConfig(format!(
+            "workspace path must be a directory: {}",
+            path.display()
+        )));
+    }
+
+    fs::canonicalize(path).map_err(|source| PetriError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "petri-instance-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn config_with_workspace(workspace: PathBuf) -> InstanceConfig {
+        InstanceConfig::new(
+            InstanceId::new("dev-1").unwrap(),
+            "macos",
+            workspace,
+            PathBuf::from("policy.toml"),
+        )
+    }
 
     #[test]
     fn lifecycle_accepts_expected_vm_flow() {
@@ -208,5 +282,68 @@ mod tests {
         );
         assert!(!LifecycleState::TornDown.can_transition_to(LifecycleState::Ready));
         assert!(!LifecycleState::RunningDispatch.can_transition_to(LifecycleState::Stopping));
+    }
+
+    #[test]
+    fn workspace_contract_maps_absolute_host_directory_to_guest_workspace() {
+        let workspace = temp_dir("workspace-contract");
+        let config = config_with_workspace(workspace.clone());
+
+        let contract = config.workspace_contract().unwrap();
+
+        assert_eq!(contract.host_path, fs::canonicalize(workspace).unwrap());
+        assert_eq!(contract.guest_path, PathBuf::from(GUEST_WORKSPACE_PATH));
+        assert!(contract.persists_after_teardown);
+    }
+
+    #[test]
+    fn workspace_contract_rejects_relative_workspace() {
+        let err = config_with_workspace(PathBuf::from("relative-workspace"))
+            .workspace_contract()
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            "invalid instance config: workspace path must be absolute"
+        );
+    }
+
+    #[test]
+    fn workspace_contract_rejects_missing_workspace() {
+        let missing =
+            std::env::temp_dir().join(format!("petri-missing-workspace-{}", std::process::id()));
+        let err = config_with_workspace(missing.clone())
+            .workspace_contract()
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            format!(
+                "invalid instance config: workspace path does not exist: {}",
+                missing.display()
+            )
+        );
+    }
+
+    #[test]
+    fn workspace_contract_rejects_file_workspace() {
+        let dir = temp_dir("workspace-file");
+        let workspace = dir.join("not-a-directory");
+        fs::write(&workspace, b"file").unwrap();
+
+        let err = config_with_workspace(workspace.clone())
+            .workspace_contract()
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            format!(
+                "invalid instance config: workspace path must be a directory: {}",
+                workspace.display()
+            )
+        );
     }
 }

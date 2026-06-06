@@ -79,6 +79,12 @@ See [Vsock Dispatch Protocol](docs/vsock-dispatch-protocol.md) for the canonical
 
 The host and guest share a `/workspace` directory via **virtio-fs**. Writes inside the VM are instantly visible on the host — no transfer step, no polling. This is the same approach Apple's Containers app uses.
 
+The host workspace must be an absolute existing directory. Petri canonicalizes
+that host path before VM creation, maps it to `/workspace` in the guest, and
+leaves workspace contents in place after VM teardown. See
+[Workspace Mounting Contract](docs/workspace-contract.md) for the full host and
+guest behavior.
+
 ### Policy config
 
 Each VM boots with an immutable policy that governs what it may do:

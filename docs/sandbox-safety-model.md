@@ -55,6 +55,10 @@ The workspace is intentionally shared. Files written by the guest are visible to
 
 The workspace is not a secret boundary. Anything placed in the workspace should be treated as readable and writable by guest workload code allowed to operate there.
 
+The host-side mounting contract, including host path validation, guest
+`/workspace` mapping, file visibility, and teardown persistence, is defined in
+[Workspace Mounting Contract](workspace-contract.md).
+
 ### Vsock Dispatch Interface
 
 Vsock is the only command and result transport between host and guest. It is not a general host API. The guest agent accepts structured dispatch frames, applies policy, executes allowed work, and returns structured result frames.

@@ -12,6 +12,11 @@ The `macos` backend boots a Linux guest with Apple's Virtualization.framework
 through the `petri-vz` helper. It attaches the host workspace with virtio-fs tag
 `workspace`, exposes the immutable policy through a read-only `petri-config`
 share, and dispatches protocol frames to `petri-guest` over vsock port `7777`.
+The workspace host path must be an absolute existing directory. It is
+canonicalized by the host library, mounted at `/workspace` in the guest, and
+left untouched when VM runtime state is torn down. See
+[Workspace Mounting Contract](../../docs/workspace-contract.md) for the full
+contract.
 
 Runtime state is written to `$PETRI_STATE_DIR` when set, otherwise
 `$HOME/.petri/instances`. Set `PETRI_VZ_BIN` when `petri-vz` is not on `PATH`.

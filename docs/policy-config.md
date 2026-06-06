@@ -57,6 +57,10 @@ The guest agent rejects dispatches that request a working directory outside `wor
 
 Petri exposes the workspace as the only shared filesystem surface unless a future policy schema explicitly adds another shared path model.
 
+The host-side workspace contract requires an absolute existing host directory
+and maps it into the guest at `/workspace`; see
+[Workspace Mounting Contract](workspace-contract.md).
+
 ## Runtime Immutability
 
 The guest agent loads the policy before accepting vsock dispatch requests. Once loaded, the policy remains fixed until the VM is torn down and a new VM boots with a new policy.

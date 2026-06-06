@@ -1,6 +1,8 @@
 use crate::dispatch::{DispatchRequest, DispatchResult};
 use crate::error::{PetriError, Result};
-use crate::instance::{InstanceConfig, InstanceHandle, InstanceId, LifecycleState};
+use crate::instance::{
+    GUEST_WORKSPACE_PATH, InstanceConfig, InstanceHandle, InstanceId, LifecycleState,
+};
 
 use std::env;
 use std::fs;
@@ -19,7 +21,6 @@ use std::os::unix::process::CommandExt;
 const MACOS_BACKEND: &str = "macos";
 const WORKSPACE_TAG: &str = "workspace";
 const CONFIG_TAG: &str = "petri-config";
-const GUEST_WORKSPACE_PATH: &str = "/workspace";
 const GUEST_POLICY_PATH: &str = "/run/petri/policy.toml";
 const DEFAULT_DISPATCH_PORT: u32 = 7777;
 
@@ -296,10 +297,8 @@ impl MacosBackend {
             path: config.policy.clone(),
             source,
         })?;
-        let workspace = fs::canonicalize(&config.workspace).map_err(|source| PetriError::Io {
-            path: config.workspace.clone(),
-            source,
-        })?;
+        let workspace_contract = config.workspace_contract()?;
+        let workspace = workspace_contract.host_path;
         let config_dir = self.config_dir(&config.id);
         fs::create_dir_all(&config_dir).map_err(|source| PetriError::Io {
             path: config_dir.clone(),
@@ -434,10 +433,8 @@ impl MacosBackend {
             path: config.policy.clone(),
             source,
         })?;
-        let workspace = fs::canonicalize(&config.workspace).map_err(|source| PetriError::Io {
-            path: config.workspace.clone(),
-            source,
-        })?;
+        let workspace_contract = config.workspace_contract()?;
+        let workspace = workspace_contract.host_path;
         let guest_binary = resolve_guest_binary(&self.guest_binary)?;
         let listen_addr = reserve_loopback_addr()?;
         let mut command = Command::new(&guest_binary);
