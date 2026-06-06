@@ -4,6 +4,9 @@ Petri base images are Linux VM bundles with `petri-guest` installed and wired to
 the host contract used by the macOS MVP backend. The backend consumes a bundle
 directory through `petri create --image <bundle>`.
 
+For custom bundle requirements and upgrade guidance, see
+[Custom Image Compatibility](custom-image-compatibility.md).
+
 ## Bundle Layout
 
 `scripts/build-base-image.sh` writes this layout:
@@ -20,7 +23,9 @@ target/petri-images/base/
 
 `petri-image.json` is the runtime manifest consumed by `crates/petri`. It keeps
 paths relative to the bundle so the whole directory can move as one artifact.
-`build-info.json` is audit metadata and is not required to boot the VM.
+The default base image is a direct Linux boot bundle with `vmlinuz`, optional
+`initrd.img`, and `root.img`. `build-info.json` is audit metadata and is not
+required to boot the VM.
 
 ## Rebuild On Linux
 
@@ -37,10 +42,10 @@ Build the default macOS-compatible ARM64 image through the Petri CLI:
 petri image build
 ```
 
-The default config lives at
-`images/base/petri-base-image.toml`. It pins the Debian suite, snapshot mirror,
-guest Rust target, dispatch port, installed package set, and disk size. To build
-a local variant:
+The default config lives at `images/base/petri-base-image.toml`. It currently
+builds a Debian trixie ARM64 base image and pins the Debian suite and mirrors,
+guest Rust target, dispatch port, installed package set, and disk size. To
+build a local variant:
 
 ```sh
 petri image build \
@@ -95,10 +100,11 @@ Prepare the reusable builder bundle on macOS with:
 ```
 
 By default Petri downloads the official Debian 12 Bookworm ARM64 NoCloud raw
-image from `cloud.debian.org`, verifies it against the upstream `SHA512SUMS`,
-expands the copy to the requested `--disk-size` or 16 GiB, and provisions it on
-first boot. Downloads are cached in `target/petri-builder-cache`; override the
-source with `--builder-source <url-or-path>` and provide
+image from `cloud.debian.org` for the reusable builder VM, verifies it against
+the upstream `SHA512SUMS`, expands the copy to the requested `--disk-size` or
+16 GiB, and provisions it on first boot. Downloads are cached in
+`target/petri-builder-cache`; override the source with
+`--builder-source <url-or-path>` and provide
 `--builder-source-sha256 <hex>` or `--builder-source-checksums <path-or-url>`
 for non-default sources.
 
@@ -139,18 +145,25 @@ at `/usr/local/bin/petri-guest`. The image enables these systemd units:
 
 Those paths match the host backend constants in `crates/petri/src/backend.rs`.
 
-## Auditability
+## Auditability And Verification
 
 Every build writes `SHA256SUMS` for boot artifacts and `build-info.json` with:
 
 - source git revision and dirty-worktree flag
 - config path
-- Debian suite and snapshot mirrors
+- Debian suite and mirrors
 - guest Rust target and guest binary SHA-256
 - disk size and build timestamp
 
 For release builds, run from a clean worktree and archive the entire bundle
-directory. Consumers should verify `sha256sum -c SHA256SUMS` before use.
+directory. Consumers should verify the checksums and inspect the build metadata
+before use:
+
+```sh
+cd target/petri-images/base
+sha256sum -c SHA256SUMS
+cat build-info.json
+```
 
 ## Use With Host MVP
 
