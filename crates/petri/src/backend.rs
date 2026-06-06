@@ -26,6 +26,7 @@ const DEFAULT_DISPATCH_PORT: u32 = 7777;
 pub trait HostBackend {
     fn name(&self) -> &str;
     fn create(&self, config: InstanceConfig) -> Result<InstanceHandle>;
+    fn list(&self) -> Result<Vec<InstanceHandle>>;
     fn dispatch(
         &self,
         instance_id: &InstanceId,
@@ -64,6 +65,10 @@ impl HostBackend for PetriBackend {
                 message: "unknown backend; expected 'macos' or 'stub'".to_string(),
             }),
         }
+    }
+
+    fn list(&self) -> Result<Vec<InstanceHandle>> {
+        self.macos.list()
     }
 
     fn dispatch(
@@ -106,6 +111,10 @@ impl HostBackend for StubBackend {
     fn create(&self, config: InstanceConfig) -> Result<InstanceHandle> {
         config.validate()?;
         Err(self.unavailable("instance creation"))
+    }
+
+    fn list(&self) -> Result<Vec<InstanceHandle>> {
+        Ok(Vec::new())
     }
 
     fn dispatch(
@@ -218,6 +227,17 @@ impl MacosBackend {
         fs::write(&path, payload).map_err(|source| PetriError::Io { path, source })
     }
 
+    fn transition_state(
+        &self,
+        mut state: RuntimeState,
+        to: LifecycleState,
+        operation: &'static str,
+    ) -> Result<RuntimeState> {
+        state.lifecycle = state.lifecycle.transition(to, operation)?;
+        self.write_state(&state)?;
+        Ok(state)
+    }
+
     fn remove_state(&self, instance_id: &InstanceId) -> Result<()> {
         let instance_dir = self.instance_dir(instance_id);
         match fs::remove_dir_all(&instance_dir) {
@@ -228,6 +248,42 @@ impl MacosBackend {
                 source,
             }),
         }
+    }
+
+    fn list_states(&self) -> Result<Vec<RuntimeState>> {
+        let entries = match fs::read_dir(&self.state_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(PetriError::Io {
+                    path: self.state_dir.clone(),
+                    source,
+                });
+            }
+        };
+
+        let mut states = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| PetriError::Io {
+                path: self.state_dir.clone(),
+                source,
+            })?;
+            let path = entry.path().join("instance.json");
+            if !path.is_file() {
+                continue;
+            }
+            let input = fs::read_to_string(&path).map_err(|source| PetriError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            let state = serde_json::from_str(&input).map_err(|err| {
+                backend_error(format!("failed to parse {}: {err}", path.display()))
+            })?;
+            states.push(state);
+        }
+
+        states.sort_by(|left: &RuntimeState, right| left.id.as_str().cmp(right.id.as_str()));
+        Ok(states)
     }
 
     fn create_real_vm(&self, config: InstanceConfig) -> Result<InstanceHandle> {
@@ -324,9 +380,11 @@ impl MacosBackend {
             source,
         })?;
 
+        let booting = LifecycleState::Provisioning.transition(LifecycleState::Booting, "create")?;
         let state = RuntimeState {
             id: config.id.clone(),
             backend: self.name().to_string(),
+            lifecycle: booting,
             pid: child.id(),
             control_socket: Some(control_socket.clone()),
             dispatch_addr: None,
@@ -350,6 +408,7 @@ impl MacosBackend {
             },
         )
         .inspect_err(|_| {
+            let _ = self.transition_state(state.clone(), LifecycleState::Failed, "create");
             let _ = terminate_process(child.id());
         })
         .map_err(|err| {
@@ -361,10 +420,12 @@ impl MacosBackend {
             ))
         })?;
 
+        let state = self.transition_state(state, LifecycleState::Ready, "create")?;
+
         Ok(InstanceHandle {
-            id: config.id,
-            backend: self.name().to_string(),
-            state: LifecycleState::Ready,
+            id: state.id,
+            backend: state.backend,
+            state: state.lifecycle,
         })
     }
 
@@ -396,9 +457,11 @@ impl MacosBackend {
             source,
         })?;
 
+        let booting = LifecycleState::Provisioning.transition(LifecycleState::Booting, "create")?;
         let state = RuntimeState {
             id: config.id.clone(),
             backend: self.name().to_string(),
+            lifecycle: booting,
             pid: child.id(),
             control_socket: None,
             dispatch_addr: Some(listen_addr.to_string()),
@@ -412,14 +475,16 @@ impl MacosBackend {
         self.write_state(&state)?;
 
         wait_for_guest(&listen_addr, Duration::from_secs(5)).inspect_err(|_| {
+            let _ = self.transition_state(state.clone(), LifecycleState::Failed, "create");
             let _ = terminate_process(child.id());
-            let _ = self.remove_state(&config.id);
         })?;
 
+        let state = self.transition_state(state, LifecycleState::Ready, "create")?;
+
         Ok(InstanceHandle {
-            id: config.id,
-            backend: self.name().to_string(),
-            state: LifecycleState::Ready,
+            id: state.id,
+            backend: state.backend,
+            state: state.lifecycle,
         })
     }
 }
@@ -446,26 +511,40 @@ impl HostBackend for MacosBackend {
         }
     }
 
+    fn list(&self) -> Result<Vec<InstanceHandle>> {
+        self.list_states().map(|states| {
+            states
+                .into_iter()
+                .map(|state| InstanceHandle {
+                    id: state.id,
+                    backend: state.backend,
+                    state: state.lifecycle,
+                })
+                .collect()
+        })
+    }
+
     fn dispatch(
         &self,
         instance_id: &InstanceId,
         request: DispatchRequest,
     ) -> Result<DispatchResult> {
         let state = self.load_state(instance_id)?;
-        match state.transport {
+        let running = self.transition_state(state, LifecycleState::RunningDispatch, "dispatch")?;
+        let result = match running.transport {
             GuestTransport::Vsock => {
                 let response: HelperResponse = send_helper_request(
-                    &required_control_socket(&state)?,
+                    &required_control_socket(&running)?,
                     &HelperRequest::Dispatch { request },
                 )?;
                 response.into_dispatch_result()
             }
             GuestTransport::TcpLoopback => {
                 let mut stream =
-                    TcpStream::connect(required_dispatch_addr(&state)?).map_err(|source| {
+                    TcpStream::connect(required_dispatch_addr(&running)?).map_err(|source| {
                         backend_error(format!(
                             "failed to connect to guest at {}: {source}",
-                            required_dispatch_addr(&state).unwrap_or("<missing>")
+                            required_dispatch_addr(&running).unwrap_or("<missing>")
                         ))
                     })?;
 
@@ -495,23 +574,53 @@ impl HostBackend for MacosBackend {
                 serde_json::from_str(&response)
                     .map_err(|err| backend_error(format!("failed to decode guest response: {err}")))
             }
+        };
+
+        match result {
+            Ok(result) => {
+                let _ = self.transition_state(running, LifecycleState::Ready, "dispatch")?;
+                Ok(result)
+            }
+            Err(err) => {
+                let _ = self.transition_state(running, LifecycleState::Failed, "dispatch");
+                Err(err)
+            }
         }
     }
 
     fn stop(&self, instance_id: &InstanceId) -> Result<()> {
         let state = self.load_state(instance_id)?;
-        match state.transport {
+        let stopping = self.transition_state(state, LifecycleState::Stopping, "stop")?;
+        let result = match stopping.transport {
             GuestTransport::Vsock => {
-                let response: HelperResponse =
-                    send_helper_request(&required_control_socket(&state)?, &HelperRequest::Stop)?;
+                let response: HelperResponse = send_helper_request(
+                    &required_control_socket(&stopping)?,
+                    &HelperRequest::Stop,
+                )?;
                 response.ensure_ok()
             }
-            GuestTransport::TcpLoopback => terminate_process(state.pid),
+            GuestTransport::TcpLoopback => terminate_process(stopping.pid),
+        };
+
+        match result {
+            Ok(()) => {
+                let _ = self.transition_state(stopping, LifecycleState::TornDown, "stop")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.transition_state(stopping, LifecycleState::Failed, "stop");
+                Err(err)
+            }
         }
     }
 
     fn teardown(&self, instance_id: &InstanceId) -> Result<()> {
         if let Ok(state) = self.load_state(instance_id) {
+            let state = if state.lifecycle == LifecycleState::TornDown {
+                state
+            } else {
+                self.transition_state(state, LifecycleState::TornDown, "teardown")?
+            };
             match state.transport {
                 GuestTransport::Vsock => {
                     let _ = send_helper_request::<HelperResponse>(
@@ -533,6 +642,8 @@ impl HostBackend for MacosBackend {
 struct RuntimeState {
     id: InstanceId,
     backend: String,
+    #[serde(default = "default_runtime_lifecycle")]
+    lifecycle: LifecycleState,
     pid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     control_socket: Option<PathBuf>,
@@ -832,6 +943,10 @@ fn default_dispatch_port() -> u32 {
 
 fn default_ready_timeout_secs() -> u64 {
     90
+}
+
+fn default_runtime_lifecycle() -> LifecycleState {
+    LifecycleState::Ready
 }
 
 fn loopback_fallback_enabled() -> bool {
@@ -1134,6 +1249,23 @@ mod tests {
         path
     }
 
+    fn runtime_state(id: InstanceId, lifecycle: LifecycleState) -> RuntimeState {
+        RuntimeState {
+            id,
+            backend: MACOS_BACKEND.to_string(),
+            lifecycle,
+            pid: 0,
+            control_socket: None,
+            dispatch_addr: Some("127.0.0.1:9".to_string()),
+            workspace: PathBuf::from("/workspace"),
+            host_policy: PathBuf::from("/policy.toml"),
+            guest_policy: PathBuf::from("/run/petri/policy.toml"),
+            image: None,
+            transport: GuestTransport::TcpLoopback,
+            vm: MacosVmSpec::loopback(None),
+        }
+    }
+
     #[test]
     fn image_bundle_loads_manifest_and_resolves_files() {
         let dir = temp_dir("image-bundle");
@@ -1246,5 +1378,45 @@ mod tests {
         assert_eq!(spec.dispatch_transport, "vsock");
         assert_eq!(spec.dispatch_port, DEFAULT_DISPATCH_PORT);
         assert!(spec.guest_program.contains("petri-guest"));
+    }
+
+    #[test]
+    fn macos_backend_lists_persisted_lifecycle_state() {
+        let state_dir = temp_dir("lifecycle-list");
+        let backend = MacosBackend::new(&state_dir, "petri-vz");
+        let id = InstanceId::new("lifecycle-list").unwrap();
+        backend
+            .write_state(&runtime_state(id.clone(), LifecycleState::Stopping))
+            .unwrap();
+
+        let instances = backend.list().unwrap();
+
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].id, id);
+        assert_eq!(instances[0].state, LifecycleState::Stopping);
+    }
+
+    #[test]
+    fn macos_backend_rejects_dispatch_from_torn_down_state() {
+        let state_dir = temp_dir("lifecycle-invalid-dispatch");
+        let backend = MacosBackend::new(&state_dir, "petri-vz");
+        let id = InstanceId::new("lifecycle-invalid-dispatch").unwrap();
+        backend
+            .write_state(&runtime_state(id.clone(), LifecycleState::TornDown))
+            .unwrap();
+        let request = DispatchRequest::bash_command(
+            "request-1",
+            "pwd",
+            Vec::new(),
+            PathBuf::from("/workspace"),
+            None,
+        );
+
+        let err = backend.dispatch(&id, request).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "invalid lifecycle transition during dispatch: torn_down -> running_dispatch"
+        );
     }
 }

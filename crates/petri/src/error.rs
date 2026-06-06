@@ -23,6 +23,11 @@ pub enum PetriError {
         backend: String,
         message: String,
     },
+    LifecycleTransition {
+        operation: &'static str,
+        from: &'static str,
+        to: &'static str,
+    },
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -47,6 +52,14 @@ impl std::fmt::Display for PetriError {
                 write!(f, "backend '{backend}' does not implement {operation} yet")
             }
             Self::Backend { backend, message } => write!(f, "backend '{backend}': {message}"),
+            Self::LifecycleTransition {
+                operation,
+                from,
+                to,
+            } => write!(
+                f,
+                "invalid lifecycle transition during {operation}: {from} -> {to}"
+            ),
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
         }
     }
