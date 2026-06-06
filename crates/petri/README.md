@@ -43,11 +43,12 @@ is not the normal `macos` backend behavior.
 ## CLI
 
 ```text
-petri create --id <id> --workspace <path> --policy <path> [--image <path>] [--backend macos|stub]
-petri dispatch --id <id> --command <name> --cwd <path> [--request-id <id>] [--arg <value>]... [--timeout-ms <ms>] [--max-output-bytes <bytes>]
+petri sandbox list [--state running|paused] [--metadata key=value,key2=value2] [--limit <n>] [--format pretty|json]
+petri sandbox create [base] --workspace <path> --policy <path> [--id <id>] [--image <path>] [--backend macos|stub]
+petri sandbox connect <sandbox-id>
+petri sandbox exec [--cwd <path>] [--env key=value[,key2=value2]] [--timeout-ms <ms>] [--max-output-bytes <bytes>] <sandbox-id> <command> [args...]
+petri sandbox kill [--all | <sandbox-id>...]
 petri image build [--builder auto|linux|vm] [--builder-image <bundle>] [--prepare-builder] [--builder-source <url-or-path>] [--config <path>] [--out-dir <path>] [--disk-size <size>]
-petri stop --id <id>
-petri teardown --id <id>
 ```
 
 Example local smoke test:
@@ -55,24 +56,26 @@ Example local smoke test:
 ```sh
 swift build --package-path crates/petri-vz
 cargo build
-PETRI_VZ_BIN=crates/petri-vz/.build/debug/petri-vz target/debug/petri create \
+PETRI_VZ_BIN=crates/petri-vz/.build/debug/petri-vz target/debug/petri sandbox create base \
   --id dev-1 \
   --workspace /absolute/workspace \
   --policy /absolute/policy.toml \
   --image /absolute/petri-image-bundle \
   --backend macos
-target/debug/petri dispatch \
-  --id dev-1 \
+target/debug/petri sandbox exec \
   --request-id req-1 \
-  --command printf \
-  --arg hello \
-  --cwd /absolute/workspace
-target/debug/petri teardown --id dev-1
+  --cwd /workspace \
+  dev-1 \
+  printf \
+  hello
+target/debug/petri sandbox kill dev-1
 ```
 
-`dispatch` currently models protocol version 1 `bash_command` requests. Backend
-implementations are responsible for opening the guest transport, sending the
-NDJSON frame, and returning the structured result.
+`sandbox exec` currently models protocol version 1 `bash_command` requests.
+Backend implementations are responsible for opening the guest transport,
+sending the NDJSON frame, and returning the structured result. The legacy
+`create`, `dispatch`, `stop`, and `teardown` commands remain available as
+compatibility aliases during the CLI migration.
 
 On macOS, `petri image build` can use a Petri builder VM with
 `--builder vm --builder-image <bundle>` or `PETRI_BUILDER_IMAGE`. The builder VM

@@ -1409,6 +1409,8 @@ mod tests {
             "pwd",
             Vec::new(),
             PathBuf::from("/workspace"),
+            std::collections::BTreeMap::new(),
+            None,
             None,
         );
 

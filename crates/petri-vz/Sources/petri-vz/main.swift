@@ -377,7 +377,9 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
 
     private func createVirtualMachine() throws -> VZVirtualMachine {
         let configuration = VZVirtualMachineConfiguration()
-        configuration.platform = VZGenericPlatformConfiguration()
+        let platform = VZGenericPlatformConfiguration()
+        platform.machineIdentifier = VZGenericMachineIdentifier()
+        configuration.platform = platform
         configuration.cpuCount = 2
         configuration.memorySize = 1_073_741_824
 
@@ -399,6 +401,7 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
         configuration.socketDevices = [VZVirtioSocketDeviceConfiguration()]
         configuration.networkDevices = [networkDevice()]
         configuration.serialPorts = [try serialPort(path: args.consoleLog!)]
+        configuration.consoleDevices = [try consoleDevice(path: args.consoleLog!)]
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         configuration.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
 
@@ -409,6 +412,9 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
     private func bootLoader() throws -> VZBootLoader {
         switch args.bootMode {
         case "linux":
+            log("linux boot kernel path: \(args.kernel!)")
+            log("linux boot initrd path: \(String(describing: args.initrd))")
+            log("linux boot command line: \(args.commandLine!)")
             let bootLoader = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: args.kernel!))
             bootLoader.commandLine = args.commandLine!
             if let initrd = args.initrd {
@@ -447,6 +453,16 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
         let url = URL(fileURLWithPath: path)
         config.attachment = try VZFileSerialPortAttachment(url: url, append: false)
         return config
+    }
+
+    private func consoleDevice(path: String) throws -> VZVirtioConsoleDeviceConfiguration {
+        let device = VZVirtioConsoleDeviceConfiguration()
+        let port = VZVirtioConsolePortConfiguration()
+        let url = URL(fileURLWithPath: path)
+        port.attachment = try VZFileSerialPortAttachment(url: url, append: true)
+        port.isConsole = true
+        device.ports[0] = port
+        return device
     }
 
     private func directoryShare(tag: String, path: String, readOnly: Bool) -> VZVirtioFileSystemDeviceConfiguration {

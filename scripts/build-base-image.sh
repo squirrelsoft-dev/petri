@@ -116,10 +116,13 @@ read_toml_array() {
 }
 
 need_tool awk
-need_tool mmdebstrap
+need_tool dd
 need_tool mke2fs
+need_tool mmdebstrap
 need_tool python3
 need_tool sha256sum
+need_tool sgdisk
+need_tool stat
 
 if [ ! -f "$config" ]; then
   echo "config not found: $config" >&2
@@ -185,6 +188,7 @@ install -d "$rootfs$workspace_path" "$rootfs/run/petri" "$rootfs/etc/systemd/sys
 
 cat > "$rootfs/etc/modules-load.d/petri.conf" <<'EOF'
 virtiofs
+virtio_console
 vsock
 vmw_vsock_virtio_transport
 EOF
@@ -260,28 +264,39 @@ if [ -n "$initrd" ]; then
 fi
 
 truncate -s "$disk_size" "$out_dir/root.img"
-mke2fs -t ext4 -F -d "$rootfs" "$out_dir/root.img"
+disk_bytes="$(stat -c '%s' "$out_dir/root.img")"
+sector_size=512
+disk_sectors=$((disk_bytes / sector_size))
+root_start_sector=2048
+root_end_sector=$((disk_sectors - 34))
+root_size=$(((root_end_sector - root_start_sector + 1) * sector_size))
 
-kernel_command_line="console=hvc0 root=/dev/vda rw systemd.unit=multi-user.target"
-initrd_manifest=""
-if [ -f "$out_dir/initrd.img" ]; then
-  initrd_manifest="initrd.img"
-fi
+sgdisk --clear \
+  --new=1:${root_start_sector}:${root_end_sector} \
+  --typecode=1:B921B045-1DF0-41C3-AF44-4C6F280D3FAE \
+  --change-name=1:root \
+  "$out_dir/root.img" >/dev/null
 
-python3 - "$out_dir/petri-image.json" "$arch" "vmlinuz" "root.img" "$initrd_manifest" "$kernel_command_line" "$dispatch_port" <<'PY'
+root_part="$work_dir/root.part"
+truncate -s "$root_size" "$root_part"
+mke2fs -t ext4 -F -d "$rootfs" "$root_part"
+
+dd if="$root_part" of="$out_dir/root.img" bs=512 seek="$root_start_sector" conv=notrunc status=none
+
+python3 - "$out_dir/petri-image.json" "$arch" "root.img" "$dispatch_port" "$initrd" <<'PY'
 import json
 import sys
 
-path, architecture, kernel, disk, initrd, kernel_command_line, dispatch_port = sys.argv[1:]
+path, architecture, disk, dispatch_port, initrd = sys.argv[1:]
 payload = {
     "architecture": architecture,
-    "kernel": kernel,
+    "kernel": "vmlinuz",
     "disk": disk,
-    "kernel_command_line": kernel_command_line,
+    "kernel_command_line": "root=/dev/vda1 rootwait rw console=hvc0 systemd.unit=multi-user.target systemd.show_status=1 systemd.log_target=console systemd.journald.forward_to_console=1",
     "dispatch_port": int(dispatch_port),
 }
 if initrd:
-    payload["initrd"] = initrd
+    payload["initrd"] = "initrd.img"
 with open(path, "w", encoding="utf-8") as output:
     json.dump(payload, output, indent=2)
     output.write("\n")

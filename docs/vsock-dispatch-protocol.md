@@ -86,6 +86,8 @@ The initial tool name is `bash_command`, but the command is not shell text. It d
 | `command` | string | yes | Executable name. Must match the immutable policy allowlist. |
 | `argv` | array of strings | no | Arguments passed to the executable. Defaults to an empty array. |
 | `cwd` | absolute string path | yes | Working directory. Must canonicalize inside the policy workspace root. |
+| `env` | object of string values | no | Extra environment variables passed to the process. Defaults to an empty object. |
+| `stdin` | string | no | Data written once to process stdin before stdin is closed. Defaults to no stdin. |
 
 The guest must not pass `command` through a shell. Shell snippets, command chaining, path traversal, and symlink escapes are rejected by policy checks.
 

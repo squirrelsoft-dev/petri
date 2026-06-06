@@ -3,9 +3,9 @@ name = "petri-base"
 architecture = "aarch64"
 distro = "debian"
 debian_arch = "arm64"
-suite = "bookworm"
-mirror = "https://snapshot.debian.org/archive/debian/20240601T000000Z"
-security_mirror = "https://snapshot.debian.org/archive/debian-security/20240601T000000Z"
+suite = "trixie"
+mirror = "https://deb.debian.org/debian"
+security_mirror = "https://deb.debian.org/debian-security"
 disk_size = "2G"
 
 [guest]
@@ -19,7 +19,7 @@ dispatch_port = 7777
 [packages]
 base = [
   "ca-certificates",
-  "linux-image-arm64",
+  "linux-image-cloud-arm64",
   "systemd",
   "systemd-sysv",
   "udev",

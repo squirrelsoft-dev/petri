@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,9 @@ pub enum Command {
     Create(CreateCommand),
     Dispatch(DispatchCommand),
     ImageBuild(ImageBuildCommand),
+    SandboxList(SandboxListCommand),
+    SandboxConnect(InstanceCommand),
+    SandboxKill(SandboxKillCommand),
     Stop(InstanceCommand),
     Teardown(InstanceCommand),
 }
@@ -21,12 +25,46 @@ pub enum Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateCommand {
     pub config: InstanceConfig,
+    pub output: CreateOutput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchCommand {
     pub instance_id: InstanceId,
     pub request: DispatchRequest,
+    pub stdin_passthrough: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateOutput {
+    LegacyMessage,
+    SandboxId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxListCommand {
+    pub state: Option<SandboxStateFilter>,
+    pub metadata: BTreeMap<String, String>,
+    pub limit: Option<usize>,
+    pub format: OutputFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxStateFilter {
+    Running,
+    Paused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Pretty,
+    Json,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxKillCommand {
+    pub all: bool,
+    pub instance_ids: Vec<InstanceId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,19 +99,40 @@ pub enum ImageBuilder {
 }
 
 pub fn run(args: impl IntoIterator<Item = OsString>, backend: &impl HostBackend) -> Result<String> {
+    run_with_stdin(args, backend, None)
+}
+
+pub fn run_with_stdin(
+    args: impl IntoIterator<Item = OsString>,
+    backend: &impl HostBackend,
+    stdin: Option<String>,
+) -> Result<String> {
     match parse(args)? {
         Command::Create(command) => {
             let handle = backend.create(command.config)?;
-            Ok(format!(
-                "created instance {} with backend {}",
-                handle.id, handle.backend
-            ))
+            match command.output {
+                CreateOutput::LegacyMessage => Ok(format!(
+                    "created instance {} with backend {}",
+                    handle.id, handle.backend
+                )),
+                CreateOutput::SandboxId => Ok(handle.id.to_string()),
+            }
         }
         Command::Dispatch(command) => {
-            let result = backend.dispatch(&command.instance_id, command.request)?;
+            let request = match (command.stdin_passthrough, stdin) {
+                (true, Some(stdin)) => command.request.with_stdin(stdin),
+                _ => command.request,
+            };
+            let result = backend.dispatch(&command.instance_id, request)?;
             serde_json::to_string(&result).map_err(|err| PetriError::Cli(err.to_string()))
         }
         Command::ImageBuild(command) => run_image_build(command, backend),
+        Command::SandboxList(command) => run_sandbox_list(command, backend),
+        Command::SandboxConnect(command) => Err(PetriError::Cli(format!(
+            "sandbox connect is not implemented yet for instance {}",
+            command.instance_id
+        ))),
+        Command::SandboxKill(command) => run_sandbox_kill(command, backend),
         Command::Stop(command) => {
             backend.stop(&command.instance_id)?;
             Ok(format!("stopped instance {}", command.instance_id))
@@ -97,6 +156,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
         "create" => parse_create(args),
         "dispatch" => parse_dispatch(args),
         "image" => parse_image(args),
+        "sandbox" => parse_sandbox(args),
         "stop" => parse_instance_command(args, CommandKind::Stop),
         "teardown" => parse_instance_command(args, CommandKind::Teardown),
         "--help" | "-h" | "help" => Err(PetriError::Cli(usage())),
@@ -120,6 +180,247 @@ fn parse_image(mut args: impl Iterator<Item = String>) -> Result<Command> {
             image_usage()
         ))),
     }
+}
+
+fn parse_sandbox(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let Some(subcommand) = args.next() else {
+        return Err(PetriError::Cli(sandbox_usage()));
+    };
+
+    match subcommand.as_str() {
+        "list" => parse_sandbox_list(args),
+        "create" => parse_sandbox_create(args),
+        "connect" => parse_sandbox_connect(args),
+        "exec" => parse_sandbox_exec(args),
+        "kill" => parse_sandbox_kill(args),
+        "--help" | "-h" | "help" => Err(PetriError::Cli(sandbox_usage())),
+        _ => Err(PetriError::Cli(format!(
+            "unknown sandbox command '{subcommand}'\n{}",
+            sandbox_usage()
+        ))),
+    }
+}
+
+fn parse_sandbox_list(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let mut command = SandboxListCommand {
+        state: None,
+        metadata: BTreeMap::new(),
+        limit: None,
+        format: OutputFormat::Pretty,
+    };
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--state" => command.state = Some(parse_state_filter(next_arg(&mut args, "--state")?)?),
+            "--metadata" => {
+                command.metadata =
+                    parse_key_value_list(next_arg(&mut args, "--metadata")?, "--metadata")?
+            }
+            "--limit" => {
+                let value = parse_u64(next_arg(&mut args, "--limit")?, "--limit")?;
+                command.limit =
+                    Some(
+                        usize::try_from(value).map_err(|_| PetriError::InvalidArgument {
+                            flag: "--limit",
+                            value: value.to_string(),
+                            message: "expected a value that fits in usize".to_string(),
+                        })?,
+                    );
+            }
+            "--format" => command.format = parse_output_format(next_arg(&mut args, "--format")?)?,
+            "--help" | "-h" => return Err(PetriError::Cli(sandbox_list_usage())),
+            _ => {
+                return Err(PetriError::Cli(format!(
+                    "unknown sandbox list argument '{arg}'"
+                )));
+            }
+        }
+    }
+
+    Ok(Command::SandboxList(command))
+}
+
+fn parse_sandbox_create(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let mut template = None;
+    let mut id = None;
+    let mut backend = "macos".to_string();
+    let mut image = None;
+    let mut workspace = None;
+    let mut policy = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--id" => id = Some(InstanceId::new(next_arg(&mut args, "--id")?)?),
+            "--backend" => backend = next_arg(&mut args, "--backend")?,
+            "--image" => image = Some(PathBuf::from(next_arg(&mut args, "--image")?)),
+            "--workspace" => workspace = Some(PathBuf::from(next_arg(&mut args, "--workspace")?)),
+            "--policy" => policy = Some(PathBuf::from(next_arg(&mut args, "--policy")?)),
+            "--help" | "-h" => return Err(PetriError::Cli(sandbox_create_usage())),
+            _ if arg.starts_with('-') => {
+                return Err(PetriError::Cli(format!(
+                    "unknown sandbox create argument '{arg}'"
+                )));
+            }
+            _ => {
+                if template.replace(arg.clone()).is_some() {
+                    return Err(PetriError::Cli(format!(
+                        "unexpected sandbox create argument '{arg}'"
+                    )));
+                }
+            }
+        }
+    }
+
+    let id = match id {
+        Some(id) => id,
+        None => InstanceId::new(format!("petri-{}", unique_build_id()?))?,
+    };
+    let workspace = workspace.ok_or(PetriError::MissingArgument {
+        flag: "--workspace",
+    })?;
+    let policy = policy.ok_or(PetriError::MissingArgument { flag: "--policy" })?;
+    let mut config = InstanceConfig::new(id, backend, workspace, policy);
+    let image = match (image, template.as_deref()) {
+        (Some(image), _) => Some(image),
+        (None, None | Some("base")) => Some(default_base_image()),
+        (None, Some(template)) => {
+            return Err(PetriError::InvalidArgument {
+                flag: "template",
+                value: template.to_string(),
+                message: "only the base template is currently supported".to_string(),
+            });
+        }
+    };
+
+    if let Some(image) = image {
+        config = config.with_image(image);
+    }
+
+    Ok(Command::Create(CreateCommand {
+        config,
+        output: CreateOutput::SandboxId,
+    }))
+}
+
+fn parse_sandbox_connect(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let Some(id) = args.next() else {
+        return Err(PetriError::Cli(sandbox_connect_usage()));
+    };
+    if matches!(id.as_str(), "--help" | "-h") {
+        return Err(PetriError::Cli(sandbox_connect_usage()));
+    }
+    if let Some(extra) = args.next() {
+        return Err(PetriError::Cli(format!(
+            "unexpected sandbox connect argument '{extra}'"
+        )));
+    }
+
+    Ok(Command::SandboxConnect(InstanceCommand {
+        instance_id: InstanceId::new(id)?,
+    }))
+}
+
+fn parse_sandbox_exec(args: impl Iterator<Item = String>) -> Result<Command> {
+    let mut args = args.peekable();
+    let mut request_id = "sandbox-exec-1".to_string();
+    let mut cwd = PathBuf::from("/workspace");
+    let mut env = BTreeMap::new();
+    let mut timeout_ms = None;
+    let mut max_output_bytes = None;
+    let mut instance_id = None;
+    let mut command = None;
+    let mut argv = Vec::new();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--request-id" => request_id = next_arg(&mut args, "--request-id")?,
+            "--cwd" => cwd = PathBuf::from(next_arg(&mut args, "--cwd")?),
+            "--env" => {
+                let value = next_arg(&mut args, "--env")?;
+                env.extend(parse_key_value_list(value, "--env")?);
+            }
+            "--timeout-ms" => {
+                timeout_ms = Some(parse_u64(
+                    next_arg(&mut args, "--timeout-ms")?,
+                    "--timeout-ms",
+                )?)
+            }
+            "--max-output-bytes" => {
+                max_output_bytes = Some(parse_u64(
+                    next_arg(&mut args, "--max-output-bytes")?,
+                    "--max-output-bytes",
+                )?)
+            }
+            "--help" | "-h" => return Err(PetriError::Cli(sandbox_exec_usage())),
+            "--background" => {
+                return Err(PetriError::Cli(
+                    "sandbox exec --background is not implemented yet".to_string(),
+                ));
+            }
+            "--user" => {
+                let value = next_arg(&mut args, "--user")?;
+                return Err(PetriError::Cli(format!(
+                    "sandbox exec --user {value} is not implemented yet"
+                )));
+            }
+            _ if arg.starts_with('-') => {
+                return Err(PetriError::Cli(format!(
+                    "unknown sandbox exec argument '{arg}'"
+                )));
+            }
+            _ if instance_id.is_none() => instance_id = Some(InstanceId::new(arg)?),
+            _ => {
+                command = Some(arg);
+                argv.extend(args);
+                break;
+            }
+        }
+    }
+
+    let instance_id = instance_id.ok_or(PetriError::MissingArgument {
+        flag: "<sandbox-id>",
+    })?;
+    let command = command.ok_or(PetriError::MissingArgument { flag: "<command>" })?;
+    let limits = (timeout_ms.is_some() || max_output_bytes.is_some()).then_some(RequestLimits {
+        timeout_ms,
+        max_output_bytes,
+    });
+    let request = DispatchRequest::bash_command(request_id, command, argv, cwd, env, None, limits);
+
+    Ok(Command::Dispatch(DispatchCommand {
+        instance_id,
+        request,
+        stdin_passthrough: true,
+    }))
+}
+
+fn parse_sandbox_kill(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let mut all = false;
+    let mut instance_ids = Vec::new();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--all" => all = true,
+            "--help" | "-h" => return Err(PetriError::Cli(sandbox_kill_usage())),
+            _ if arg.starts_with('-') => {
+                return Err(PetriError::Cli(format!(
+                    "unknown sandbox kill argument '{arg}'"
+                )));
+            }
+            _ => instance_ids.push(InstanceId::new(arg)?),
+        }
+    }
+
+    if (all && !instance_ids.is_empty()) || (!all && instance_ids.is_empty()) {
+        return Err(PetriError::Cli(
+            "sandbox kill requires --all or at least one sandbox id".to_string(),
+        ));
+    }
+
+    Ok(Command::SandboxKill(SandboxKillCommand {
+        all,
+        instance_ids,
+    }))
 }
 
 fn parse_image_build(mut args: impl Iterator<Item = String>) -> Result<Command> {
@@ -230,7 +531,10 @@ fn parse_create(mut args: impl Iterator<Item = String>) -> Result<Command> {
         config = config.with_image(image);
     }
 
-    Ok(Command::Create(CreateCommand { config }))
+    Ok(Command::Create(CreateCommand {
+        config,
+        output: CreateOutput::LegacyMessage,
+    }))
 }
 
 fn parse_dispatch(mut args: impl Iterator<Item = String>) -> Result<Command> {
@@ -287,11 +591,20 @@ fn parse_dispatch(mut args: impl Iterator<Item = String>) -> Result<Command> {
         timeout_ms,
         max_output_bytes,
     });
-    let request = DispatchRequest::bash_command(request_id, command, argv, cwd, limits);
+    let request = DispatchRequest::bash_command(
+        request_id,
+        command,
+        argv,
+        cwd,
+        BTreeMap::new(),
+        None,
+        limits,
+    );
 
     Ok(Command::Dispatch(DispatchCommand {
         instance_id,
         request,
+        stdin_passthrough: false,
     }))
 }
 
@@ -352,6 +665,122 @@ fn parse_u64(value: String, flag: &'static str) -> Result<u64> {
                 Ok(value)
             }
         })
+}
+
+fn parse_state_filter(value: String) -> Result<SandboxStateFilter> {
+    match value.as_str() {
+        "running" => Ok(SandboxStateFilter::Running),
+        "paused" => Ok(SandboxStateFilter::Paused),
+        _ => Err(PetriError::InvalidArgument {
+            flag: "--state",
+            value,
+            message: "expected running or paused".to_string(),
+        }),
+    }
+}
+
+fn parse_output_format(value: String) -> Result<OutputFormat> {
+    match value.as_str() {
+        "pretty" => Ok(OutputFormat::Pretty),
+        "json" => Ok(OutputFormat::Json),
+        _ => Err(PetriError::InvalidArgument {
+            flag: "--format",
+            value,
+            message: "expected pretty or json".to_string(),
+        }),
+    }
+}
+
+fn parse_key_value_list(value: String, flag: &'static str) -> Result<BTreeMap<String, String>> {
+    let mut pairs = BTreeMap::new();
+    if value.is_empty() {
+        return Ok(pairs);
+    }
+
+    for pair in value.split(',') {
+        let Some((key, value)) = pair.split_once('=') else {
+            return Err(PetriError::InvalidArgument {
+                flag,
+                value: pair.to_string(),
+                message: "expected key=value".to_string(),
+            });
+        };
+        if key.is_empty() {
+            return Err(PetriError::InvalidArgument {
+                flag,
+                value: pair.to_string(),
+                message: "key must be non-empty".to_string(),
+            });
+        }
+        pairs.insert(key.to_string(), value.to_string());
+    }
+
+    Ok(pairs)
+}
+
+fn default_base_image() -> PathBuf {
+    std::env::var_os("PETRI_BASE_IMAGE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            repo_root_fallback()
+                .join("target")
+                .join("petri-images")
+                .join("base")
+        })
+}
+
+fn run_sandbox_list(command: SandboxListCommand, backend: &impl HostBackend) -> Result<String> {
+    let mut instances = backend.list()?;
+    if !command.metadata.is_empty() {
+        instances.clear();
+    }
+    if let Some(state) = command.state {
+        instances.retain(|instance| match state {
+            SandboxStateFilter::Running => instance.state.is_running(),
+            SandboxStateFilter::Paused => false,
+        });
+    }
+    if let Some(limit) = command.limit {
+        instances.truncate(limit);
+    }
+
+    match command.format {
+        OutputFormat::Json => {
+            serde_json::to_string(&instances).map_err(|err| PetriError::Cli(err.to_string()))
+        }
+        OutputFormat::Pretty => {
+            if instances.is_empty() {
+                return Ok("no sandboxes".to_string());
+            }
+
+            let mut lines = vec!["ID\tBACKEND\tSTATE".to_string()];
+            lines.extend(instances.into_iter().map(|instance| {
+                format!(
+                    "{}\t{}\t{:?}",
+                    instance.id, instance.backend, instance.state
+                )
+            }));
+            Ok(lines.join("\n"))
+        }
+    }
+}
+
+fn run_sandbox_kill(command: SandboxKillCommand, backend: &impl HostBackend) -> Result<String> {
+    let instance_ids = if command.all {
+        backend
+            .list()?
+            .into_iter()
+            .map(|instance| instance.id)
+            .collect()
+    } else {
+        command.instance_ids
+    };
+
+    for instance_id in &instance_ids {
+        backend.teardown(instance_id)?;
+    }
+
+    Ok(format!("killed {} sandbox(s)", instance_ids.len()))
 }
 
 fn run_image_build(command: ImageBuildCommand, backend: &impl HostBackend) -> Result<String> {
@@ -524,6 +953,8 @@ fn run_prepare_builder(command: ImageBuildCommand, backend: &impl HostBackend) -
         "bash",
         vec!["-lc".to_string(), builder_package_install_script()],
         PathBuf::from("/workspace"),
+        BTreeMap::new(),
+        None,
         Some(RequestLimits {
             timeout_ms: Some(30 * 60 * 1000),
             max_output_bytes: Some(2 * 1024 * 1024),
@@ -549,6 +980,8 @@ fn run_prepare_builder(command: ImageBuildCommand, backend: &impl HostBackend) -
                 .to_string(),
         ],
         PathBuf::from("/workspace"),
+        BTreeMap::new(),
+        None,
         Some(RequestLimits {
             timeout_ms: Some(5 * 60 * 1000),
             max_output_bytes: Some(256 * 1024),
@@ -574,6 +1007,8 @@ fn run_prepare_builder(command: ImageBuildCommand, backend: &impl HostBackend) -
                 .to_string(),
         ],
         PathBuf::from("/workspace"),
+        BTreeMap::new(),
+        None,
         Some(RequestLimits {
             timeout_ms: Some(5 * 60 * 1000),
             max_output_bytes: Some(256 * 1024),
@@ -1483,6 +1918,8 @@ fn run_vm_image_build(command: ImageBuildCommand, backend: &impl HostBackend) ->
             vm_build_script(&command, &staged_out_dir_in_vm, &guest_binary_in_vm)?,
         ],
         PathBuf::from("/workspace"),
+        BTreeMap::new(),
+        None,
         Some(RequestLimits {
             timeout_ms: Some(3 * 60 * 60 * 1000),
             max_output_bytes: Some(4 * 1024 * 1024),
@@ -1613,7 +2050,7 @@ fn vm_build_script(
     }
 
     Ok(format!(
-        "set -euo pipefail; rm -f /etc/resolv.conf; printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\noptions timeout:2 attempts:3\\n' > /etc/resolv.conf; export TMPDIR=/var/tmp/petri-builder-tmp; mkdir -p \"$TMPDIR\"; {}",
+        "set -euo pipefail; rm -f /etc/resolv.conf; printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\noptions timeout:2 attempts:3\\n' > /etc/resolv.conf; export DEBIAN_FRONTEND=noninteractive; apt-get update -o Acquire::Retries=5; apt-get install -y --no-install-recommends gdisk; export TMPDIR=/var/tmp/petri-builder-tmp; mkdir -p \"$TMPDIR\"; {}",
         args.join(" ")
     ))
 }
@@ -1781,12 +2218,16 @@ pub fn usage() -> String {
         "usage: petri <command> [options]",
         "",
         "commands:",
-        "  create    create a configured Petri instance",
-        "  dispatch  send a protocol v1 dispatch request",
-        "  image     build and inspect Petri VM images",
-        "  stop      stop a running instance",
-        "  teardown  remove instance runtime state",
+        "  sandbox  create, list, exec, connect to, and kill sandboxes",
+        "  image    build and inspect Petri VM images",
         "",
+        "compatibility aliases:",
+        "  create    alias for sandbox create with explicit --id",
+        "  dispatch  alias for sandbox exec using protocol flags",
+        "  stop      stop a running instance",
+        "  teardown  alias for sandbox kill <id>",
+        "",
+        &sandbox_usage(),
         &create_usage(),
         &dispatch_usage(),
         &image_usage(),
@@ -1794,6 +2235,46 @@ pub fn usage() -> String {
         &teardown_usage(),
     ]
     .join("\n")
+}
+
+fn sandbox_usage() -> String {
+    [
+        "usage: petri sandbox <command> [options]",
+        "",
+        "commands:",
+        "  list     list known local sandboxes",
+        "  create   create a sandbox from a template",
+        "  connect  connect to a running sandbox",
+        "  exec     run a command inside a sandbox",
+        "  kill     stop and remove sandbox runtime state",
+        "",
+        &sandbox_list_usage(),
+        &sandbox_create_usage(),
+        &sandbox_connect_usage(),
+        &sandbox_exec_usage(),
+        &sandbox_kill_usage(),
+    ]
+    .join("\n")
+}
+
+fn sandbox_list_usage() -> String {
+    "usage: petri sandbox list [--state running|paused] [--metadata key=value,key2=value2] [--limit <n>] [--format pretty|json]".to_string()
+}
+
+fn sandbox_create_usage() -> String {
+    "usage: petri sandbox create [base] --workspace <path> --policy <path> [--id <id>] [--image <path>] [--backend macos|stub]".to_string()
+}
+
+fn sandbox_connect_usage() -> String {
+    "usage: petri sandbox connect <sandbox-id>".to_string()
+}
+
+fn sandbox_exec_usage() -> String {
+    "usage: petri sandbox exec [--cwd <path>] [--env key=value[,key2=value2]] [--timeout-ms <ms>] [--max-output-bytes <bytes>] <sandbox-id> <command> [args...]".to_string()
+}
+
+fn sandbox_kill_usage() -> String {
+    "usage: petri sandbox kill [--all | <sandbox-id>...]".to_string()
 }
 
 fn create_usage() -> String {
@@ -1884,6 +2365,95 @@ mod tests {
         assert_eq!(command.request.id, "req-1");
         assert_eq!(command.request.tool, "bash_command");
         assert_eq!(command.request.limits.unwrap().timeout_ms, Some(1000));
+        assert!(!command.stdin_passthrough);
+    }
+
+    #[test]
+    fn parses_sandbox_create_base_template() {
+        let command = parse(args(&[
+            "sandbox",
+            "create",
+            "base",
+            "--id",
+            "dev-1",
+            "--workspace",
+            "/workspace",
+            "--policy",
+            "policy.toml",
+        ]))
+        .unwrap();
+
+        let Command::Create(command) = command else {
+            panic!("expected create command");
+        };
+
+        assert_eq!(command.output, CreateOutput::SandboxId);
+        assert_eq!(command.config.id.as_str(), "dev-1");
+        assert_eq!(command.config.workspace, PathBuf::from("/workspace"));
+        assert_eq!(command.config.policy, PathBuf::from("policy.toml"));
+        assert!(command.config.image.is_some());
+    }
+
+    #[test]
+    fn parses_sandbox_exec_with_options_and_args() {
+        let command = parse(args(&[
+            "sandbox",
+            "exec",
+            "dev-1",
+            "--cwd",
+            "/workspace",
+            "--env",
+            "FOO=bar,BAZ=qux",
+            "--timeout-ms",
+            "1000",
+            "ls",
+            "-la",
+        ]))
+        .unwrap();
+
+        let Command::Dispatch(command) = command else {
+            panic!("expected dispatch command");
+        };
+
+        assert_eq!(command.instance_id.as_str(), "dev-1");
+        assert!(command.stdin_passthrough);
+        assert_eq!(command.request.tool, "bash_command");
+        assert_eq!(command.request.limits.unwrap().timeout_ms, Some(1000));
+        assert_eq!(command.request.args["command"], "ls");
+        assert_eq!(command.request.args["argv"], serde_json::json!(["-la"]));
+        assert_eq!(command.request.args["cwd"], "/workspace");
+        assert_eq!(command.request.args["env"]["FOO"], "bar");
+        assert_eq!(command.request.args["env"]["BAZ"], "qux");
+    }
+
+    #[test]
+    fn parses_sandbox_list_json() {
+        let command = parse(args(&[
+            "sandbox", "list", "--state", "running", "--limit", "10", "--format", "json",
+        ]))
+        .unwrap();
+
+        let Command::SandboxList(command) = command else {
+            panic!("expected sandbox list command");
+        };
+
+        assert_eq!(command.state, Some(SandboxStateFilter::Running));
+        assert_eq!(command.limit, Some(10));
+        assert_eq!(command.format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn parses_sandbox_kill_ids() {
+        let command = parse(args(&["sandbox", "kill", "dev-1", "dev-2"])).unwrap();
+
+        let Command::SandboxKill(command) = command else {
+            panic!("expected sandbox kill command");
+        };
+
+        assert!(!command.all);
+        assert_eq!(command.instance_ids.len(), 2);
+        assert_eq!(command.instance_ids[0].as_str(), "dev-1");
+        assert_eq!(command.instance_ids[1].as_str(), "dev-2");
     }
 
     #[test]

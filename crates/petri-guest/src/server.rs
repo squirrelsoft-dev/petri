@@ -240,6 +240,8 @@ fn handle_bash_command(request: DispatchRequest, policy: &Policy, started: Insta
         args.command,
         args.argv,
         cwd,
+        args.env,
+        args.stdin,
         timeout,
         max_output_bytes,
         started,
@@ -299,14 +301,22 @@ fn execute_command(
     command: String,
     argv: Vec<String>,
     cwd: std::path::PathBuf,
+    env: std::collections::BTreeMap<String, String>,
+    stdin: Option<String>,
     timeout: Duration,
     max_output_bytes: usize,
     started: Instant,
 ) -> ResultFrame {
+    let stdin_stdio = if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
     let mut child = match Command::new(&command)
         .args(argv)
+        .envs(env)
         .current_dir(cwd)
-        .stdin(Stdio::null())
+        .stdin(stdin_stdio)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -320,6 +330,19 @@ fn execute_command(
             );
         }
     };
+
+    if let Some(input) = stdin {
+        if let Some(mut child_stdin) = child.stdin.take() {
+            if let Err(err) = child_stdin.write_all(input.as_bytes()) {
+                let _ = child.kill();
+                return guest_error(
+                    id,
+                    elapsed_ms(started.elapsed()),
+                    format!("failed to write command stdin: {err}"),
+                );
+            }
+        }
+    }
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -587,6 +610,31 @@ mod tests {
         assert_eq!(result.stdout.as_deref(), Some("hello"));
         assert_eq!(result.stderr.as_deref(), Some(""));
         assert_eq!(result.output_truncated, Some(false));
+    }
+
+    #[test]
+    fn passes_stdin_and_env_to_command() {
+        let workspace = workspace();
+        let line = serde_json::json!({
+            "protocol_version": 1,
+            "id": "req-1",
+            "tool": "bash_command",
+            "args": {
+                "command": "sh",
+                "argv": ["-c", "printf '%s:' \"$PETRI_TEST_VALUE\"; cat"],
+                "cwd": workspace.clone(),
+                "env": {
+                    "PETRI_TEST_VALUE": "env-ok"
+                },
+                "stdin": "stdin-ok",
+            }
+        })
+        .to_string();
+
+        let result = handle_frame(&line, &policy(&["sh"], workspace));
+
+        assert_eq!(result.status, Status::Success);
+        assert_eq!(result.stdout.as_deref(), Some("env-ok:stdin-ok"));
     }
 
     #[test]

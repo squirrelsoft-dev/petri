@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 
 pub const PROTOCOL_VERSION: u64 = 1;
 
@@ -21,6 +22,8 @@ impl DispatchRequest {
         command: impl Into<String>,
         argv: Vec<String>,
         cwd: PathBuf,
+        env: BTreeMap<String, String>,
+        stdin: Option<String>,
         limits: Option<RequestLimits>,
     ) -> Self {
         Self {
@@ -31,9 +34,18 @@ impl DispatchRequest {
                 "command": command.into(),
                 "argv": argv,
                 "cwd": cwd,
+                "env": env,
+                "stdin": stdin,
             }),
             limits,
         }
+    }
+
+    pub fn with_stdin(mut self, stdin: impl Into<String>) -> Self {
+        if let Some(args) = self.args.as_object_mut() {
+            args.insert("stdin".to_string(), Value::String(stdin.into()));
+        }
+        self
     }
 }
 
