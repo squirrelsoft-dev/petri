@@ -1,0 +1,411 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://squirrelsoft.dev/petri/schema/petri-protocol-v1.schema.json",
+  "title": "Petri Protocol v1",
+  "description": "Shared wire schema for Petri NDJSON protocol frames and planned SDK operation groups.",
+  "type": "object",
+  "$defs": {
+    "ProtocolVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "RequestId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "RequestLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_output_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "DispatchRequest": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BashCommandRequest"
+        },
+        {
+          "$ref": "#/$defs/CancelControlRequest"
+        }
+      ]
+    },
+    "BashCommandRequest": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["protocol_version", "id", "tool", "args"],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "tool": {
+          "const": "bash_command"
+        },
+        "args": {
+          "$ref": "#/$defs/BashCommandArgs"
+        },
+        "limits": {
+          "$ref": "#/$defs/RequestLimits"
+        }
+      }
+    },
+    "CancelControlRequest": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["protocol_version", "id", "control", "target_id"],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "control": {
+          "const": "cancel"
+        },
+        "target_id": {
+          "$ref": "#/$defs/RequestId"
+        }
+      }
+    },
+    "BashCommandArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "cwd"],
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "argv": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "cwd": {
+          "type": "string",
+          "minLength": 1
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "stdin": {
+          "type": "string"
+        }
+      }
+    },
+    "DispatchResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "id", "status", "elapsed_ms"],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/RequestId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/ResultStatus"
+        },
+        "stdout": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        },
+        "exit_code": {
+          "type": ["integer", "null"]
+        },
+        "elapsed_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_truncated": {
+          "type": "boolean"
+        },
+        "error": {
+          "$ref": "#/$defs/ErrorFrame"
+        }
+      }
+    },
+    "ResultStatus": {
+      "type": "string",
+      "enum": ["success", "failure", "rejected", "timeout", "cancelled", "malformed"]
+    },
+    "ErrorFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "details": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "LifecycleControlRequest": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Sandbox lifecycle/control request envelope for SDK clients. Only operations backed by the current host API should be sent.",
+      "required": ["protocol_version", "id", "operation"],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "operation": {
+          "$ref": "#/$defs/LifecycleOperation"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "capability_token": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "FilesystemRequest": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Planned Filesystem SDK request envelope.",
+      "required": ["protocol_version", "id", "operation", "path"],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "operation": {
+          "$ref": "#/$defs/FilesystemOperation"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "capability_token": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "GitRequest": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Planned Git SDK request envelope.",
+      "required": ["protocol_version", "id", "operation"],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "operation": {
+          "$ref": "#/$defs/GitOperation"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "capability_token": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "PtyRequest": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Planned PTY SDK request envelope.",
+      "required": ["protocol_version", "id", "operation"],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "operation": {
+          "$ref": "#/$defs/PtyOperation"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "capability_token": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "TemplateRequest": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Planned Template SDK request envelope.",
+      "required": ["protocol_version", "id", "operation"],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "operation": {
+          "$ref": "#/$defs/TemplateOperation"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "capability_token": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "CommandsOperation": {
+      "type": "string",
+      "description": "Commands SDK operations. commands.run maps to the current bash_command dispatch request.",
+      "enum": [
+        "commands.run",
+        "commands.stream",
+        "commands.background",
+        "commands.stdin"
+      ]
+    },
+    "LifecycleOperation": {
+      "type": "string",
+      "description": "Sandbox SDK lifecycle/control operations. Only create/connect/list/info/running/kill are current; pause/resume/snapshot/timeout are reserved.",
+      "enum": [
+        "sandbox.create",
+        "sandbox.connect",
+        "sandbox.list",
+        "sandbox.info",
+        "sandbox.running",
+        "sandbox.kill",
+        "sandbox.pause",
+        "sandbox.resume",
+        "sandbox.snapshot",
+        "sandbox.timeout"
+      ]
+    },
+    "FilesystemOperation": {
+      "type": "string",
+      "description": "Filesystem SDK operations. Current schema names are reserved for cross-language client alignment.",
+      "enum": [
+        "filesystem.exists",
+        "filesystem.get_info",
+        "filesystem.list",
+        "filesystem.read",
+        "filesystem.write",
+        "filesystem.write_files",
+        "filesystem.make_dir",
+        "filesystem.remove",
+        "filesystem.rename",
+        "filesystem.watch"
+      ]
+    },
+    "GitOperation": {
+      "type": "string",
+      "description": "Planned Git SDK operations.",
+      "enum": [
+        "git.clone",
+        "git.status",
+        "git.diff",
+        "git.commit",
+        "git.checkout"
+      ]
+    },
+    "PtyOperation": {
+      "type": "string",
+      "description": "Planned PTY SDK operations.",
+      "enum": [
+        "pty.open",
+        "pty.input",
+        "pty.resize",
+        "pty.close"
+      ]
+    },
+    "TemplateOperation": {
+      "type": "string",
+      "description": "Planned Template SDK operations.",
+      "enum": [
+        "template.build",
+        "template.list",
+        "template.info",
+        "template.remove"
+      ]
+    },
+    "SdkModule": {
+      "type": "string",
+      "enum": ["Sandbox", "Commands", "Filesystem", "Git", "Pty", "Template"]
+    },
+    "OperationGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["module", "operation", "stability"],
+      "properties": {
+        "module": {
+          "$ref": "#/$defs/SdkModule"
+        },
+        "operation": {
+          "type": "string",
+          "minLength": 1
+        },
+        "stability": {
+          "type": "string",
+          "enum": ["current", "planned"]
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/DispatchRequest"
+    },
+    {
+      "$ref": "#/$defs/DispatchResult"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "protocol_version": 1,
+  "id": "fixture-cancel",
+  "control": "cancel",
+  "target_id": "fixture-bash-command"
+}

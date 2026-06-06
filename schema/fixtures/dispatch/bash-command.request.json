@@ -1,0 +1,18 @@
+{
+  "protocol_version": 1,
+  "id": "fixture-bash-command",
+  "tool": "bash_command",
+  "args": {
+    "command": "printf",
+    "argv": ["hello"],
+    "cwd": "/workspace",
+    "env": {
+      "PETRI_FIXTURE": "1"
+    },
+    "stdin": ""
+  },
+  "limits": {
+    "timeout_ms": 30000,
+    "max_output_bytes": 1048576
+  }
+}

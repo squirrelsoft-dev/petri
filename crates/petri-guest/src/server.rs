@@ -414,7 +414,7 @@ fn guest_error(id: String, elapsed_ms: u64, message: String) -> ResultFrame {
         exit_code: Some(None),
         output_truncated: Some(false),
         error: Some(crate::protocol::ErrorFrame {
-            code: "guest_error",
+            code: "guest_error".to_string(),
             message,
             details: None,
         }),

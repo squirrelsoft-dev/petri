@@ -1,0 +1,10 @@
+{
+  "protocol_version": 1,
+  "id": "fixture-bash-command",
+  "status": "success",
+  "stdout": "hello",
+  "stderr": "",
+  "exit_code": 0,
+  "elapsed_ms": 1,
+  "output_truncated": false
+}

@@ -4,6 +4,10 @@ Petri hosts dispatch tool work to the guest agent over vsock using newline-delim
 
 This document defines protocol version `1`.
 
+The shared Rust wire types live in `crates/petri-protocol`, and the checked-in
+JSON Schema and compatibility fixtures are documented in
+[Protocol Schema](protocol-schema.md).
+
 ## Transport And Framing
 
 - The host opens a vsock stream to the guest agent's dispatch port.

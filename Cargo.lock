@@ -92,6 +92,7 @@ dependencies = [
 name = "petri"
 version = "0.1.0"
 dependencies = [
+ "petri-protocol",
  "serde",
  "serde_json",
 ]
@@ -100,10 +101,19 @@ dependencies = [
 name = "petri-guest"
 version = "0.1.0"
 dependencies = [
+ "petri-protocol",
  "serde",
  "serde_json",
  "toml",
  "vsock",
+]
+
+[[package]]
+name = "petri-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

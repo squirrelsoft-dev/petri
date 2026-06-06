@@ -2363,7 +2363,7 @@ mod tests {
 
         assert_eq!(command.instance_id.as_str(), "dev-1");
         assert_eq!(command.request.id, "req-1");
-        assert_eq!(command.request.tool, "bash_command");
+        assert_eq!(command.request.tool.as_deref(), Some("bash_command"));
         assert_eq!(command.request.limits.unwrap().timeout_ms, Some(1000));
         assert!(!command.stdin_passthrough);
     }
@@ -2417,13 +2417,14 @@ mod tests {
 
         assert_eq!(command.instance_id.as_str(), "dev-1");
         assert!(command.stdin_passthrough);
-        assert_eq!(command.request.tool, "bash_command");
+        assert_eq!(command.request.tool.as_deref(), Some("bash_command"));
         assert_eq!(command.request.limits.unwrap().timeout_ms, Some(1000));
-        assert_eq!(command.request.args["command"], "ls");
-        assert_eq!(command.request.args["argv"], serde_json::json!(["-la"]));
-        assert_eq!(command.request.args["cwd"], "/workspace");
-        assert_eq!(command.request.args["env"]["FOO"], "bar");
-        assert_eq!(command.request.args["env"]["BAZ"], "qux");
+        let args = command.request.args.unwrap();
+        assert_eq!(args["command"], "ls");
+        assert_eq!(args["argv"], serde_json::json!(["-la"]));
+        assert_eq!(args["cwd"], "/workspace");
+        assert_eq!(args["env"]["FOO"], "bar");
+        assert_eq!(args["env"]["BAZ"], "qux");
     }
 
     #[test]

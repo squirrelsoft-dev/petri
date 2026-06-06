@@ -1,0 +1,14 @@
+{
+  "protocol_version": 1,
+  "id": "fixture-policy-rejection",
+  "status": "rejected",
+  "elapsed_ms": 1,
+  "error": {
+    "code": "policy_denied",
+    "message": "command is not allowed by policy",
+    "details": {
+      "field": "args.command",
+      "command": "curl"
+    }
+  }
+}

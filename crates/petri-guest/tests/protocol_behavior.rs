@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use petri_guest::policy::Policy;
-use petri_guest::protocol::Status;
+use petri_guest::protocol::{DispatchRequest, ResultFrame, Status};
 use petri_guest::server::handle_frame;
 
 fn workspace() -> PathBuf {
@@ -29,6 +29,62 @@ fn policy(allowed_commands: &[&str], workspace_path: PathBuf) -> Policy {
         max_output_bytes: 1024,
         workspace_path,
     }
+}
+
+fn fixture(path: &str) -> serde_json::Value {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(path);
+    let input = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!("failed to read fixture {}: {err}", path.display());
+    });
+    serde_json::from_str(&input).unwrap_or_else(|err| {
+        panic!("failed to parse fixture {}: {err}", path.display());
+    })
+}
+
+#[test]
+fn shared_dispatch_fixtures_match_protocol_types() {
+    let request = fixture("schema/fixtures/dispatch/bash-command.request.json");
+    let request: DispatchRequest = serde_json::from_value(request).unwrap();
+    assert_eq!(request.protocol_version, 1);
+    assert_eq!(request.id, "fixture-bash-command");
+    assert_eq!(request.tool.as_deref(), Some("bash_command"));
+
+    let cancel = fixture("schema/fixtures/dispatch/cancel.request.json");
+    let cancel: DispatchRequest = serde_json::from_value(cancel).unwrap();
+    assert_eq!(cancel.control.as_deref(), Some("cancel"));
+    assert_eq!(cancel.target_id.as_deref(), Some("fixture-bash-command"));
+
+    for path in [
+        "schema/fixtures/dispatch/success.result.json",
+        "schema/fixtures/dispatch/policy-rejection.result.json",
+    ] {
+        let result = fixture(path);
+        let result: ResultFrame = serde_json::from_value(result).unwrap();
+        assert_eq!(result.protocol_version, 1);
+    }
+}
+
+#[test]
+fn guest_accepts_shared_bash_command_fixture() {
+    let workspace = workspace();
+    let mut request = fixture("schema/fixtures/dispatch/bash-command.request.json");
+    request["args"]["cwd"] = serde_json::Value::from(workspace.display().to_string());
+    let policy = Policy {
+        network_enabled: false,
+        allowed_commands: ["printf"].into_iter().map(str::to_string).collect(),
+        max_runtime_secs: 60,
+        max_output_bytes: 1_048_576,
+        workspace_path: workspace,
+    };
+
+    let result = handle_frame(&request.to_string(), &policy);
+
+    assert_eq!(result.protocol_version, 1);
+    assert_eq!(result.id.as_deref(), Some("fixture-bash-command"));
+    assert_eq!(result.status, Status::Success);
+    assert_eq!(result.stdout.as_deref(), Some("hello"));
 }
 
 #[test]
