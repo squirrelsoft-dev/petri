@@ -10,6 +10,12 @@ petri-protocol = { path = "../petri-protocol" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.9"
+# DNS wire-format codec for the in-guest DNS proxy (domain allowlisting, #36).
+# Used synchronously for message encode/decode only — no async runtime; the
+# proxy uses std UDP sockets on a dedicated thread. `std` without `tokio`. Kept
+# all-target (not just the guest's linux/musl) so the proxy's pure request
+# handling stays unit-testable on the host.
+hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 vsock = "0.5.4"

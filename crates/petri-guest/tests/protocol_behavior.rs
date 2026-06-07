@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use petri_guest::lsp::{LspConfig, LspManager};
+use petri_guest::netstate::ActiveNetwork;
 use petri_guest::policy::{CommandLevel, CommandPolicy, NetworkPolicy, Policy};
 use petri_guest::protocol::{DispatchRequest, ResultFrame, Status};
 use petri_guest::server::handle_frame;
@@ -11,8 +12,8 @@ use petri_guest::server::handle_frame;
 fn handle(line: &str, policy: &Policy) -> ResultFrame {
     let lsp = LspManager::new(LspConfig::disabled(), std::env::temp_dir());
     let mut active = policy.command.default;
-    let mut net = policy.network.default;
-    handle_frame(line, policy, &lsp, &mut active, &mut net)
+    let net = ActiveNetwork::new(policy.network.default);
+    handle_frame(line, policy, &lsp, &mut active, &net)
 }
 
 fn workspace() -> PathBuf {

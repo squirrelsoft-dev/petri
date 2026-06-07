@@ -152,7 +152,7 @@ accepted, documented limitation, identical in kind to the command axis. A
 host-side boundary filter from spike #36 (parked in `git stash`), which can return as a
 high-assurance mode for callers who need it and can pay the throughput cost.
 
-Consequences for the network axis (implemented for IP/CIDR; domain names pending the DNS proxy):
+Consequences for the network axis (implemented — IP/CIDR via nftables, domain names via the in-guest DNS proxy):
 
 - `petri-guest` gains nftables application at boot (from policy) and on `set_mode`, using a
   **named set** for the allowlist so runtime updates are atomic (`nft add/delete element`) with
@@ -270,7 +270,7 @@ not part of this work.
 
 The schema below shows both axes. `[policy.command]` and `[policy.network]` are both
 implemented; the network axis enforces IP/CIDR allowlist entries via nftables at boot and on
-`set_mode`, with **domain-name** entries still pending the DNS-proxy layer (see below). A
+`set_mode`, and **domain-name** entries via the in-guest DNS proxy (see below). A
 `[policy.network]` block subsumes the legacy boolean `network_enabled` (an attached device with
 a ceiling); with no block present the axis derives from `network_enabled`
 (`true` → full egress, `false` → none).
@@ -288,7 +288,7 @@ read_only = ["ls", "cat", "grep", "rg", "find"]
 edit = ["ls", "cat", "grep", "rg", "find", "sed", "tee", "cargo", "git"]
 # yolo needs no list; it means *
 
-# Guest-enforced via nftables (IP/CIDR now; domain names pending the DNS proxy).
+# Guest-enforced: IP/CIDR via nftables, domain names via the in-guest DNS proxy.
 [policy.network]
 default = "none"
 max = "allowlist"              # full egress is never reachable on this VM
@@ -366,11 +366,12 @@ First cut implements the **`command` axis** end to end: schema, `set_mode`, gues
 and an updated builder policy that declares an explicit `yolo` level instead of smuggling `*`
 via `["bash"]`. This is the direct fix for issue #31.
 
-The **`network` axis** is specified here and lands in a follow-up. Like `command`, it is
-**guest-enforced** via the same `set_mode` frame (see [Enforcement Layers](#enforcement-layers));
-spike #36 ruled out the originally-planned host-side filter on throughput grounds. Until the
-follow-up lands, `network_enabled` remains a single boot-time gate with no escalation: `true`
-means full egress for the VM's lifetime, `false` means none. The follow-up adds, concretely:
+The **`network` axis** was specified here and has since landed (issue #36). Like `command`, it
+is **guest-enforced** via the same `set_mode` frame (see [Enforcement Layers](#enforcement-layers));
+spike #36 ruled out the originally-planned host-side filter on throughput grounds. A policy with
+no `[policy.network]` block still degrades to the single boot-time `network_enabled` gate with no
+escalation: `true` means full egress for the VM's lifetime, `false` means none. The axis adds,
+concretely:
 
 - An `agent` user (uid/gid 1000) in the guest image, with `/workspace` owned by it, and the
   per-child privilege drop (`setgroups([])` → gid → uid in `pre_exec`) in `execute_command`.

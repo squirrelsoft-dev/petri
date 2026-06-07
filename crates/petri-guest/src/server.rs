@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value, json};
 
 use crate::lsp::{LspManager, LspOutcome};
+use crate::netstate::ActiveNetwork;
 use crate::policy::{CommandLevel, NetworkLevel, Policy};
 use crate::protocol::{
     BashCommandArgs, DispatchRequest, PROTOCOL_VERSION, ResultFrame, SetModeArgs, Status,
@@ -19,19 +20,20 @@ pub fn serve_lines(
     mut writer: impl Write,
     policy: &Policy,
     lsp: &LspManager,
+    active_network: &ActiveNetwork,
 ) -> Result<(), std::io::Error> {
     let reader = BufReader::new(reader);
-    // The active command and network levels are per-connection mutable state.
-    // Each starts at its boot policy default and may move up to (never past) the
-    // policy ceiling via `set_mode`. They can only be changed by host control
-    // frames, never inferred from workload processes. The network level is also
-    // re-applied to the live nftables ruleset on change. See ADR 0002.
+    // The active command level is per-connection mutable state: it starts at the
+    // boot policy default and may move up to (never past) the policy ceiling via
+    // `set_mode`. The active *network* level is VM-global instead (the nftables
+    // ruleset and DNS proxy it drives are per-VM, not per-connection), so it is
+    // shared in. Both change only via host control frames, never inferred from
+    // workload processes. See ADR 0002.
     let mut active_command = policy.command.default;
-    let mut active_network = policy.network.default;
 
     for line in reader.lines() {
         let line = line?;
-        let result = handle_frame(&line, policy, lsp, &mut active_command, &mut active_network);
+        let result = handle_frame(&line, policy, lsp, &mut active_command, active_network);
         serde_json::to_writer(&mut writer, &result)?;
         writer.write_all(b"\n")?;
         writer.flush()?;
@@ -45,7 +47,7 @@ pub fn handle_frame(
     policy: &Policy,
     lsp: &LspManager,
     active_command: &mut CommandLevel,
-    active_network: &mut NetworkLevel,
+    active_network: &ActiveNetwork,
 ) -> ResultFrame {
     let started = Instant::now();
     let line = line.trim_end_matches('\r');
@@ -284,18 +286,19 @@ fn handle_bash_command(
     )
 }
 
-/// Handle a `set_mode` control frame. Moves the per-connection active command
-/// and/or network levels, rejecting any request above the relevant boot policy
-/// ceiling. At least one axis must be present; an omitted axis is left
-/// unchanged. Both axes are guest-enforced by design (ADR 0002): command via
-/// process-launch checks, network by re-applying the in-guest nftables ruleset.
-/// Only host control frames reach this path; workload processes cannot emit
-/// dispatch frames.
+/// Handle a `set_mode` control frame. Moves the active command (per-connection)
+/// and/or network (VM-global) levels, rejecting any request above the relevant
+/// boot policy ceiling. At least one axis must be present; an omitted axis is
+/// left unchanged. Both axes are guest-enforced by design (ADR 0002): command
+/// via process-launch checks, network by re-applying the in-guest nftables
+/// ruleset (which the DNS proxy reads through the shared active level). Only
+/// host control frames reach this path; workload processes cannot emit dispatch
+/// frames.
 fn handle_set_mode(
     request: DispatchRequest,
     policy: &Policy,
     active_command: &mut CommandLevel,
-    active_network: &mut NetworkLevel,
+    active_network: &ActiveNetwork,
     started: Instant,
 ) -> ResultFrame {
     if request.target_id.is_some() || request.tool.is_some() {
@@ -428,7 +431,7 @@ fn handle_set_mode(
         mode.insert("command".to_string(), Value::from(level.as_str()));
     }
     if let Some(level) = new_network {
-        *active_network = level;
+        active_network.set(level);
         mode.insert("network".to_string(), Value::from(level.as_str()));
     }
 
@@ -879,8 +882,8 @@ mod tests {
     /// policy's default command level.
     fn handle(line: &str, policy: &Policy) -> ResultFrame {
         let mut active = policy.command.default;
-        let mut net = policy.network.default;
-        handle_frame(line, policy, &test_lsp(), &mut active, &mut net)
+        let net = ActiveNetwork::new(policy.network.default);
+        handle_frame(line, policy, &test_lsp(), &mut active, &net)
     }
 
     #[test]
@@ -1106,12 +1109,15 @@ mod tests {
         .to_string()
             + "\n";
         let mut output = Vec::new();
+        let policy = policy(&["printf"], workspace);
+        let active_network = ActiveNetwork::new(policy.network.default);
 
         serve_lines(
             input.as_bytes(),
             &mut output,
-            &policy(&["printf"], workspace),
+            &policy,
             &test_lsp(),
+            &active_network,
         )
         .unwrap();
 
@@ -1163,7 +1169,7 @@ mod tests {
         };
         let lsp = test_lsp();
         let mut active = policy.command.default;
-        let mut net = policy.network.default;
+        let net = ActiveNetwork::new(policy.network.default);
 
         // printf is an `edit`-tier command; at the default `read_only` it is denied.
         let printf = serde_json::json!({
@@ -1173,14 +1179,14 @@ mod tests {
             "args": { "command": "printf", "argv": ["hi"], "cwd": workspace.clone() }
         })
         .to_string();
-        let denied = handle_frame(&printf, &policy, &lsp, &mut active, &mut net);
+        let denied = handle_frame(&printf, &policy, &lsp, &mut active, &net);
         assert_eq!(denied.status, Status::Rejected);
         assert_eq!(denied.error.unwrap().code, "policy_denied");
 
         // Escalate to `edit`, which is within the `yolo` ceiling.
         let set =
             r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{"command":"edit"}}"#;
-        let switched = handle_frame(set, &policy, &lsp, &mut active, &mut net);
+        let switched = handle_frame(set, &policy, &lsp, &mut active, &net);
         assert_eq!(switched.status, Status::Success);
         assert_eq!(
             switched.data.unwrap()["mode"]["command"],
@@ -1189,7 +1195,7 @@ mod tests {
         assert_eq!(active, CommandLevel::Edit);
 
         // The same command now runs.
-        let ok = handle_frame(&printf, &policy, &lsp, &mut active, &mut net);
+        let ok = handle_frame(&printf, &policy, &lsp, &mut active, &net);
         assert_eq!(ok.status, Status::Success);
         assert_eq!(ok.stdout.as_deref(), Some("hi"));
     }
@@ -1211,11 +1217,11 @@ mod tests {
             drop_privileges: false,
         };
         let mut active = policy.command.default;
-        let mut net = policy.network.default;
+        let net = ActiveNetwork::new(policy.network.default);
 
         let set =
             r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{"command":"yolo"}}"#;
-        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &mut net);
+        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &net);
 
         assert_eq!(result.status, Status::Rejected);
         assert_eq!(result.error.unwrap().code, "policy_denied");
@@ -1240,33 +1246,33 @@ mod tests {
     fn set_mode_escalates_network_within_ceiling() {
         let policy = network_policy(NetworkLevel::Full);
         let mut active = policy.command.default;
-        let mut net = policy.network.default;
-        assert_eq!(net, NetworkLevel::None);
+        let net = ActiveNetwork::new(policy.network.default);
+        assert_eq!(net.get(), NetworkLevel::None);
 
         let set =
             r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{"network":"full"}}"#;
-        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &mut net);
+        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &net);
 
         assert_eq!(result.status, Status::Success);
         assert_eq!(result.data.unwrap()["mode"]["network"], Value::from("full"));
-        assert_eq!(net, NetworkLevel::Full);
+        assert_eq!(net.get(), NetworkLevel::Full);
     }
 
     #[test]
     fn set_mode_rejects_network_above_ceiling() {
         let policy = network_policy(NetworkLevel::Allowlist);
         let mut active = policy.command.default;
-        let mut net = policy.network.default;
+        let net = ActiveNetwork::new(policy.network.default);
 
         let set =
             r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{"network":"full"}}"#;
-        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &mut net);
+        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &net);
 
         assert_eq!(result.status, Status::Rejected);
         let err = result.error.unwrap();
         assert_eq!(err.code, "policy_denied");
         // The active level is unchanged after a rejected escalation.
-        assert_eq!(net, NetworkLevel::None);
+        assert_eq!(net.get(), NetworkLevel::None);
     }
 
     #[test]
@@ -1274,27 +1280,27 @@ mod tests {
         let mut policy = network_policy(NetworkLevel::Full);
         policy.command.max = CommandLevel::Yolo;
         let mut active = policy.command.default;
-        let mut net = policy.network.default;
+        let net = ActiveNetwork::new(policy.network.default);
 
         let set = r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{"command":"edit","network":"full"}}"#;
-        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &mut net);
+        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &net);
 
         assert_eq!(result.status, Status::Success);
         let mode = result.data.unwrap();
         assert_eq!(mode["mode"]["command"], Value::from("edit"));
         assert_eq!(mode["mode"]["network"], Value::from("full"));
         assert_eq!(active, CommandLevel::Edit);
-        assert_eq!(net, NetworkLevel::Full);
+        assert_eq!(net.get(), NetworkLevel::Full);
     }
 
     #[test]
     fn set_mode_requires_at_least_one_axis() {
         let policy = policy(&["printf"], workspace());
         let mut active = policy.command.default;
-        let mut net = policy.network.default;
+        let net = ActiveNetwork::new(policy.network.default);
 
         let set = r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{}}"#;
-        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &mut net);
+        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &net);
 
         assert_eq!(result.status, Status::Rejected);
         assert_eq!(result.error.unwrap().code, "invalid_request");
@@ -1304,10 +1310,10 @@ mod tests {
     fn set_mode_rejects_unknown_network_level() {
         let policy = network_policy(NetworkLevel::Full);
         let mut active = policy.command.default;
-        let mut net = policy.network.default;
+        let net = ActiveNetwork::new(policy.network.default);
 
         let set = r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{"network":"wide_open"}}"#;
-        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &mut net);
+        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &net);
 
         assert_eq!(result.status, Status::Rejected);
         assert_eq!(result.error.unwrap().code, "invalid_request");
@@ -1317,10 +1323,10 @@ mod tests {
     fn set_mode_rejects_unknown_level() {
         let policy = policy(&["printf"], workspace());
         let mut active = policy.command.default;
-        let mut net = policy.network.default;
+        let net = ActiveNetwork::new(policy.network.default);
 
         let set = r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{"command":"superuser"}}"#;
-        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &mut net);
+        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &net);
 
         assert_eq!(result.status, Status::Rejected);
         assert_eq!(result.error.unwrap().code, "invalid_request");

@@ -44,7 +44,7 @@ pub fn plan(level: NetworkLevel, allowlist: &[String]) -> RulesetPlan {
             skipped_domains: Vec::new(),
         },
         NetworkLevel::None => RulesetPlan {
-            script: Some(render_ruleset(&[], &[])),
+            script: Some(render_ruleset(&[], &[], false)),
             skipped_domains: Vec::new(),
         },
         NetworkLevel::Allowlist => {
@@ -58,8 +58,9 @@ pub fn plan(level: NetworkLevel, allowlist: &[String]) -> RulesetPlan {
                     Dest::Domain => skipped_domains.push(entry.clone()),
                 }
             }
+            let has_domains = !skipped_domains.is_empty();
             RulesetPlan {
-                script: Some(render_ruleset(&v4, &v6)),
+                script: Some(render_ruleset(&v4, &v6, has_domains)),
                 skipped_domains,
             }
         }
@@ -92,10 +93,25 @@ fn render_teardown() -> String {
     format!("add table inet {TABLE}\ndelete table inet {TABLE}\n")
 }
 
+/// Names of the dynamic, per-element-timeout sets the DNS proxy populates with
+/// IPs it resolves for allowlisted domains. Kept distinct from the static
+/// `allow4`/`allow6` literal sets so domain answers self-expire on their TTL
+/// without disturbing the configured IP/CIDR entries.
+pub const RESOLVED4: &str = "resolved4";
+pub const RESOLVED6: &str = "resolved6";
+
 /// Render an idempotent `nft -f` script: ensure-then-delete clears any prior
 /// petri table, then a fresh definition with a default-drop `output` chain that
 /// accepts loopback, established/related flows, and the allowlisted sets.
-fn render_ruleset(v4: &[String], v6: &[String]) -> String {
+///
+/// When `has_domains` is set, a DNS proxy is running: the chain additionally
+/// forces all name resolution through it (drop egress to ports 53/853 except
+/// from the proxy itself, which runs as root) and accepts the dynamic
+/// proxy-populated sets. Domain IPs land in `resolved4`/`resolved6` with a
+/// per-element timeout (= record TTL); the `ct state established,related accept`
+/// above the set lookup means an entry expiring only blocks *future*
+/// connections, never an in-flight transfer.
+fn render_ruleset(v4: &[String], v6: &[String], has_domains: bool) -> String {
     let mut out = String::new();
     // `add` then `delete` makes the redefinition idempotent whether or not the
     // table already exists (delete alone errors when absent).
@@ -113,16 +129,37 @@ fn render_ruleset(v4: &[String], v6: &[String]) -> String {
         out.push_str(&format!("\t\telements = {{ {} }}\n", v6.join(", ")));
         out.push_str("\t}\n");
     }
+    if has_domains {
+        out.push_str(&format!(
+            "\tset {RESOLVED4} {{\n\t\ttype ipv4_addr\n\t\tflags timeout\n\t}}\n"
+        ));
+        out.push_str(&format!(
+            "\tset {RESOLVED6} {{\n\t\ttype ipv6_addr\n\t\tflags timeout\n\t}}\n"
+        ));
+    }
 
     out.push_str("\tchain output {\n");
     out.push_str("\t\ttype filter hook output priority 0; policy drop;\n");
     out.push_str("\t\toifname \"lo\" accept\n");
     out.push_str("\t\tct state established,related accept\n");
+    if has_domains {
+        // Force DNS through the local proxy: the root proxy may reach upstream
+        // resolvers; everything else is denied so resolution cannot route
+        // around it (loopback to the proxy is already accepted above).
+        out.push_str("\t\tmeta skuid 0 udp dport { 53, 853 } accept\n");
+        out.push_str("\t\tmeta skuid 0 tcp dport { 53, 853 } accept\n");
+        out.push_str("\t\tudp dport { 53, 853 } drop\n");
+        out.push_str("\t\ttcp dport { 53, 853 } drop\n");
+    }
     if !v4.is_empty() {
         out.push_str("\t\tip daddr @allow4 accept\n");
     }
     if !v6.is_empty() {
         out.push_str("\t\tip6 daddr @allow6 accept\n");
+    }
+    if has_domains {
+        out.push_str(&format!("\t\tip daddr @{RESOLVED4} accept\n"));
+        out.push_str(&format!("\t\tip6 daddr @{RESOLVED6} accept\n"));
     }
     out.push_str("\t}\n}\n");
     out
@@ -174,26 +211,88 @@ pub fn apply_boot(policy: &crate::policy::Policy) -> Result<(), NetfilterError> 
     apply(&policy.network, policy.network.default)
 }
 
-/// Apply a specific level for the given network policy. Shared by boot and (in a
-/// follow-up) `set_mode`.
+/// Apply a specific level for the given network policy. Shared by boot and
+/// `set_mode`.
 #[cfg(target_os = "linux")]
 pub fn apply(
     network: &crate::policy::NetworkPolicy,
     level: NetworkLevel,
 ) -> Result<(), NetfilterError> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
     let plan = plan(level, &network.allowlist);
     if !plan.skipped_domains.is_empty() {
         eprintln!(
-            "petri-guest: network allowlist domains not yet enforced (pending DNS proxy): {}",
+            "petri-guest: network allowlist domains enforced via DNS proxy: {}",
             plan.skipped_domains.join(", ")
         );
     }
     let Some(script) = plan.script else {
         return Ok(());
     };
+    run_nft(&script)
+}
+
+/// Add proxy-resolved domain IPs to the dynamic `resolved4`/`resolved6` sets,
+/// each with a per-element timeout equal to its DNS record TTL (clamped to a
+/// floor so a near-zero TTL cannot blackhole the connection the answer is for).
+/// A no-op when there is nothing to add.
+///
+/// Returns `Err` if the table/sets are absent — e.g. the active level is not
+/// `allowlist`, so the answer is irrelevant; callers (the proxy) log and
+/// continue rather than treating it as fatal.
+#[cfg(target_os = "linux")]
+pub fn add_resolved(
+    v4: &[(Ipv4Addr, u32)],
+    v6: &[(Ipv6Addr, u32)],
+) -> Result<(), NetfilterError> {
+    let Some(script) = render_add_elements(v4, v6) else {
+        return Ok(());
+    };
+    run_nft(&script)
+}
+
+/// Lowest timeout (seconds) we assign a resolved element, so a tiny record TTL
+/// cannot expire the entry before the workload's `connect()` lands.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const MIN_TIMEOUT_SECS: u32 = 10;
+
+/// Render `add element` statements for the resolved sets, or `None` when both
+/// lists are empty. Pure (and so host-testable); the live `add_resolved` caller
+/// is Linux-only, hence the host build sees no non-test use.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn render_add_elements(v4: &[(Ipv4Addr, u32)], v6: &[(Ipv6Addr, u32)]) -> Option<String> {
+    if v4.is_empty() && v6.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    if !v4.is_empty() {
+        out.push_str(&format!(
+            "add element inet {TABLE} {RESOLVED4} {{ {} }}\n",
+            render_timed_elements(v4)
+        ));
+    }
+    if !v6.is_empty() {
+        out.push_str(&format!(
+            "add element inet {TABLE} {RESOLVED6} {{ {} }}\n",
+            render_timed_elements(v6)
+        ));
+    }
+    Some(out)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn render_timed_elements<A: std::fmt::Display>(elems: &[(A, u32)]) -> String {
+    elems
+        .iter()
+        .map(|(ip, ttl)| format!("{ip} timeout {}s", (*ttl).max(MIN_TIMEOUT_SECS)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Feed an `nft -f` script to `nft` on stdin and map a non-zero exit to an error.
+#[cfg(target_os = "linux")]
+fn run_nft(script: &str) -> Result<(), NetfilterError> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
 
     let mut child = Command::new("nft")
         .arg("-f")
@@ -294,5 +393,53 @@ mod tests {
         let add = script.find("add table inet petri").unwrap();
         let delete = script.find("delete table inet petri").unwrap();
         assert!(add < delete, "add must precede delete for idempotency");
+    }
+
+    #[test]
+    fn allowlist_with_domains_adds_proxy_sets_and_dns_gating() {
+        let script = plan(NetworkLevel::Allowlist, &["example.com".to_string()])
+            .script
+            .unwrap();
+        // Dynamic timeout sets the proxy populates.
+        assert!(script.contains("set resolved4"));
+        assert!(script.contains("set resolved6"));
+        assert!(script.contains("flags timeout"));
+        assert!(script.contains("ip daddr @resolved4 accept"));
+        assert!(script.contains("ip6 daddr @resolved6 accept"));
+        // DNS is forced through the proxy: root may reach upstream, others denied.
+        assert!(script.contains("meta skuid 0 udp dport { 53, 853 } accept"));
+        assert!(script.contains("udp dport { 53, 853 } drop"));
+        assert!(script.contains("tcp dport { 53, 853 } drop"));
+    }
+
+    #[test]
+    fn allowlist_without_domains_has_no_proxy_sets_or_dns_gating() {
+        let script = plan(NetworkLevel::Allowlist, &["1.1.1.1".to_string()])
+            .script
+            .unwrap();
+        assert!(!script.contains("resolved4"));
+        assert!(!script.contains("dport { 53, 853 }"));
+    }
+
+    #[test]
+    fn add_elements_applies_per_element_ttl_with_floor() {
+        let v4 = vec![
+            (Ipv4Addr::new(93, 184, 215, 14), 300),
+            (Ipv4Addr::new(1, 2, 3, 4), 1), // below the floor
+        ];
+        let v6 = vec![(Ipv6Addr::LOCALHOST, 120)];
+        let script = render_add_elements(&v4, &v6).unwrap();
+
+        assert!(script.contains("add element inet petri resolved4"));
+        assert!(script.contains("93.184.215.14 timeout 300s"));
+        // A 1s TTL is clamped up to the floor so the entry outlives the connect().
+        assert!(script.contains(&format!("1.2.3.4 timeout {MIN_TIMEOUT_SECS}s")));
+        assert!(script.contains("add element inet petri resolved6"));
+        assert!(script.contains("timeout 120s"));
+    }
+
+    #[test]
+    fn add_elements_is_none_when_empty() {
+        assert!(render_add_elements(&[], &[]).is_none());
     }
 }
