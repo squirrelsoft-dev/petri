@@ -152,7 +152,7 @@ accepted, documented limitation, identical in kind to the command axis. A
 host-side boundary filter from spike #36 (parked in `git stash`), which can return as a
 high-assurance mode for callers who need it and can pay the throughput cost.
 
-Consequences for the network axis (follow-up work):
+Consequences for the network axis (implemented for IP/CIDR; domain names pending the DNS proxy):
 
 - `petri-guest` gains nftables application at boot (from policy) and on `set_mode`, using a
   **named set** for the allowlist so runtime updates are atomic (`nft add/delete element`) with
@@ -268,10 +268,12 @@ not part of this work.
 
 ### Boot Policy Schema
 
-The target schema below shows both axes. `[policy.command]` is implemented in the first cut;
-`[policy.network]` is the follow-up form. Today the network gate is the existing boolean
-`network_enabled` (a `[policy.network]` block subsumes it: an attached device with a ceiling,
-or no block / `max = "none"` meaning no device).
+The schema below shows both axes. `[policy.command]` and `[policy.network]` are both
+implemented; the network axis enforces IP/CIDR allowlist entries via nftables at boot and on
+`set_mode`, with **domain-name** entries still pending the DNS-proxy layer (see below). A
+`[policy.network]` block subsumes the legacy boolean `network_enabled` (an attached device with
+a ceiling); with no block present the axis derives from `network_enabled`
+(`true` → full egress, `false` → none).
 
 ```toml
 [policy]
@@ -286,7 +288,7 @@ read_only = ["ls", "cat", "grep", "rg", "find"]
 edit = ["ls", "cat", "grep", "rg", "find", "sed", "tee", "cargo", "git"]
 # yolo needs no list; it means *
 
-# Follow-up (guest-enforced via nftables). Today this is `network_enabled = true|false`.
+# Guest-enforced via nftables (IP/CIDR now; domain names pending the DNS proxy).
 [policy.network]
 default = "none"
 max = "allowlist"              # full egress is never reachable on this VM

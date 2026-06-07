@@ -1,0 +1,11 @@
+{
+  "protocol_version": 1,
+  "id": "fixture-set-mode-network",
+  "status": "success",
+  "elapsed_ms": 1,
+  "data": {
+    "mode": {
+      "network": "allowlist"
+    }
+  }
+}

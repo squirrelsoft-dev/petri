@@ -305,6 +305,8 @@ mod tests {
             include_str!("../../../schema/fixtures/dispatch/cancel.request.json"),
             include_str!("../../../schema/fixtures/dispatch/set-mode.request.json"),
             include_str!("../../../schema/fixtures/dispatch/set-mode.result.json"),
+            include_str!("../../../schema/fixtures/dispatch/set-mode.network.request.json"),
+            include_str!("../../../schema/fixtures/dispatch/set-mode.network.result.json"),
             include_str!("../../../schema/fixtures/dispatch/success.result.json"),
             include_str!("../../../schema/fixtures/dispatch/policy-rejection.result.json"),
             include_str!("../../../schema/fixtures/dispatch/lsp-hover.request.json"),

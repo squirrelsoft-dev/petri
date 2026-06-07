@@ -35,11 +35,12 @@ pub struct RulesetPlan {
 /// so it is unit-testable without a guest kernel.
 pub fn plan(level: NetworkLevel, allowlist: &[String]) -> RulesetPlan {
     match level {
-        // No restrictions. At boot there is no prior petri table to tear down,
-        // so this is a genuine no-op; runtime transitions to `full` (set_mode)
-        // handle teardown separately.
+        // No restrictions: ensure no petri table remains. This is what makes a
+        // runtime escalation to `full` (via set_mode) actually lift a prior
+        // restriction. At boot there is no table yet, so `apply_boot` skips this
+        // case rather than issuing a pointless teardown.
         NetworkLevel::Full => RulesetPlan {
-            script: None,
+            script: Some(render_teardown()),
             skipped_domains: Vec::new(),
         },
         NetworkLevel::None => RulesetPlan {
@@ -82,6 +83,13 @@ fn classify(entry: &str) -> Dest {
     } else {
         Dest::Domain
     }
+}
+
+/// Render an `nft -f` script that removes the petri table, lifting all egress
+/// restrictions. `add` then `delete` is idempotent whether or not the table
+/// already exists (a bare `delete` errors when it is absent).
+fn render_teardown() -> String {
+    format!("add table inet {TABLE}\ndelete table inet {TABLE}\n")
 }
 
 /// Render an idempotent `nft -f` script: ensure-then-delete clears any prior
@@ -157,6 +165,12 @@ pub fn apply_boot(policy: &crate::policy::Policy) -> Result<(), NetfilterError> 
     if unsafe { libc::geteuid() } != 0 {
         return Ok(());
     }
+    // Boot starts from a clean slate (no petri table), so the `full` level has
+    // nothing to tear down — skip it rather than shell out to nft for a no-op.
+    // Restrictive levels (`none`/`allowlist`) install their ruleset.
+    if policy.network.default == NetworkLevel::Full {
+        return Ok(());
+    }
     apply(&policy.network, policy.network.default)
 }
 
@@ -212,9 +226,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn full_is_a_noop() {
+    fn full_tears_down_the_table() {
+        // `full` lifts restrictions by removing the petri table: add-then-delete,
+        // and crucially no drop policy or allow sets left behind.
         let plan = plan(NetworkLevel::Full, &["1.1.1.1".to_string()]);
-        assert!(plan.script.is_none());
+        let script = plan.script.unwrap();
+        assert!(script.contains("add table inet petri"));
+        assert!(script.contains("delete table inet petri"));
+        assert!(!script.contains("policy drop;"));
+        assert!(!script.contains("chain output"));
         assert!(plan.skipped_domains.is_empty());
     }
 

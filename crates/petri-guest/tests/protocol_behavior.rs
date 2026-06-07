@@ -11,7 +11,8 @@ use petri_guest::server::handle_frame;
 fn handle(line: &str, policy: &Policy) -> ResultFrame {
     let lsp = LspManager::new(LspConfig::disabled(), std::env::temp_dir());
     let mut active = policy.command.default;
-    handle_frame(line, policy, &lsp, &mut active)
+    let mut net = policy.network.default;
+    handle_frame(line, policy, &lsp, &mut active, &mut net)
 }
 
 fn workspace() -> PathBuf {
