@@ -1,9 +1,9 @@
 use crate::dispatch::{DispatchRequest, DispatchResult};
 use crate::error::{PetriError, Result};
-use petri_protocol::policy::Policy;
 use crate::instance::{
     GUEST_WORKSPACE_PATH, InstanceConfig, InstanceHandle, InstanceId, LifecycleState,
 };
+use petri_protocol::policy::Policy;
 
 use std::env;
 use std::fs;

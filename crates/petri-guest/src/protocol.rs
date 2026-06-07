@@ -1,5 +1,5 @@
 pub use petri_protocol::{
     BashCommandArgs, DispatchRequest, ErrorFrame, LspDiagnosticsArgs, LspPositionArgs,
-    LspRenameArgs, PROTOCOL_VERSION, RequestLimits, ResultFrame, Status, lsp_tools,
+    LspRenameArgs, PROTOCOL_VERSION, RequestLimits, ResultFrame, SetModeArgs, Status, lsp_tools,
     request_id_from_value,
 };

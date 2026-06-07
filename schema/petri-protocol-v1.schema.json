@@ -36,6 +36,9 @@
           "$ref": "#/$defs/CancelControlRequest"
         },
         {
+          "$ref": "#/$defs/SetModeControlRequest"
+        },
+        {
           "$ref": "#/$defs/LspPositionRequest"
         },
         {
@@ -84,6 +87,39 @@
         },
         "target_id": {
           "$ref": "#/$defs/RequestId"
+        }
+      }
+    },
+    "SetModeControlRequest": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Host control frame that moves the VM's active capability levels within the boot-policy ceiling. See ADR 0002.",
+      "required": ["protocol_version", "id", "control", "args"],
+      "properties": {
+        "protocol_version": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "control": {
+          "const": "set_mode"
+        },
+        "args": {
+          "$ref": "#/$defs/SetModeArgs"
+        }
+      }
+    },
+    "SetModeArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Command capability level for the guest-enforced command axis. The network axis is enforced host-side at the VM boundary and is not carried in a guest-bound frame; a `network` field here is rejected.",
+      "properties": {
+        "command": {
+          "enum": ["none", "read_only", "edit", "yolo"]
+        },
+        "network": {
+          "enum": ["none", "allowlist", "full"]
         }
       }
     },

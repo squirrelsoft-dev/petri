@@ -288,6 +288,41 @@ Cancellation is a control request sent over the same NDJSON stream:
 
 If the target is cancelled, the guest returns a terminal `cancelled` result for the target request and a `success` acknowledgement for the cancellation request. If the target is unknown or already terminal, the cancellation request is rejected with `error.code = "invalid_request"`.
 
+## Mode Switching
+
+`set_mode` is a control request that moves the VM's active capability level within the boot-policy ceiling, on a live connection, with no reboot. It is sent over the same NDJSON stream:
+
+```json
+{
+  "protocol_version": 1,
+  "id": "mode-1",
+  "control": "set_mode",
+  "args": {
+    "command": "edit"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|---|---:|---:|---|
+| `protocol_version` | integer | yes | Protocol version. |
+| `id` | string | yes | Correlation id for the mode request itself. |
+| `control` | string | yes | Must be `set_mode`. |
+| `args.command` | string | no | Target command level: `none`, `read_only`, `edit`, or `yolo`. |
+| `args.network` | string | no | Not accepted in a guest frame. The network axis is enforced host-side at the VM boundary; a request that sets it is rejected with `invalid_request`. |
+
+An omitted axis leaves that axis's active level unchanged. The `args` object is closed; unknown keys are rejected. `set_mode` must not carry `tool` or `target_id`.
+
+The command level moves bidirectionally: the caller may climb toward the boot policy `[policy.command]` ceiling (`max`) or drop back down. The guest rejects any target level above `max` with `error.code = "policy_denied"` and leaves the active level unchanged. An unknown level name is rejected with `invalid_request`.
+
+On success the guest returns a `success` result whose `data` echoes the new active levels:
+
+```json
+{"protocol_version":1,"id":"mode-1","status":"success","elapsed_ms":1,"data":{"mode":{"command":"edit"}}}
+```
+
+The change applies to subsequent dispatches on the connection. `set_mode` is a control-plane action by the trusted host; the untrusted workload cannot emit frames and therefore cannot escalate its own level. See [Immutable Policy Config](policy-config.md#runtime-mode-switching).
+
 ## Output Limits
 
 The effective output cap is the lower of the boot policy `max_output_bytes` and request `limits.max_output_bytes`, when provided.

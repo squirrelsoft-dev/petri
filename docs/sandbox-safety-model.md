@@ -41,7 +41,9 @@ Petri also assumes the host-side caller may send malformed, unsupported, or poli
 
 The host provisions VMs, mounts the workspace, sends dispatch requests, and receives results. The host is trusted to select the VM image, policy config, workspace directory, and lifecycle controls.
 
-The host is not trusted to widen policy after boot. Once the guest agent loads policy, host requests can only ask for work inside that policy. A request may narrow runtime or output limits for a single dispatch, but it cannot enable network access, add commands, raise caps, or change workspace roots.
+The host is not trusted to widen policy beyond what the boot policy authorized. Once the guest agent loads policy, host requests can only ask for work inside that policy's bounds. A request may narrow runtime or output limits for a single dispatch, but it cannot raise caps, change workspace roots, enable network access, or move a capability axis above its boot-declared ceiling.
+
+The command axis is a special case: the boot policy declares an escalation ceiling, and the host may move the VM's active level between boot-declared levels with `set_mode` (see [Immutable Policy Config](policy-config.md#runtime-mode-switching)). This is a control-plane action bounded by the immutable ceiling — the boot policy's `max` is still the maximum authority; only the starting point moves. It does not weaken the guarantee that matters: the untrusted guest workload cannot emit frames at all, so it can never escalate its own authority, and no request can lift the ceiling.
 
 ### Guest VM
 

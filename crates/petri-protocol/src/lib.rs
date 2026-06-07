@@ -79,6 +79,19 @@ pub struct BashCommandArgs {
     pub stdin: Option<String>,
 }
 
+/// Args for the `set_mode` control frame. The `command` axis is guest-enforced
+/// and validated against the boot policy's command ceiling. The `network` axis
+/// is enforced host-side at the VM boundary and is rejected in a guest-bound
+/// frame; the field exists only so the guest can return a clear error. See ADR 0002.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetModeArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+}
+
 /// Tool names for the semantic (LSP-backed) tool surface.
 pub mod lsp_tools {
     pub const HOVER: &str = "lsp_hover";
@@ -290,6 +303,8 @@ mod tests {
             include_str!("../../../schema/petri-protocol-v1.schema.json"),
             include_str!("../../../schema/fixtures/dispatch/bash-command.request.json"),
             include_str!("../../../schema/fixtures/dispatch/cancel.request.json"),
+            include_str!("../../../schema/fixtures/dispatch/set-mode.request.json"),
+            include_str!("../../../schema/fixtures/dispatch/set-mode.result.json"),
             include_str!("../../../schema/fixtures/dispatch/success.result.json"),
             include_str!("../../../schema/fixtures/dispatch/policy-rejection.result.json"),
             include_str!("../../../schema/fixtures/dispatch/lsp-hover.request.json"),
