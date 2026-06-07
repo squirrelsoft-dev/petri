@@ -77,6 +77,44 @@ pub struct BashCommandArgs {
     pub stdin: Option<String>,
 }
 
+/// Tool names for the semantic (LSP-backed) tool surface.
+pub mod lsp_tools {
+    pub const HOVER: &str = "lsp_hover";
+    pub const DEFINITION: &str = "lsp_definition";
+    pub const REFERENCES: &str = "lsp_references";
+    pub const DIAGNOSTICS: &str = "lsp_diagnostics";
+    pub const RENAME: &str = "lsp_rename";
+
+    /// Whether `tool` names one of the LSP tools.
+    pub fn is_lsp_tool(tool: &str) -> bool {
+        matches!(tool, HOVER | DEFINITION | REFERENCES | RENAME | DIAGNOSTICS)
+    }
+}
+
+/// Args shared by position-based LSP tools (`lsp_hover`, `lsp_definition`,
+/// `lsp_references`). Positions are zero-based, matching the LSP spec.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspPositionArgs {
+    pub file: PathBuf,
+    pub line: u32,
+    pub col: u32,
+}
+
+/// Args for `lsp_diagnostics`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspDiagnosticsArgs {
+    pub file: PathBuf,
+}
+
+/// Args for `lsp_rename`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LspRenameArgs {
+    pub file: PathBuf,
+    pub line: u32,
+    pub col: u32,
+    pub new_name: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
@@ -102,6 +140,10 @@ pub struct ResultFrame {
     pub exit_code: Option<Option<i32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_truncated: Option<bool>,
+    /// Structured, tool-specific result payload. Used by non-process tools such
+    /// as the `lsp_*` family, which return JSON data rather than stdio streams.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorFrame>,
 }
@@ -135,6 +177,24 @@ impl ResultFrame {
             stderr: Some(stderr),
             exit_code: Some(exit_code),
             output_truncated: Some(output_truncated),
+            data: None,
+            error: None,
+        }
+    }
+
+    /// Build a successful result for a structured (non-process) tool, carrying a
+    /// JSON `data` payload instead of stdio streams. Used by the `lsp_*` tools.
+    pub fn data(id: String, elapsed_ms: u64, data: Value) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            id: Some(id),
+            status: Status::Success,
+            elapsed_ms,
+            stdout: None,
+            stderr: None,
+            exit_code: None,
+            output_truncated: None,
+            data: Some(data),
             error: None,
         }
     }
@@ -199,6 +259,7 @@ impl ResultFrame {
             stderr: None,
             exit_code: None,
             output_truncated: None,
+            data: None,
             error: Some(ErrorFrame {
                 code: code.into(),
                 message: message.into(),
@@ -229,8 +290,30 @@ mod tests {
             include_str!("../../../schema/fixtures/dispatch/cancel.request.json"),
             include_str!("../../../schema/fixtures/dispatch/success.result.json"),
             include_str!("../../../schema/fixtures/dispatch/policy-rejection.result.json"),
+            include_str!("../../../schema/fixtures/dispatch/lsp-hover.request.json"),
+            include_str!("../../../schema/fixtures/dispatch/lsp-hover.result.json"),
+            include_str!("../../../schema/fixtures/dispatch/lsp-unavailable.result.json"),
         ] {
             serde_json::from_str::<Value>(input).unwrap();
         }
+    }
+
+    #[test]
+    fn lsp_fixtures_deserialize_into_wire_types() {
+        let request: DispatchRequest = serde_json::from_str(include_str!(
+            "../../../schema/fixtures/dispatch/lsp-hover.request.json"
+        ))
+        .unwrap();
+        assert_eq!(request.tool.as_deref(), Some("lsp_hover"));
+        let args: LspPositionArgs = serde_json::from_value(request.args.unwrap()).unwrap();
+        assert_eq!(args.line, 42);
+        assert_eq!(args.col, 15);
+
+        let result: ResultFrame = serde_json::from_str(include_str!(
+            "../../../schema/fixtures/dispatch/lsp-hover.result.json"
+        ))
+        .unwrap();
+        assert_eq!(result.status, Status::Success);
+        assert_eq!(result.data.unwrap()["available"], Value::Bool(true));
     }
 }

@@ -5,6 +5,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use petri_guest::lsp::{LspConfig, LspManager};
 use petri_guest::policy::Policy;
 use petri_guest::server;
 use petri_guest::transport::VsockListenerConfig;
@@ -12,6 +13,7 @@ use petri_guest::transport::VsockListenerConfig;
 #[derive(Debug)]
 struct Args {
     policy_path: PathBuf,
+    lsp_config_path: Option<PathBuf>,
     transport: Transport,
 }
 
@@ -35,12 +37,19 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse(env::args().skip(1))?;
     let policy = Policy::load(File::open(&args.policy_path)?)?;
+    let lsp_config = match &args.lsp_config_path {
+        Some(path) => LspConfig::load(File::open(path)?)?,
+        None => LspConfig::disabled(),
+    };
+    // Language servers are reused across connections for the VM session and shut
+    // down cleanly when the guest exits (LspManager::drop).
+    let lsp = LspManager::new(lsp_config, policy.workspace_path.clone());
 
     match args.transport {
         Transport::Stdio => {
             let stdin = io::stdin();
             let stdout = io::stdout();
-            server::serve_lines(stdin.lock(), stdout.lock(), &policy)?;
+            server::serve_lines(stdin.lock(), stdout.lock(), &policy, &lsp)?;
         }
         Transport::Tcp(addr) => {
             let listener = TcpListener::bind(&addr)?;
@@ -49,7 +58,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let stream = stream?;
                 let reader = BufReader::new(stream.try_clone()?);
                 let writer = BufWriter::new(stream);
-                server::serve_lines(reader, writer, &policy)?;
+                server::serve_lines(reader, writer, &policy, &lsp)?;
             }
         }
         Transport::Vsock { port } => {
@@ -62,7 +71,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let stream = stream?;
                     let reader = BufReader::new(stream.try_clone()?);
                     let writer = BufWriter::new(stream);
-                    server::serve_lines(reader, writer, &policy)?;
+                    server::serve_lines(reader, writer, &policy, &lsp)?;
                 }
             }
             #[cfg(not(target_os = "linux"))]
@@ -81,12 +90,16 @@ impl Args {
         I: Iterator<Item = String>,
     {
         let mut policy_path = None;
+        let mut lsp_config_path = None;
         let mut transport = Transport::Stdio;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--policy" => {
                     policy_path = Some(PathBuf::from(next_arg(&mut args, "--policy")?));
+                }
+                "--lsp-config" => {
+                    lsp_config_path = Some(PathBuf::from(next_arg(&mut args, "--lsp-config")?));
                 }
                 "--transport" => {
                     let value = next_arg(&mut args, "--transport")?;
@@ -116,6 +129,7 @@ impl Args {
         let policy_path = policy_path.ok_or_else(usage)?;
         Ok(Self {
             policy_path,
+            lsp_config_path,
             transport,
         })
     }
@@ -130,5 +144,5 @@ where
 }
 
 fn usage() -> String {
-    "usage: petri-guest --policy <path> [--transport stdio|tcp|vsock] [--listen <addr>] [--vsock-port <port>]".to_string()
+    "usage: petri-guest --policy <path> [--lsp-config <path>] [--transport stdio|tcp|vsock] [--listen <addr>] [--vsock-port <port>]".to_string()
 }

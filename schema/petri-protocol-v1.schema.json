@@ -34,6 +34,15 @@
         },
         {
           "$ref": "#/$defs/CancelControlRequest"
+        },
+        {
+          "$ref": "#/$defs/LspPositionRequest"
+        },
+        {
+          "$ref": "#/$defs/LspDiagnosticsRequest"
+        },
+        {
+          "$ref": "#/$defs/LspRenameRequest"
         }
       ]
     },
@@ -110,6 +119,68 @@
         }
       }
     },
+    "LspPositionRequest": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["protocol_version", "id", "tool", "args"],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/ProtocolVersion" },
+        "id": { "$ref": "#/$defs/RequestId" },
+        "tool": { "enum": ["lsp_hover", "lsp_definition", "lsp_references"] },
+        "args": { "$ref": "#/$defs/LspPositionArgs" }
+      }
+    },
+    "LspDiagnosticsRequest": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["protocol_version", "id", "tool", "args"],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/ProtocolVersion" },
+        "id": { "$ref": "#/$defs/RequestId" },
+        "tool": { "const": "lsp_diagnostics" },
+        "args": { "$ref": "#/$defs/LspDiagnosticsArgs" }
+      }
+    },
+    "LspRenameRequest": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["protocol_version", "id", "tool", "args"],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/ProtocolVersion" },
+        "id": { "$ref": "#/$defs/RequestId" },
+        "tool": { "const": "lsp_rename" },
+        "args": { "$ref": "#/$defs/LspRenameArgs" }
+      }
+    },
+    "LspPositionArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "line", "col"],
+      "properties": {
+        "file": { "type": "string", "minLength": 1 },
+        "line": { "type": "integer", "minimum": 0 },
+        "col": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "LspDiagnosticsArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file"],
+      "properties": {
+        "file": { "type": "string", "minLength": 1 }
+      }
+    },
+    "LspRenameArgs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "line", "col", "new_name"],
+      "properties": {
+        "file": { "type": "string", "minLength": 1 },
+        "line": { "type": "integer", "minimum": 0 },
+        "col": { "type": "integer", "minimum": 0 },
+        "new_name": { "type": "string", "minLength": 1 }
+      }
+    },
     "DispatchResult": {
       "type": "object",
       "additionalProperties": false,
@@ -146,6 +217,11 @@
         },
         "output_truncated": {
           "type": "boolean"
+        },
+        "data": {
+          "type": "object",
+          "description": "Structured payload for non-process tools (e.g. the lsp_* family).",
+          "additionalProperties": true
         },
         "error": {
           "$ref": "#/$defs/ErrorFrame"

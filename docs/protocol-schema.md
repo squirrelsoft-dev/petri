@@ -28,6 +28,7 @@ that operation.
 |---|---|---|
 | `Sandbox` | `LifecycleControlRequest` for `sandbox.create`, `sandbox.connect`, `sandbox.list`, `sandbox.info`, `sandbox.running`, `sandbox.kill` | `sandbox.pause`, `sandbox.resume`, `sandbox.snapshot`, `sandbox.timeout` |
 | `Commands` | `BashCommandRequest`, `DispatchResult`, `commands.run` | `commands.stream`, `commands.background`, `commands.stdin` |
+| `Lsp` | `LspPositionRequest` (`lsp_hover`, `lsp_definition`, `lsp_references`), `LspDiagnosticsRequest` (`lsp_diagnostics`), `LspRenameRequest` (`lsp_rename`); results carry the structured `data` field | additional language tools |
 | `Filesystem` | none | `FilesystemRequest` with `filesystem.exists`, `filesystem.get_info`, `filesystem.list`, `filesystem.read`, `filesystem.write`, `filesystem.write_files`, `filesystem.make_dir`, `filesystem.remove`, `filesystem.rename`, `filesystem.watch` |
 | `Git` | none | `GitRequest` with `git.clone`, `git.status`, `git.diff`, `git.commit`, `git.checkout` |
 | `Pty` | none | `PtyRequest` with `pty.open`, `pty.input`, `pty.resize`, `pty.close` |

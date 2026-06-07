@@ -1,9 +1,17 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use petri_guest::lsp::{LspConfig, LspManager};
 use petri_guest::policy::Policy;
 use petri_guest::protocol::{DispatchRequest, ResultFrame, Status};
 use petri_guest::server::handle_frame;
+
+/// Dispatch a frame with a disabled LSP manager (these tests cover the
+/// bash/protocol surface only).
+fn handle(line: &str, policy: &Policy) -> ResultFrame {
+    let lsp = LspManager::new(LspConfig::disabled(), std::env::temp_dir());
+    handle_frame(line, policy, &lsp)
+}
 
 fn workspace() -> PathBuf {
     let unique = SystemTime::now()
@@ -79,7 +87,7 @@ fn guest_accepts_shared_bash_command_fixture() {
         workspace_path: workspace,
     };
 
-    let result = handle_frame(&request.to_string(), &policy);
+    let result = handle(&request.to_string(), &policy);
 
     assert_eq!(result.protocol_version, 1);
     assert_eq!(result.id.as_deref(), Some("fixture-bash-command"));
@@ -102,7 +110,7 @@ fn accepts_valid_dispatch_and_captures_process_result() {
     })
     .to_string();
 
-    let result = handle_frame(&line, &policy(&["printf"], workspace));
+    let result = handle(&line, &policy(&["printf"], workspace));
 
     assert_eq!(result.protocol_version, 1);
     assert_eq!(result.id.as_deref(), Some("valid-dispatch"));
@@ -116,7 +124,7 @@ fn accepts_valid_dispatch_and_captures_process_result() {
 
 #[test]
 fn reports_malformed_json_without_request_id() {
-    let result = handle_frame(
+    let result = handle(
         r#"{"protocol_version":1,"id":"bad-json","tool":"#,
         &policy(&["printf"], workspace()),
     );
@@ -142,7 +150,7 @@ fn rejects_command_disallowed_by_policy() {
     })
     .to_string();
 
-    let result = handle_frame(&line, &policy(&["printf"], workspace));
+    let result = handle(&line, &policy(&["printf"], workspace));
 
     assert_eq!(result.id.as_deref(), Some("policy-rejection"));
     assert_eq!(result.status, Status::Rejected);
@@ -165,7 +173,7 @@ fn reports_non_zero_exit_as_command_failure() {
     })
     .to_string();
 
-    let result = handle_frame(&line, &policy(&["false"], workspace));
+    let result = handle(&line, &policy(&["false"], workspace));
 
     assert_eq!(result.status, Status::Failure);
     assert_ne!(result.exit_code, Some(Some(0)));
@@ -192,7 +200,7 @@ fn times_out_when_request_limit_is_exceeded() {
     })
     .to_string();
 
-    let result = handle_frame(&line, &policy(&["sleep"], workspace));
+    let result = handle(&line, &policy(&["sleep"], workspace));
 
     assert_eq!(result.status, Status::Timeout);
     assert_eq!(result.exit_code, Some(None));
@@ -218,7 +226,7 @@ fn truncates_output_to_request_limit() {
     })
     .to_string();
 
-    let result = handle_frame(&line, &policy(&["printf"], workspace));
+    let result = handle(&line, &policy(&["printf"], workspace));
 
     assert_eq!(result.status, Status::Success);
     assert_eq!(result.stdout.as_deref(), Some("abcd"));

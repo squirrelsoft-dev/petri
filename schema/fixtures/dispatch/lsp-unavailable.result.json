@@ -1,0 +1,11 @@
+{
+  "protocol_version": 1,
+  "id": "fixture-lsp-unavailable",
+  "status": "success",
+  "elapsed_ms": 1,
+  "data": {
+    "available": false,
+    "language": "go",
+    "reason": "no language server configured for 'go'"
+  }
+}

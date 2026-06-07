@@ -544,6 +544,7 @@ fn parse_dispatch(mut args: impl Iterator<Item = String>) -> Result<Command> {
     let mut command = None;
     let mut argv = Vec::new();
     let mut cwd = None;
+    let mut args_json = None;
     let mut timeout_ms = None;
     let mut max_output_bytes = None;
 
@@ -554,6 +555,7 @@ fn parse_dispatch(mut args: impl Iterator<Item = String>) -> Result<Command> {
             "--tool" => tool = next_arg(&mut args, "--tool")?,
             "--command" => command = Some(next_arg(&mut args, "--command")?),
             "--arg" => argv.push(next_arg(&mut args, "--arg")?),
+            "--args-json" => args_json = Some(next_arg(&mut args, "--args-json")?),
             "--cwd" => cwd = Some(PathBuf::from(next_arg(&mut args, "--cwd")?)),
             "--timeout-ms" => {
                 timeout_ms = Some(parse_u64(
@@ -576,30 +578,52 @@ fn parse_dispatch(mut args: impl Iterator<Item = String>) -> Result<Command> {
         }
     }
 
-    if tool != "bash_command" {
-        return Err(PetriError::InvalidArgument {
-            flag: "--tool",
-            value: tool,
-            message: "only bash_command is defined by protocol version 1".to_string(),
-        });
-    }
-
     let instance_id = instance_id.ok_or(PetriError::MissingArgument { flag: "--id" })?;
-    let command = command.ok_or(PetriError::MissingArgument { flag: "--command" })?;
-    let cwd = cwd.ok_or(PetriError::MissingArgument { flag: "--cwd" })?;
     let limits = (timeout_ms.is_some() || max_output_bytes.is_some()).then_some(RequestLimits {
         timeout_ms,
         max_output_bytes,
     });
-    let request = DispatchRequest::bash_command(
-        request_id,
-        command,
-        argv,
-        cwd,
-        BTreeMap::new(),
-        None,
-        limits,
-    );
+
+    let request = if tool == "bash_command" {
+        let command = command.ok_or(PetriError::MissingArgument { flag: "--command" })?;
+        let cwd = cwd.ok_or(PetriError::MissingArgument { flag: "--cwd" })?;
+        DispatchRequest::bash_command(
+            request_id,
+            command,
+            argv,
+            cwd,
+            BTreeMap::new(),
+            None,
+            limits,
+        )
+    } else if petri_protocol::lsp_tools::is_lsp_tool(&tool) {
+        // Structured tools carry a raw JSON args object via --args-json.
+        let raw = args_json.ok_or(PetriError::MissingArgument {
+            flag: "--args-json",
+        })?;
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw).map_err(|err| {
+            PetriError::InvalidArgument {
+                flag: "--args-json",
+                value: raw.clone(),
+                message: format!("must be a JSON object: {err}"),
+            }
+        })?;
+        DispatchRequest {
+            protocol_version: crate::dispatch::PROTOCOL_VERSION,
+            id: request_id,
+            control: None,
+            target_id: None,
+            tool: Some(tool),
+            args: Some(parsed),
+            limits,
+        }
+    } else {
+        return Err(PetriError::InvalidArgument {
+            flag: "--tool",
+            value: tool,
+            message: "supported tools: bash_command, lsp_hover, lsp_definition, lsp_references, lsp_diagnostics, lsp_rename".to_string(),
+        });
+    };
 
     Ok(Command::Dispatch(DispatchCommand {
         instance_id,
@@ -2282,7 +2306,7 @@ fn create_usage() -> String {
 }
 
 fn dispatch_usage() -> String {
-    "usage: petri dispatch --id <id> --command <name> --cwd <path> [--request-id <id>] [--arg <value>]... [--timeout-ms <ms>] [--max-output-bytes <bytes>]".to_string()
+    "usage: petri dispatch --id <id> [--tool bash_command|lsp_hover|lsp_definition|lsp_references|lsp_diagnostics|lsp_rename]\n  bash_command: --command <name> --cwd <path> [--arg <value>]...\n  lsp_*: --args-json '<json args object>'\n  common: [--request-id <id>] [--timeout-ms <ms>] [--max-output-bytes <bytes>]".to_string()
 }
 
 fn image_usage() -> String {
@@ -2473,7 +2497,56 @@ mod tests {
         .unwrap_err()
         .to_string();
 
-        assert!(err.contains("only bash_command"));
+        assert!(err.contains("supported tools"));
+    }
+
+    #[test]
+    fn parses_lsp_dispatch_with_args_json() {
+        let command = parse(args(&[
+            "dispatch",
+            "--id",
+            "dev-1",
+            "--tool",
+            "lsp_hover",
+            "--args-json",
+            r#"{"file":"/workspace/src/main.rs","line":42,"col":15}"#,
+        ]))
+        .unwrap();
+
+        let Command::Dispatch(command) = command else {
+            panic!("expected dispatch command");
+        };
+        assert_eq!(command.request.tool.as_deref(), Some("lsp_hover"));
+        let args = command.request.args.expect("lsp args");
+        assert_eq!(args["file"], "/workspace/src/main.rs");
+        assert_eq!(args["line"], 42);
+        assert_eq!(args["col"], 15);
+    }
+
+    #[test]
+    fn rejects_lsp_dispatch_without_args_json() {
+        let err = parse(args(&["dispatch", "--id", "dev-1", "--tool", "lsp_hover"]))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("--args-json"));
+    }
+
+    #[test]
+    fn rejects_lsp_dispatch_with_invalid_args_json() {
+        let err = parse(args(&[
+            "dispatch",
+            "--id",
+            "dev-1",
+            "--tool",
+            "lsp_hover",
+            "--args-json",
+            "not json",
+        ]))
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("JSON"));
     }
 
     #[test]

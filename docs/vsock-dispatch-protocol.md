@@ -95,6 +95,102 @@ The initial tool name is `bash_command`, but the command is not shell text. It d
 
 The guest must not pass `command` through a shell. Shell snippets, command chaining, path traversal, and symlink escapes are rejected by policy checks.
 
+## LSP Tools
+
+The guest exposes semantic code intelligence backed by Language Server Protocol
+servers that run inside the VM. Servers are pre-installed in the base image (see
+[Base VM Images](base-vm-images.md)), configured via the image `[lsp]` section,
+and managed by the guest: started lazily on first use, reused for the VM
+session, restarted automatically if they crash, and shut down with the guest.
+
+The tools are:
+
+| Tool | Args | Purpose |
+|---|---|---|
+| `lsp_hover` | position | Type/signature/doc at a position. |
+| `lsp_definition` | position | Locate the definition of the symbol at a position. |
+| `lsp_references` | position | Find references to the symbol at a position. |
+| `lsp_diagnostics` | file | Diagnostics published for a file. |
+| `lsp_rename` | position + `new_name` | Compute a workspace edit renaming the symbol. |
+
+### Position Args
+
+`lsp_hover`, `lsp_definition`, and `lsp_references` share the position args:
+
+```json
+{
+  "file": "/workspace/src/main.rs",
+  "line": 42,
+  "col": 15
+}
+```
+
+| Field | Type | Required | Description |
+|---|---:|---:|---|
+| `file` | absolute string path | yes | File to query. Must canonicalize inside the policy workspace root. |
+| `line` | integer ≥ 0 | yes | Zero-based line, per the LSP spec. |
+| `col` | integer ≥ 0 | yes | Zero-based character offset within the line. |
+
+`lsp_diagnostics` takes only `file`. `lsp_rename` adds a required non-empty
+`new_name` string to the position args.
+
+The language is detected from the file extension and mapped to a configured
+server. The file is opened in the server (`textDocument/didOpen`) before the
+request is issued; `lsp_diagnostics` returns the diagnostics published for the
+file (or an empty list if none arrive before the internal deadline).
+
+### Result Data
+
+Accepted LSP requests return `status = "success"` with a `data` object instead
+of `stdout`/`stderr`:
+
+```json
+{
+  "available": true,
+  "result": { "contents": { "kind": "markdown", "value": "fn main()" } }
+}
+```
+
+| Field | Type | Description |
+|---|---:|---|
+| `available` | boolean | Whether a language server served the request. |
+| `result` | any | The raw LSP result, present only when `available` is `true`. |
+| `language` | string or null | Detected language key, present when `available` is `false`. |
+| `reason` | string | Why the request degraded, present when `available` is `false`. |
+
+### Graceful Degradation
+
+When no server can serve a request — LSP disabled in the image, an unrecognized
+file extension, or no server configured for the language — the guest still
+returns `status = "success"` with `data.available = false` and a `reason`,
+rather than an error. The calling agent degrades to grep/read_file for that file.
+This keeps "no language support" distinct from genuine failures.
+
+Requests are still subject to the usual validation: a file outside the workspace
+is rejected with `policy_denied`, a missing file or malformed args with
+`invalid_request`, and a server that fails to start or crashes unrecoverably
+returns `status = "failure"` with `error.code = "guest_error"`.
+
+### Example
+
+Request:
+
+```json
+{"protocol_version":1,"id":"req-lsp-1","tool":"lsp_hover","args":{"file":"/workspace/src/main.rs","line":42,"col":15}}
+```
+
+Result:
+
+```json
+{"protocol_version":1,"id":"req-lsp-1","status":"success","elapsed_ms":37,"data":{"available":true,"result":{"contents":{"kind":"markdown","value":"fn main()"}}}}
+```
+
+Degraded result (no server for the file's language):
+
+```json
+{"protocol_version":1,"id":"req-lsp-2","status":"success","elapsed_ms":1,"data":{"available":false,"language":"go","reason":"no language server configured for 'go'"}}
+```
+
 ## Result Schema
 
 Every accepted request returns exactly one terminal result frame.
@@ -122,6 +218,7 @@ Every accepted request returns exactly one terminal result frame.
 | `exit_code` | integer or null | for process results | Process exit code. `null` when no process exit code exists. |
 | `elapsed_ms` | integer | yes | Wall-clock time spent handling the request. |
 | `output_truncated` | boolean | for process results | Whether output was truncated to fit the effective output cap. |
+| `data` | object | for structured tools | Tool-specific structured payload. Used by the `lsp_*` tools instead of `stdout`/`stderr`. See [LSP Tools](#lsp-tools). |
 | `error` | object | for rejected, timeout, cancelled, malformed, and guest failures | Machine-readable error details. |
 
 `success` means the tool completed and returned exit code `0`. `failure` means the tool ran and returned a non-zero exit code, or the guest failed while preparing or running an otherwise valid request. Process failures do not need an `error` object when stdout, stderr, and exit code fully describe the result. `rejected` means the guest refused to run the request because of policy, unsupported version, unknown tool, or invalid request shape. `timeout` means the effective timeout expired. `cancelled` means the request was cancelled before completion. `malformed` means the input frame could not be interpreted as a valid request.

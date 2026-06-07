@@ -1,0 +1,10 @@
+{
+  "protocol_version": 1,
+  "id": "fixture-lsp-hover",
+  "tool": "lsp_hover",
+  "args": {
+    "file": "/workspace/src/main.rs",
+    "line": 42,
+    "col": 15
+  }
+}

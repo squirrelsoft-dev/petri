@@ -109,6 +109,13 @@ than systemd-specific:
 - The policy `workspace_path` should resolve to `/workspace`.
 - Dispatch protocol version `1` must be supported.
 
+LSP support is optional. To serve the `lsp_*` tools, install the language
+servers and pass `--lsp-config <path>` to an `[lsp]` config (the default image
+uses `/etc/petri/lsp.toml`); see
+[Vsock Dispatch Protocol](vsock-dispatch-protocol.md#lsp-tools). Omitting the
+flag is fully compatible — the guest serves `bash_command` normally and degrades
+every `lsp_*` request gracefully.
+
 The default service command is:
 
 ```text

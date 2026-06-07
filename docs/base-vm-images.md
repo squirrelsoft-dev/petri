@@ -141,9 +141,29 @@ at `/usr/local/bin/petri-guest`. The image enables these systemd units:
 - `workspace.mount` mounts the host workspace virtio-fs share at `/workspace`.
 - `run-petri.mount` mounts the read-only config share at `/run/petri`.
 - `petri-guest.service` starts the agent with
-  `--policy /run/petri/policy.toml --transport vsock --vsock-port 7777`.
+  `--policy /run/petri/policy.toml --transport vsock --vsock-port 7777`. When LSP
+  support is enabled the unit also passes `--lsp-config /etc/petri/lsp.toml`.
 
 Those paths match the host backend constants in `crates/petri/src/backend.rs`.
+
+## Language Server Pre-Install
+
+When the image config enables `[lsp]`, the build script provisions the
+configured language servers into the rootfs and bakes a runtime config at
+`/etc/petri/lsp.toml` (the `enabled` flag plus each server's `language`,
+`binary`, and `args` — the build-only `install` and `apt_packages` keys are
+dropped). The default base image ships servers for Rust (`rust-analyzer`),
+TypeScript/JavaScript (`typescript-language-server`), Python (`pylsp`), Go
+(`gopls`), and C/C++ (`clangd`).
+
+Each server's `install` command runs inside the target rootfs, so this stage of
+the build requires network access and the ability to execute the target
+architecture (natively or via binfmt/qemu) under `chroot`. Server binaries are
+placed on `PATH` at `/usr/local/bin`. The guest exposes them through the
+`lsp_*` tools documented in
+[Vsock Dispatch Protocol](vsock-dispatch-protocol.md#lsp-tools); set
+`enabled = false` (or omit the `[lsp]` section) to build an image without LSP
+support, in which case every `lsp_*` request degrades gracefully.
 
 ## Auditability And Verification
 

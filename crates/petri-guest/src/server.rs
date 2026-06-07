@@ -5,23 +5,26 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
+use crate::lsp::{LspManager, LspOutcome};
 use crate::policy::Policy;
 use crate::protocol::{
-    BashCommandArgs, DispatchRequest, PROTOCOL_VERSION, ResultFrame, Status, request_id_from_value,
+    BashCommandArgs, DispatchRequest, PROTOCOL_VERSION, ResultFrame, Status, lsp_tools,
+    request_id_from_value,
 };
 
 pub fn serve_lines(
     reader: impl std::io::Read,
     mut writer: impl Write,
     policy: &Policy,
+    lsp: &LspManager,
 ) -> Result<(), std::io::Error> {
     let reader = BufReader::new(reader);
 
     for line in reader.lines() {
         let line = line?;
-        let result = handle_frame(&line, policy);
+        let result = handle_frame(&line, policy, lsp);
         serde_json::to_writer(&mut writer, &result)?;
         writer.write_all(b"\n")?;
         writer.flush()?;
@@ -30,7 +33,7 @@ pub fn serve_lines(
     Ok(())
 }
 
-pub fn handle_frame(line: &str, policy: &Policy) -> ResultFrame {
+pub fn handle_frame(line: &str, policy: &Policy, lsp: &LspManager) -> ResultFrame {
     let started = Instant::now();
     let line = line.trim_end_matches('\r');
 
@@ -156,6 +159,7 @@ pub fn handle_frame(line: &str, policy: &Policy) -> ResultFrame {
 
     match request.tool.as_deref() {
         Some("bash_command") => handle_bash_command(request, policy, started),
+        Some(tool) if lsp_tools::is_lsp_tool(tool) => handle_lsp(request, lsp, started),
         Some(_) => ResultFrame::rejected(
             Some(request.id),
             elapsed_ms(started.elapsed()),
@@ -246,6 +250,35 @@ fn handle_bash_command(request: DispatchRequest, policy: &Policy, started: Insta
         max_output_bytes,
         started,
     )
+}
+
+fn handle_lsp(request: DispatchRequest, lsp: &LspManager, started: Instant) -> ResultFrame {
+    let tool = request.tool.as_deref().unwrap_or_default();
+    let outcome = lsp.dispatch(tool, request.args.as_ref());
+    let elapsed = elapsed_ms(started.elapsed());
+
+    match outcome {
+        LspOutcome::Available(result) => ResultFrame::data(
+            request.id,
+            elapsed,
+            json!({ "available": true, "result": result }),
+        ),
+        LspOutcome::Unavailable { language, reason } => ResultFrame::data(
+            request.id,
+            elapsed,
+            json!({ "available": false, "language": language, "reason": reason }),
+        ),
+        LspOutcome::Rejected {
+            code,
+            field,
+            message,
+        } => {
+            let mut details = Map::new();
+            details.insert("field".to_string(), Value::from(field));
+            ResultFrame::rejected(Some(request.id), elapsed, code, message, Some(details))
+        }
+        LspOutcome::Failed(message) => guest_error(request.id, elapsed, message),
+    }
 }
 
 fn is_executable_name(command: &str) -> bool {
@@ -413,6 +446,7 @@ fn guest_error(id: String, elapsed_ms: u64, message: String) -> ResultFrame {
         stderr: Some(String::new()),
         exit_code: Some(None),
         output_truncated: Some(false),
+        data: None,
         error: Some(crate::protocol::ErrorFrame {
             code: "guest_error".to_string(),
             message,
@@ -587,6 +621,15 @@ mod tests {
         }
     }
 
+    fn test_lsp() -> LspManager {
+        LspManager::new(crate::lsp::LspConfig::disabled(), std::env::temp_dir())
+    }
+
+    /// Test wrapper that supplies a disabled LSP manager.
+    fn handle(line: &str, policy: &Policy) -> ResultFrame {
+        handle_frame(line, policy, &test_lsp())
+    }
+
     #[test]
     fn executes_allowed_command_and_captures_output() {
         let workspace = workspace();
@@ -602,7 +645,7 @@ mod tests {
         })
         .to_string();
 
-        let result = handle_frame(&line, &policy(&["printf"], workspace));
+        let result = handle(&line, &policy(&["printf"], workspace));
 
         assert_eq!(result.id.as_deref(), Some("req-1"));
         assert_eq!(result.status, Status::Success);
@@ -631,7 +674,7 @@ mod tests {
         })
         .to_string();
 
-        let result = handle_frame(&line, &policy(&["sh"], workspace));
+        let result = handle(&line, &policy(&["sh"], workspace));
 
         assert_eq!(result.status, Status::Success);
         assert_eq!(result.stdout.as_deref(), Some("env-ok:stdin-ok"));
@@ -651,7 +694,7 @@ mod tests {
         })
         .to_string();
 
-        let result = handle_frame(&line, &policy(&["false"], workspace));
+        let result = handle(&line, &policy(&["false"], workspace));
 
         assert_eq!(result.status, Status::Failure);
         assert_ne!(result.exit_code, Some(Some(0)));
@@ -677,7 +720,7 @@ mod tests {
         })
         .to_string();
 
-        let result = handle_frame(&line, &policy(&["printf"], workspace));
+        let result = handle(&line, &policy(&["printf"], workspace));
 
         assert_eq!(result.status, Status::Success);
     }
@@ -686,7 +729,7 @@ mod tests {
     fn rejects_unknown_tool() {
         let line = r#"{"protocol_version":1,"id":"req-1","tool":"unknown","args":{}}"#;
 
-        let result = handle_frame(line, &policy(&["printf"], workspace()));
+        let result = handle(line, &policy(&["printf"], workspace()));
 
         assert_eq!(result.status, Status::Rejected);
         assert_eq!(result.error.unwrap().code, "unknown_tool");
@@ -696,7 +739,7 @@ mod tests {
     fn rejects_policy_command_violation() {
         let line = r#"{"protocol_version":1,"id":"req-1","tool":"bash_command","args":{"command":"bash","cwd":"/workspace"}}"#;
 
-        let result = handle_frame(line, &policy(&["printf"], workspace()));
+        let result = handle(line, &policy(&["printf"], workspace()));
 
         assert_eq!(result.status, Status::Rejected);
         assert_eq!(result.error.unwrap().code, "policy_denied");
@@ -717,7 +760,7 @@ mod tests {
         })
         .to_string();
 
-        let result = handle_frame(&line, &policy(&["printf"], workspace));
+        let result = handle(&line, &policy(&["printf"], workspace));
 
         assert_eq!(result.status, Status::Rejected);
         assert_eq!(result.error.unwrap().code, "policy_denied");
@@ -741,7 +784,7 @@ mod tests {
         })
         .to_string();
 
-        let result = handle_frame(&line, &policy(&["sleep"], workspace));
+        let result = handle(&line, &policy(&["sleep"], workspace));
 
         assert_eq!(result.status, Status::Timeout);
         assert_eq!(result.exit_code, Some(None));
@@ -766,7 +809,7 @@ mod tests {
         })
         .to_string();
 
-        let result = handle_frame(&line, &policy(&["printf"], workspace));
+        let result = handle(&line, &policy(&["printf"], workspace));
 
         assert_eq!(result.status, Status::Success);
         assert_eq!(result.stdout.as_deref(), Some("abcd"));
@@ -777,7 +820,7 @@ mod tests {
     fn rejects_unsupported_protocol_version() {
         let line = r#"{"protocol_version":2,"id":"req-1","tool":"bash_command","args":{"command":"cargo","cwd":"/workspace"}}"#;
 
-        let result = handle_frame(line, &policy(&["printf"], workspace()));
+        let result = handle(line, &policy(&["printf"], workspace()));
 
         assert_eq!(result.status, Status::Rejected);
         assert_eq!(result.error.unwrap().code, "unsupported_protocol_version");
@@ -785,7 +828,7 @@ mod tests {
 
     #[test]
     fn reports_malformed_json() {
-        let result = handle_frame(
+        let result = handle(
             r#"{"protocol_version":1,"id":"req-1","tool":"#,
             &policy(&["printf"], workspace()),
         );
@@ -815,6 +858,7 @@ mod tests {
             input.as_bytes(),
             &mut output,
             &policy(&["printf"], workspace),
+            &test_lsp(),
         )
         .unwrap();
 
@@ -822,5 +866,28 @@ mod tests {
         assert!(output.ends_with('\n'));
         assert!(output.contains(r#""id":"req-1""#));
         assert!(output.contains(r#""status":"success""#));
+    }
+
+    #[test]
+    fn lsp_request_degrades_gracefully_when_disabled() {
+        let line = r#"{"protocol_version":1,"id":"req-1","tool":"lsp_hover","args":{"file":"/workspace/src/main.rs","line":1,"col":1}}"#;
+
+        let result = handle(line, &policy(&["printf"], workspace()));
+
+        assert_eq!(result.status, Status::Success);
+        let data = result.data.expect("lsp result carries data");
+        assert_eq!(data["available"], serde_json::Value::Bool(false));
+        assert!(result.stdout.is_none());
+    }
+
+    #[test]
+    fn unknown_lsp_tool_is_rejected_as_unknown_tool() {
+        // A tool that looks lsp-ish but is not in the surface is unknown.
+        let line = r#"{"protocol_version":1,"id":"req-1","tool":"lsp_format","args":{}}"#;
+
+        let result = handle(line, &policy(&["printf"], workspace()));
+
+        assert_eq!(result.status, Status::Rejected);
+        assert_eq!(result.error.unwrap().code, "unknown_tool");
     }
 }

@@ -115,6 +115,56 @@ read_toml_array() {
   ' "$config"
 }
 
+# Parse the [lsp] section (array-of-tables) via python/tomllib.
+# Modes: enabled | apt | install | runtime
+lsp_py() {
+  python3 - "$config" "$1" <<'PY'
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    sys.stderr.write("python3 with tomllib (>=3.11) is required for [lsp] support\n")
+    sys.exit(1)
+
+config_path, mode = sys.argv[1], sys.argv[2]
+with open(config_path, "rb") as handle:
+    data = tomllib.load(handle)
+
+lsp = data.get("lsp") or {}
+enabled = bool(lsp.get("enabled", False))
+servers = lsp.get("servers", []) or []
+
+if mode == "enabled":
+    print("true" if enabled else "false")
+elif mode == "apt":
+    if enabled:
+        for pkg in lsp.get("apt_packages", []) or []:
+            print(pkg)
+elif mode == "install":
+    if enabled:
+        for server in servers:
+            command = (server.get("install") or "").strip()
+            if command:
+                print(command)
+elif mode == "runtime":
+    # The guest consumes only enabled + language/binary/args.
+    lines = ["[lsp]", "enabled = true" if enabled else "enabled = false", ""]
+    for server in servers:
+        lines.append("[[lsp.servers]]")
+        lines.append('language = "%s"' % server["language"])
+        lines.append('binary = "%s"' % server["binary"])
+        args = server.get("args", []) or []
+        if args:
+            rendered = ", ".join('"%s"' % arg for arg in args)
+            lines.append("args = [%s]" % rendered)
+        lines.append("")
+    sys.stdout.write("\n".join(lines).rstrip() + "\n")
+else:
+    sys.exit(2)
+PY
+}
+
 need_tool awk
 need_tool dd
 need_tool mke2fs
@@ -146,6 +196,14 @@ packages="$(read_toml_array base | paste -sd, -)"
 if [ -z "$name" ] || [ -z "$arch" ] || [ -z "$debian_arch" ] || [ -z "$suite" ] || [ -z "$mirror" ]; then
   echo "config is missing required [image] fields" >&2
   exit 1
+fi
+
+lsp_enabled="$(lsp_py enabled)"
+if [ "$lsp_enabled" = "true" ]; then
+  lsp_apt="$(lsp_py apt | paste -sd, -)"
+  if [ -n "$lsp_apt" ]; then
+    packages="$packages,$lsp_apt"
+  fi
 fi
 
 if [ "$skip_guest_build" -eq 0 ]; then
@@ -185,6 +243,36 @@ mmdebstrap \
 
 install -Dm0755 "$guest_binary" "$rootfs$install_path"
 install -d "$rootfs$workspace_path" "$rootfs/run/petri" "$rootfs/etc/systemd/system" "$rootfs/etc/modules-load.d"
+
+# Provision Language Server Protocol servers into the image. Requires network
+# access and the ability to execute the target architecture (native or via
+# binfmt/qemu) inside a chroot.
+lsp_config_arg=""
+if [ "$lsp_enabled" = "true" ]; then
+  need_tool chroot
+  install -d "$rootfs/etc/petri"
+  lsp_py runtime > "$rootfs/etc/petri/lsp.toml"
+  lsp_config_arg=" --lsp-config /etc/petri/lsp.toml"
+
+  # Shared env so every server binary lands on PATH at /usr/local/bin.
+  lsp_env='export PATH=/opt/rust/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin; export CARGO_HOME=/opt/rust RUSTUP_HOME=/opt/rust GOPATH=/opt/go GOBIN=/usr/local/bin npm_config_prefix=/usr/local'
+
+  # rust-analyzer is a rustup component, so bootstrap a minimal stable toolchain
+  # first and expose the component binary on PATH.
+  if lsp_py install | grep -q 'rustup'; then
+    chroot "$rootfs" /bin/sh -euc "$lsp_env; curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path"
+  fi
+
+  while IFS= read -r install_command; do
+    [ -n "$install_command" ] || continue
+    echo "installing language server: $install_command"
+    chroot "$rootfs" /bin/sh -euc "$lsp_env; $install_command"
+  done < <(lsp_py install)
+
+  if lsp_py install | grep -q 'rustup'; then
+    chroot "$rootfs" /bin/sh -euc "$lsp_env; ln -sf \"\$(rustup which rust-analyzer)\" /usr/local/bin/rust-analyzer"
+  fi
+fi
 
 cat > "$rootfs/etc/modules-load.d/petri.conf" <<'EOF'
 virtiofs
@@ -233,7 +321,7 @@ Requires=workspace.mount run-petri.mount
 
 [Service]
 Type=simple
-ExecStart=$install_path --policy $policy_path --transport vsock --vsock-port $dispatch_port
+ExecStart=$install_path --policy $policy_path$lsp_config_arg --transport vsock --vsock-port $dispatch_port
 Restart=always
 RestartSec=1
 NoNewPrivileges=yes
