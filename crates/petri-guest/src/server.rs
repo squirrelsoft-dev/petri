@@ -794,6 +794,7 @@ mod tests {
     fn policy(allowed_commands: &[&str], workspace_path: PathBuf) -> Policy {
         Policy {
             network_enabled: false,
+            network: crate::policy::NetworkPolicy::disabled(),
             command: crate::policy::CommandPolicy {
                 default: CommandLevel::Edit,
                 max: CommandLevel::Yolo,
@@ -1087,6 +1088,7 @@ mod tests {
         let workspace = workspace();
         let policy = Policy {
             network_enabled: false,
+            network: crate::policy::NetworkPolicy::disabled(),
             command: crate::policy::CommandPolicy {
                 default: CommandLevel::ReadOnly,
                 max: CommandLevel::Yolo,
@@ -1134,6 +1136,7 @@ mod tests {
     fn set_mode_rejects_level_above_ceiling() {
         let policy = Policy {
             network_enabled: false,
+            network: crate::policy::NetworkPolicy::disabled(),
             command: crate::policy::CommandPolicy {
                 default: CommandLevel::ReadOnly,
                 max: CommandLevel::Edit,

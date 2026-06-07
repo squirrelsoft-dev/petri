@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use petri_guest::lsp::{LspConfig, LspManager};
-use petri_guest::policy::{CommandLevel, CommandPolicy, Policy};
+use petri_guest::policy::{CommandLevel, CommandPolicy, NetworkPolicy, Policy};
 use petri_guest::protocol::{DispatchRequest, ResultFrame, Status};
 use petri_guest::server::handle_frame;
 
@@ -30,6 +30,7 @@ fn workspace() -> PathBuf {
 fn policy(allowed_commands: &[&str], workspace_path: PathBuf) -> Policy {
     Policy {
         network_enabled: false,
+        network: NetworkPolicy::disabled(),
         command: CommandPolicy {
             default: CommandLevel::Edit,
             max: CommandLevel::Yolo,
@@ -88,6 +89,7 @@ fn guest_accepts_shared_bash_command_fixture() {
     request["args"]["cwd"] = serde_json::Value::from(workspace.display().to_string());
     let policy = Policy {
         network_enabled: false,
+        network: NetworkPolicy::disabled(),
         command: CommandPolicy {
             default: CommandLevel::Edit,
             max: CommandLevel::Yolo,

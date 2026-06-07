@@ -25,6 +25,10 @@ base = [
   "udev",
   "mount",
   "procps",
+  # In-guest network egress enforcement (#36): iproute2 brings the device up,
+  # nftables provides `nft` for the policy-driven egress ruleset.
+  "iproute2",
+  "nftables",
 ]
 
 # Language Server Protocol servers pre-installed in the image. The guest reads

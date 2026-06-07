@@ -37,6 +37,12 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse(env::args().skip(1))?;
     let policy = Policy::load(File::open(&args.policy_path)?)?;
+
+    // Install the in-guest egress ruleset before accepting any dispatch, so no
+    // workload runs before network policy is in force. Fatal on failure: failing
+    // to apply a required restriction must not fall back to open egress (ADR 0002).
+    #[cfg(target_os = "linux")]
+    petri_guest::netfilter::apply_boot(&policy)?;
     let lsp_config = match &args.lsp_config_path {
         Some(path) => LspConfig::load(File::open(path)?)?,
         None => LspConfig::disabled(),
