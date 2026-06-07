@@ -42,6 +42,7 @@ fn policy(allowed_commands: &[&str], workspace_path: PathBuf) -> Policy {
         max_runtime_secs: 60,
         max_output_bytes: 1024,
         workspace_path,
+        drop_privileges: false,
     }
 }
 
@@ -96,6 +97,7 @@ fn guest_accepts_shared_bash_command_fixture() {
         max_runtime_secs: 60,
         max_output_bytes: 1_048_576,
         workspace_path: workspace,
+        drop_privileges: false,
     };
 
     let result = handle(&request.to_string(), &policy);

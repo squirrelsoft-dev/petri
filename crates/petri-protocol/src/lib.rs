@@ -79,10 +79,10 @@ pub struct BashCommandArgs {
     pub stdin: Option<String>,
 }
 
-/// Args for the `set_mode` control frame. The `command` axis is guest-enforced
-/// and validated against the boot policy's command ceiling. The `network` axis
-/// is enforced host-side at the VM boundary and is rejected in a guest-bound
-/// frame; the field exists only so the guest can return a clear error. See ADR 0002.
+/// Args for the `set_mode` control frame. Both axes are guest-enforced: the
+/// `command` axis via process-launch checks and the `network` axis via in-guest
+/// nftables, each validated against its boot-policy ceiling. At least one axis
+/// must be present; an omitted axis is left unchanged. See ADR 0002.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetModeArgs {

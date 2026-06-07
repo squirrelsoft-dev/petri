@@ -11,6 +11,12 @@ pub struct Policy {
     pub max_runtime_secs: u64,
     pub max_output_bytes: u64,
     pub workspace_path: PathBuf,
+    /// Whether the guest drops each workload process to the unprivileged `agent`
+    /// user before exec (ADR 0002). Defaults to `true` — the secure posture for
+    /// untrusted sandboxes. Trusted provisioning contexts (the image builder)
+    /// set it `false` so commands run with the guest agent's privileges (root),
+    /// which they require to write `/etc`, install packages, etc.
+    pub drop_privileges: bool,
 }
 
 /// Ordered levels of the `command` capability axis. Higher levels grant
@@ -91,6 +97,13 @@ struct RawPolicy {
     max_runtime_secs: u64,
     max_output_bytes: u64,
     workspace_path: PathBuf,
+    /// See [`Policy::drop_privileges`]. Defaults to `true` (drop) when omitted.
+    #[serde(default = "default_drop_privileges")]
+    drop_privileges: bool,
+}
+
+fn default_drop_privileges() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,6 +160,7 @@ impl Policy {
             max_runtime_secs: raw.max_runtime_secs,
             max_output_bytes: raw.max_output_bytes,
             workspace_path: raw.workspace_path,
+            drop_privileges: raw.drop_privileges,
         })
     }
 }

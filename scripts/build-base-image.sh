@@ -242,7 +242,32 @@ mmdebstrap \
   "deb $security_mirror $suite-security main"
 
 install -Dm0755 "$guest_binary" "$rootfs$install_path"
-install -d "$rootfs$workspace_path" "$rootfs/run/petri" "$rootfs/etc/systemd/system" "$rootfs/etc/modules-load.d"
+install -d "$rootfs$workspace_path" "$rootfs/run/petri" "$rootfs/etc/systemd/system" "$rootfs/etc/modules-load.d" "$rootfs/etc/sysctl.d"
+
+# Unprivileged user the guest agent drops workload processes to (uid/gid 1000).
+# `petri-guest` runs as root but execs every tool as this user, so no workload
+# holds CAP_NET_ADMIN to touch nftables or can read root-only state. See ADR 0002.
+# Edit the account files directly so no target-arch binary runs in a chroot.
+if ! grep -q '^agent:' "$rootfs/etc/group"; then
+  echo 'agent:x:1000:' >> "$rootfs/etc/group"
+fi
+if ! grep -q '^agent:' "$rootfs/etc/passwd"; then
+  echo 'agent:x:1000:1000:Petri agent:/workspace:/usr/sbin/nologin' >> "$rootfs/etc/passwd"
+  echo 'agent:!:19000:0:99999:7:::' >> "$rootfs/etc/shadow"
+fi
+# Best-effort ownership of the workspace mountpoint. Note: when the host mounts
+# the workspace over virtio-fs, file ownership is mapped from the host side, so
+# guest-side writability must still be verified end-to-end (ADR 0002 gotcha).
+chown 1000:1000 "$rootfs$workspace_path"
+
+# Close the main re-escalation path for the unprivileged agent user: a uid-1000
+# process can otherwise gain full capabilities inside a new user namespace.
+# Combined with NoNewPrivileges on the service (neutering setuid-root binaries),
+# this leaves no in-guest route back to privilege for a workload. See ADR 0002.
+cat > "$rootfs/etc/sysctl.d/99-petri-hardening.conf" <<'EOF'
+kernel.unprivileged_userns_clone = 0
+user.max_user_namespaces = 0
+EOF
 
 # Provision Language Server Protocol servers into the image. Requires network
 # access and the ability to execute the target architecture (native or via

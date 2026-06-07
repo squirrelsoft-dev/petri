@@ -2093,6 +2093,10 @@ network_enabled = true
 max_runtime_secs = 10800
 max_output_bytes = 4194304
 workspace_path = "/workspace"
+# The builder is a trusted provisioning context: its commands write /etc, install
+# packages, and run mmdebstrap, so they must keep root. Disable the per-command
+# privilege drop that untrusted sandboxes use by default. See ADR 0002.
+drop_privileges = false
 
 # The image builder runs arbitrary provisioning shell, so it declares the yolo
 # command level explicitly rather than smuggling `*` in through an allowlisted

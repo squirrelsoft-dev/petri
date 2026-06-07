@@ -290,7 +290,9 @@ If the target is cancelled, the guest returns a terminal `cancelled` result for 
 
 ## Mode Switching
 
-`set_mode` is a control request that moves the VM's active capability level within the boot-policy ceiling, on a live connection, with no reboot. It is sent over the same NDJSON stream:
+`set_mode` is a control request that moves the VM's active capability levels within the boot-policy ceiling, on a live connection, with no reboot. It is sent over the same NDJSON stream:
+
+> **Implementation status.** The `command` axis is implemented. The `network` axis is the target shape per [ADR 0002](adr/0002-policy-modes-and-runtime-mode-switching.md) and lands with the #36 follow-up; until then the guest rejects a `set_mode` carrying `network` with `invalid_request`.
 
 ```json
 {
@@ -298,7 +300,8 @@ If the target is cancelled, the guest returns a terminal `cancelled` result for 
   "id": "mode-1",
   "control": "set_mode",
   "args": {
-    "command": "edit"
+    "command": "edit",
+    "network": "allowlist"
   }
 }
 ```
@@ -308,17 +311,17 @@ If the target is cancelled, the guest returns a terminal `cancelled` result for 
 | `protocol_version` | integer | yes | Protocol version. |
 | `id` | string | yes | Correlation id for the mode request itself. |
 | `control` | string | yes | Must be `set_mode`. |
-| `args.command` | string | no | Target command level: `none`, `read_only`, `edit`, or `yolo`. |
-| `args.network` | string | no | Not accepted in a guest frame. The network axis is enforced host-side at the VM boundary; a request that sets it is rejected with `invalid_request`. |
+| `args.command` | string | no\* | Target command level: `none`, `read_only`, `edit`, or `yolo`. |
+| `args.network` | string | no\* | Target network level: `none`, `allowlist`, or `full`. Applied by the guest reconfiguring its in-guest nftables ruleset; requires `network_enabled = true` at boot. |
 
-An omitted axis leaves that axis's active level unchanged. The `args` object is closed; unknown keys are rejected. `set_mode` must not carry `tool` or `target_id`.
+\* At least one axis must be present. Both axes are guest-enforced (`command` via process-launch checks, `network` via in-guest nftables — see [Enforcement Layers](adr/0002-policy-modes-and-runtime-mode-switching.md#enforcement-layers)). An omitted axis leaves that axis's active level unchanged. The `args` object is closed; unknown keys are rejected. `set_mode` must not carry `tool` or `target_id`.
 
-The command level moves bidirectionally: the caller may climb toward the boot policy `[policy.command]` ceiling (`max`) or drop back down. The guest rejects any target level above `max` with `error.code = "policy_denied"` and leaves the active level unchanged. An unknown level name is rejected with `invalid_request`.
+Each axis moves bidirectionally: the caller may climb toward that axis's boot-policy ceiling (`max`) or drop back down. The guest validates every requested axis against its `max` first, then applies; a target above `max` is rejected with `error.code = "policy_denied"` and **no** axis is changed. An unknown level name is rejected with `invalid_request`. A `network` change that fails to apply (e.g. the `nft` reconfiguration errors) returns `guest_error` with the prior ruleset left in force, rather than leaving egress undefined.
 
-On success the guest returns a `success` result whose `data` echoes the new active levels:
+On success the guest returns a `success` result whose `data` echoes the new active levels (only the axes that were set; unchanged axes may be omitted):
 
 ```json
-{"protocol_version":1,"id":"mode-1","status":"success","elapsed_ms":1,"data":{"mode":{"command":"edit"}}}
+{"protocol_version":1,"id":"mode-1","status":"success","elapsed_ms":1,"data":{"mode":{"command":"edit","network":"allowlist"}}}
 ```
 
 The change applies to subsequent dispatches on the connection. `set_mode` is a control-plane action by the trusted host; the untrusted workload cannot emit frames and therefore cannot escalate its own level. See [Immutable Policy Config](policy-config.md#runtime-mode-switching).

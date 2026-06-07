@@ -274,15 +274,17 @@ fn handle_bash_command(
         args.stdin,
         timeout,
         max_output_bytes,
+        policy.drop_privileges,
         started,
     )
 }
 
 /// Handle a `set_mode` control frame. Moves the per-connection active command
-/// level, rejecting any request above the boot policy ceiling. Only the command
-/// axis is guest-enforced; the network axis is enforced host-side and is not
-/// accepted here (ADR 0002). Only host control frames reach this path; workload
-/// processes cannot emit dispatch frames.
+/// level, rejecting any request above the boot policy ceiling. Both axes are
+/// guest-enforced by design (ADR 0002), but the network axis (in-guest nftables)
+/// is not implemented yet, so a `network` field is rejected as unimplemented for
+/// now. Only host control frames reach this path; workload processes cannot emit
+/// dispatch frames.
 fn handle_set_mode(
     request: DispatchRequest,
     policy: &Policy,
@@ -323,13 +325,14 @@ fn handle_set_mode(
     };
 
     if args.network.is_some() {
-        // The network axis is enforced at the VM boundary by the host, not in the
-        // guest, so it is never carried in a guest-bound frame. See ADR 0002.
+        // The network axis (in-guest nftables) is designed to be guest-enforced
+        // via this frame, but is not implemented yet — reject until that lands.
+        // See ADR 0002 and the #36 follow-up.
         return ResultFrame::rejected(
             Some(request.id),
             elapsed_ms(started.elapsed()),
             "invalid_request",
-            "network axis is enforced host-side and not accepted in a guest set_mode frame",
+            "network axis is not implemented yet",
             None,
         );
     }
@@ -462,6 +465,7 @@ fn execute_command(
     stdin: Option<String>,
     timeout: Duration,
     max_output_bytes: usize,
+    drop_privileges: bool,
     started: Instant,
 ) -> ResultFrame {
     let stdin_stdio = if stdin.is_some() {
@@ -469,15 +473,20 @@ fn execute_command(
     } else {
         Stdio::null()
     };
-    let mut child = match Command::new(&command)
-        .args(argv)
+    let mut cmd = Command::new(&command);
+    cmd.args(argv)
         .envs(env)
         .current_dir(cwd)
         .stdin(stdin_stdio)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    // Workload processes run as an unprivileged user so they hold no
+    // capabilities (no CAP_NET_ADMIN to touch nftables, etc.) and are confined
+    // to the workspace they own. The guest agent itself stays root. Trusted
+    // provisioning contexts (the image builder) disable this via policy so their
+    // commands keep root. See ADR 0002.
+    configure_privilege_drop(&mut cmd, drop_privileges);
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
             return guest_error(
@@ -559,6 +568,54 @@ fn execute_command(
         }
     }
 }
+
+/// Unprivileged user the guest drops workload processes to. Must match the
+/// `agent` user created in the VM image (`scripts/build-base-image.sh`).
+#[cfg(target_os = "linux")]
+const AGENT_UID: libc::uid_t = 1000;
+#[cfg(target_os = "linux")]
+const AGENT_GID: libc::gid_t = 1000;
+
+/// Arrange for a spawned workload process to drop to the unprivileged `agent`
+/// user before it execs. Only applies when the guest agent runs as root (the
+/// production case — the systemd unit runs `petri-guest` as root); when not root
+/// there is nothing to drop and we leave the child as-is so dev/test runs work.
+#[cfg(target_os = "linux")]
+fn configure_privilege_drop(cmd: &mut Command, drop_privileges: bool) {
+    use std::os::unix::process::CommandExt;
+
+    // Policy may disable the drop for trusted provisioning (the image builder),
+    // whose commands must keep the guest agent's privileges. SAFETY: geteuid is
+    // async-signal-safe and has no preconditions. Nothing to drop unless root.
+    if !drop_privileges || unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+
+    // SAFETY: the closure runs in the forked child between fork and exec and
+    // performs only async-signal-safe syscalls (no allocation, no locks). Order
+    // is load-bearing: clear supplementary groups, then gid, then uid — once the
+    // uid is dropped the process can no longer call setgroups/setgid. std's
+    // CommandExt::uid/gid do NOT clear supplementary groups, so we must.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setgroups(0, std::ptr::null()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setgid(AGENT_GID) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setuid(AGENT_UID) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Non-Linux builds (dev/test on macOS) run workloads in-process without a
+/// privilege drop; the production guest is always Linux.
+#[cfg(not(target_os = "linux"))]
+fn configure_privilege_drop(_cmd: &mut Command, _drop_privileges: bool) {}
 
 fn guest_error(id: String, elapsed_ms: u64, message: String) -> ResultFrame {
     ResultFrame {
@@ -749,6 +806,7 @@ mod tests {
             max_runtime_secs: 60,
             max_output_bytes: 1024,
             workspace_path,
+            drop_privileges: false,
         }
     }
 
@@ -1038,6 +1096,7 @@ mod tests {
             max_runtime_secs: 60,
             max_output_bytes: 1024,
             workspace_path: workspace.clone(),
+            drop_privileges: false,
         };
         let lsp = test_lsp();
         let mut active = policy.command.default;
@@ -1084,6 +1143,7 @@ mod tests {
             max_runtime_secs: 60,
             max_output_bytes: 1024,
             workspace_path: workspace(),
+            drop_privileges: false,
         };
         let mut active = policy.command.default;
 
