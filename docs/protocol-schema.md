@@ -6,9 +6,9 @@ wire types instead of carrying independent request and result definitions.
 
 The checked-in JSON Schema at `schema/petri-protocol-v1.schema.json` is the
 language-client contract for TypeScript, Python, Go, and other SDKs. It covers
-current dispatch requests, dispatch results, error frames, cancellation control
-frames, lifecycle/control operation names, filesystem operation names, and the
-planned SDK module groups:
+current dispatch requests, dispatch results, error frames, cancellation and
+`set_mode` control frames, lifecycle/control operation names, filesystem
+operation names, and the planned SDK module groups:
 
 - `Sandbox`
 - `Commands`

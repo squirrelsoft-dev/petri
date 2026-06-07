@@ -2090,10 +2090,16 @@ fn write_builder_policy(repo_root: &Path) -> Result<PathBuf> {
         &policy,
         r#"[policy]
 network_enabled = true
-allowed_commands = ["bash"]
 max_runtime_secs = 10800
 max_output_bytes = 4194304
 workspace_path = "/workspace"
+
+# The image builder runs arbitrary provisioning shell, so it declares the yolo
+# command level explicitly rather than smuggling `*` in through an allowlisted
+# shell. See docs/adr/0002-policy-modes-and-runtime-mode-switching.md.
+[policy.command]
+default = "yolo"
+max = "yolo"
 "#,
     )
     .map_err(|source| PetriError::Io {

@@ -2,15 +2,16 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use petri_guest::lsp::{LspConfig, LspManager};
-use petri_guest::policy::Policy;
+use petri_guest::policy::{CommandLevel, CommandPolicy, Policy};
 use petri_guest::protocol::{DispatchRequest, ResultFrame, Status};
 use petri_guest::server::handle_frame;
 
 /// Dispatch a frame with a disabled LSP manager (these tests cover the
-/// bash/protocol surface only).
+/// bash/protocol surface only), starting at the policy's default command level.
 fn handle(line: &str, policy: &Policy) -> ResultFrame {
     let lsp = LspManager::new(LspConfig::disabled(), std::env::temp_dir());
-    handle_frame(line, policy, &lsp)
+    let mut active = policy.command.default;
+    handle_frame(line, policy, &lsp, &mut active)
 }
 
 fn workspace() -> PathBuf {
@@ -29,10 +30,15 @@ fn workspace() -> PathBuf {
 fn policy(allowed_commands: &[&str], workspace_path: PathBuf) -> Policy {
     Policy {
         network_enabled: false,
-        allowed_commands: allowed_commands
-            .iter()
-            .map(|command| (*command).to_string())
-            .collect(),
+        command: CommandPolicy {
+            default: CommandLevel::Edit,
+            max: CommandLevel::Yolo,
+            read_only: std::collections::HashSet::new(),
+            edit: allowed_commands
+                .iter()
+                .map(|command| (*command).to_string())
+                .collect(),
+        },
         max_runtime_secs: 60,
         max_output_bytes: 1024,
         workspace_path,
@@ -81,7 +87,12 @@ fn guest_accepts_shared_bash_command_fixture() {
     request["args"]["cwd"] = serde_json::Value::from(workspace.display().to_string());
     let policy = Policy {
         network_enabled: false,
-        allowed_commands: ["printf"].into_iter().map(str::to_string).collect(),
+        command: CommandPolicy {
+            default: CommandLevel::Edit,
+            max: CommandLevel::Yolo,
+            read_only: std::collections::HashSet::new(),
+            edit: ["printf"].into_iter().map(str::to_string).collect(),
+        },
         max_runtime_secs: 60,
         max_output_bytes: 1_048_576,
         workspace_path: workspace,
@@ -93,6 +104,21 @@ fn guest_accepts_shared_bash_command_fixture() {
     assert_eq!(result.id.as_deref(), Some("fixture-bash-command"));
     assert_eq!(result.status, Status::Success);
     assert_eq!(result.stdout.as_deref(), Some("hello"));
+}
+
+#[test]
+fn guest_accepts_shared_set_mode_fixture() {
+    let request = fixture("schema/fixtures/dispatch/set-mode.request.json");
+    let parsed: DispatchRequest = serde_json::from_value(request.clone()).unwrap();
+    assert_eq!(parsed.control.as_deref(), Some("set_mode"));
+
+    let result = handle(&request.to_string(), &policy(&["printf"], workspace()));
+
+    assert_eq!(result.status, Status::Success);
+    assert_eq!(
+        result.data.unwrap()["mode"]["command"],
+        serde_json::Value::from("edit")
+    );
 }
 
 #[test]

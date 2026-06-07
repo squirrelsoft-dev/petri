@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value, json};
 
 use crate::lsp::{LspManager, LspOutcome};
-use crate::policy::Policy;
+use crate::policy::{CommandLevel, Policy};
 use crate::protocol::{
-    BashCommandArgs, DispatchRequest, PROTOCOL_VERSION, ResultFrame, Status, lsp_tools,
-    request_id_from_value,
+    BashCommandArgs, DispatchRequest, PROTOCOL_VERSION, ResultFrame, SetModeArgs, Status,
+    lsp_tools, request_id_from_value,
 };
 
 pub fn serve_lines(
@@ -21,10 +21,15 @@ pub fn serve_lines(
     lsp: &LspManager,
 ) -> Result<(), std::io::Error> {
     let reader = BufReader::new(reader);
+    // The active command level is per-connection mutable state. It starts at the
+    // boot policy default and may move up to (never past) the policy ceiling via
+    // `set_mode`. It can only be changed by host control frames, never inferred
+    // from workload processes. See ADR 0002.
+    let mut active_command = policy.command.default;
 
     for line in reader.lines() {
         let line = line?;
-        let result = handle_frame(&line, policy, lsp);
+        let result = handle_frame(&line, policy, lsp, &mut active_command);
         serde_json::to_writer(&mut writer, &result)?;
         writer.write_all(b"\n")?;
         writer.flush()?;
@@ -33,7 +38,12 @@ pub fn serve_lines(
     Ok(())
 }
 
-pub fn handle_frame(line: &str, policy: &Policy, lsp: &LspManager) -> ResultFrame {
+pub fn handle_frame(
+    line: &str,
+    policy: &Policy,
+    lsp: &LspManager,
+    active_command: &mut CommandLevel,
+) -> ResultFrame {
     let started = Instant::now();
     let line = line.trim_end_matches('\r');
 
@@ -105,17 +115,27 @@ pub fn handle_frame(line: &str, policy: &Policy, lsp: &LspManager) -> ResultFram
         );
     }
 
-    if request.control.as_deref() == Some("cancel") {
-        return ResultFrame::rejected(
-            Some(request.id),
-            elapsed_ms(started.elapsed()),
-            "invalid_request",
-            "cancellation is not implemented in the skeleton guest",
-            None,
-        );
+    if let Some(control) = request.control.as_deref() {
+        return match control {
+            "cancel" => ResultFrame::rejected(
+                Some(request.id),
+                elapsed_ms(started.elapsed()),
+                "invalid_request",
+                "cancellation is not implemented in the skeleton guest",
+                None,
+            ),
+            "set_mode" => handle_set_mode(request, policy, active_command, started),
+            _ => ResultFrame::rejected(
+                Some(request.id),
+                elapsed_ms(started.elapsed()),
+                "invalid_request",
+                "unsupported control request",
+                None,
+            ),
+        };
     }
 
-    if request.control.is_some() || request.target_id.is_some() {
+    if request.target_id.is_some() {
         return ResultFrame::rejected(
             Some(request.id),
             elapsed_ms(started.elapsed()),
@@ -158,7 +178,7 @@ pub fn handle_frame(line: &str, policy: &Policy, lsp: &LspManager) -> ResultFram
     }
 
     match request.tool.as_deref() {
-        Some("bash_command") => handle_bash_command(request, policy, started),
+        Some("bash_command") => handle_bash_command(request, policy, *active_command, started),
         Some(tool) if lsp_tools::is_lsp_tool(tool) => handle_lsp(request, lsp, started),
         Some(_) => ResultFrame::rejected(
             Some(request.id),
@@ -177,7 +197,12 @@ pub fn handle_frame(line: &str, policy: &Policy, lsp: &LspManager) -> ResultFram
     }
 }
 
-fn handle_bash_command(request: DispatchRequest, policy: &Policy, started: Instant) -> ResultFrame {
+fn handle_bash_command(
+    request: DispatchRequest,
+    policy: &Policy,
+    active_command: CommandLevel,
+    started: Instant,
+) -> ResultFrame {
     let timeout = effective_timeout(&request, policy);
     let max_output_bytes = effective_output_cap(&request, policy);
 
@@ -214,10 +239,11 @@ fn handle_bash_command(request: DispatchRequest, policy: &Policy, started: Insta
         );
     }
 
-    if !policy.allows_command(&args.command) {
+    if !policy.command.allows(active_command, &args.command) {
         let mut details = Map::new();
         details.insert("field".to_string(), Value::from("args.command"));
         details.insert("command".to_string(), Value::from(args.command));
+        details.insert("mode".to_string(), Value::from(active_command.as_str()));
         return ResultFrame::rejected(
             Some(request.id),
             elapsed_ms(started.elapsed()),
@@ -249,6 +275,104 @@ fn handle_bash_command(request: DispatchRequest, policy: &Policy, started: Insta
         timeout,
         max_output_bytes,
         started,
+    )
+}
+
+/// Handle a `set_mode` control frame. Moves the per-connection active command
+/// level, rejecting any request above the boot policy ceiling. Only the command
+/// axis is guest-enforced; the network axis is enforced host-side and is not
+/// accepted here (ADR 0002). Only host control frames reach this path; workload
+/// processes cannot emit dispatch frames.
+fn handle_set_mode(
+    request: DispatchRequest,
+    policy: &Policy,
+    active_command: &mut CommandLevel,
+    started: Instant,
+) -> ResultFrame {
+    if request.target_id.is_some() || request.tool.is_some() {
+        return ResultFrame::rejected(
+            Some(request.id),
+            elapsed_ms(started.elapsed()),
+            "invalid_request",
+            "set_mode does not take target_id or tool",
+            None,
+        );
+    }
+
+    let Some(args) = request.args else {
+        return ResultFrame::rejected(
+            Some(request.id),
+            elapsed_ms(started.elapsed()),
+            "invalid_request",
+            "set_mode requires args",
+            None,
+        );
+    };
+
+    let args = match serde_json::from_value::<SetModeArgs>(args) {
+        Ok(args) => args,
+        Err(err) => {
+            return ResultFrame::rejected(
+                Some(request.id),
+                elapsed_ms(started.elapsed()),
+                "invalid_request",
+                format!("invalid set_mode args: {err}"),
+                None,
+            );
+        }
+    };
+
+    if args.network.is_some() {
+        // The network axis is enforced at the VM boundary by the host, not in the
+        // guest, so it is never carried in a guest-bound frame. See ADR 0002.
+        return ResultFrame::rejected(
+            Some(request.id),
+            elapsed_ms(started.elapsed()),
+            "invalid_request",
+            "network axis is enforced host-side and not accepted in a guest set_mode frame",
+            None,
+        );
+    }
+
+    let Some(command_name) = args.command else {
+        return ResultFrame::rejected(
+            Some(request.id),
+            elapsed_ms(started.elapsed()),
+            "invalid_request",
+            "set_mode requires a command level",
+            None,
+        );
+    };
+
+    let Some(level) = CommandLevel::parse(&command_name) else {
+        return ResultFrame::rejected(
+            Some(request.id),
+            elapsed_ms(started.elapsed()),
+            "invalid_request",
+            format!("unknown command level '{command_name}'"),
+            None,
+        );
+    };
+
+    if level > policy.command.max {
+        let mut details = Map::new();
+        details.insert("field".to_string(), Value::from("mode.command"));
+        details.insert("requested".to_string(), Value::from(level.as_str()));
+        details.insert("max".to_string(), Value::from(policy.command.max.as_str()));
+        return ResultFrame::rejected(
+            Some(request.id),
+            elapsed_ms(started.elapsed()),
+            "policy_denied",
+            "requested command level exceeds policy ceiling",
+            Some(details),
+        );
+    }
+
+    *active_command = level;
+    ResultFrame::data(
+        request.id,
+        elapsed_ms(started.elapsed()),
+        json!({ "mode": { "command": level.as_str() } }),
     )
 }
 
@@ -608,13 +732,20 @@ mod tests {
         path
     }
 
+    /// Build a policy whose default level (`edit`) allows exactly the given
+    /// commands, with the ceiling at `yolo` so escalation tests can climb.
     fn policy(allowed_commands: &[&str], workspace_path: PathBuf) -> Policy {
         Policy {
             network_enabled: false,
-            allowed_commands: allowed_commands
-                .iter()
-                .map(|command| (*command).to_string())
-                .collect(),
+            command: crate::policy::CommandPolicy {
+                default: CommandLevel::Edit,
+                max: CommandLevel::Yolo,
+                read_only: std::collections::HashSet::new(),
+                edit: allowed_commands
+                    .iter()
+                    .map(|command| (*command).to_string())
+                    .collect(),
+            },
             max_runtime_secs: 60,
             max_output_bytes: 1024,
             workspace_path,
@@ -625,9 +756,11 @@ mod tests {
         LspManager::new(crate::lsp::LspConfig::disabled(), std::env::temp_dir())
     }
 
-    /// Test wrapper that supplies a disabled LSP manager.
+    /// Test wrapper that supplies a disabled LSP manager and starts at the
+    /// policy's default command level.
     fn handle(line: &str, policy: &Policy) -> ResultFrame {
-        handle_frame(line, policy, &test_lsp())
+        let mut active = policy.command.default;
+        handle_frame(line, policy, &test_lsp(), &mut active)
     }
 
     #[test]
@@ -889,5 +1022,103 @@ mod tests {
 
         assert_eq!(result.status, Status::Rejected);
         assert_eq!(result.error.unwrap().code, "unknown_tool");
+    }
+
+    #[test]
+    fn set_mode_escalates_within_ceiling_and_changes_command_authority() {
+        let workspace = workspace();
+        let policy = Policy {
+            network_enabled: false,
+            command: crate::policy::CommandPolicy {
+                default: CommandLevel::ReadOnly,
+                max: CommandLevel::Yolo,
+                read_only: ["true"].into_iter().map(str::to_string).collect(),
+                edit: ["printf"].into_iter().map(str::to_string).collect(),
+            },
+            max_runtime_secs: 60,
+            max_output_bytes: 1024,
+            workspace_path: workspace.clone(),
+        };
+        let lsp = test_lsp();
+        let mut active = policy.command.default;
+
+        // printf is an `edit`-tier command; at the default `read_only` it is denied.
+        let printf = serde_json::json!({
+            "protocol_version": 1,
+            "id": "r1",
+            "tool": "bash_command",
+            "args": { "command": "printf", "argv": ["hi"], "cwd": workspace.clone() }
+        })
+        .to_string();
+        let denied = handle_frame(&printf, &policy, &lsp, &mut active);
+        assert_eq!(denied.status, Status::Rejected);
+        assert_eq!(denied.error.unwrap().code, "policy_denied");
+
+        // Escalate to `edit`, which is within the `yolo` ceiling.
+        let set =
+            r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{"command":"edit"}}"#;
+        let switched = handle_frame(set, &policy, &lsp, &mut active);
+        assert_eq!(switched.status, Status::Success);
+        assert_eq!(
+            switched.data.unwrap()["mode"]["command"],
+            Value::from("edit")
+        );
+        assert_eq!(active, CommandLevel::Edit);
+
+        // The same command now runs.
+        let ok = handle_frame(&printf, &policy, &lsp, &mut active);
+        assert_eq!(ok.status, Status::Success);
+        assert_eq!(ok.stdout.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn set_mode_rejects_level_above_ceiling() {
+        let policy = Policy {
+            network_enabled: false,
+            command: crate::policy::CommandPolicy {
+                default: CommandLevel::ReadOnly,
+                max: CommandLevel::Edit,
+                read_only: std::collections::HashSet::new(),
+                edit: std::collections::HashSet::new(),
+            },
+            max_runtime_secs: 60,
+            max_output_bytes: 1024,
+            workspace_path: workspace(),
+        };
+        let mut active = policy.command.default;
+
+        let set =
+            r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{"command":"yolo"}}"#;
+        let result = handle_frame(set, &policy, &test_lsp(), &mut active);
+
+        assert_eq!(result.status, Status::Rejected);
+        assert_eq!(result.error.unwrap().code, "policy_denied");
+        // The active level is unchanged after a rejected escalation.
+        assert_eq!(active, CommandLevel::ReadOnly);
+    }
+
+    #[test]
+    fn set_mode_rejects_network_axis_for_now() {
+        let policy = policy(&["printf"], workspace());
+        let mut active = policy.command.default;
+
+        let set =
+            r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{"network":"full"}}"#;
+        let result = handle_frame(set, &policy, &test_lsp(), &mut active);
+
+        assert_eq!(result.status, Status::Rejected);
+        assert_eq!(result.error.unwrap().code, "invalid_request");
+    }
+
+    #[test]
+    fn set_mode_rejects_unknown_level() {
+        let policy = policy(&["printf"], workspace());
+        let mut active = policy.command.default;
+
+        let set = r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{"command":"superuser"}}"#;
+        let result = handle_frame(set, &policy, &test_lsp(), &mut active);
+
+        assert_eq!(result.status, Status::Rejected);
+        assert_eq!(result.error.unwrap().code, "invalid_request");
     }
 }
