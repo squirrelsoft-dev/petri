@@ -33,6 +33,7 @@ struct Args {
     var commandLine: String?
     var dispatchPort: UInt32 = dispatchPortDefault
     var guestReadyTimeoutSecs: TimeInterval = 60
+    var networkEnabled: Bool = false
 
     static func parse(_ values: ArraySlice<String>) throws -> Args {
         var args = Args()
@@ -69,6 +70,8 @@ struct Args {
                 args.configDir = try next(arg)
             case "--console-log":
                 args.consoleLog = try next(arg)
+            case "--enable-network":
+                args.networkEnabled = true
             case "--command-line":
                 args.commandLine = try next(arg)
             case "--dispatch-port":
@@ -399,7 +402,13 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
             directoryShare(tag: configTag, path: args.configDir!, readOnly: true),
         ]
         configuration.socketDevices = [VZVirtioSocketDeviceConfiguration()]
-        configuration.networkDevices = [networkDevice()]
+        if args.networkEnabled {
+            log("policy enables networking; attaching NAT network device")
+            configuration.networkDevices = [networkDevice()]
+        } else {
+            log("policy disables networking; omitting network device")
+            configuration.networkDevices = []
+        }
         configuration.serialPorts = [try serialPort(path: args.consoleLog!)]
         configuration.consoleDevices = [try consoleDevice(path: args.consoleLog!)]
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]

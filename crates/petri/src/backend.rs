@@ -1,5 +1,6 @@
 use crate::dispatch::{DispatchRequest, DispatchResult};
 use crate::error::{PetriError, Result};
+use petri_protocol::policy::Policy;
 use crate::instance::{
     GUEST_WORKSPACE_PATH, InstanceConfig, InstanceHandle, InstanceId, LifecycleState,
 };
@@ -297,6 +298,7 @@ impl MacosBackend {
             path: config.policy.clone(),
             source,
         })?;
+        let policy_doc = load_host_policy(&policy)?;
         let workspace_contract = config.workspace_contract()?;
         let workspace = workspace_contract.host_path;
         let config_dir = self.config_dir(&config.id);
@@ -369,6 +371,9 @@ impl MacosBackend {
         }
         for disk in &image.auxiliary_disks {
             command.arg("--auxiliary-disk").arg(disk);
+        }
+        if policy_doc.network_enabled {
+            command.arg("--enable-network");
         }
 
         #[cfg(unix)]
@@ -911,6 +916,15 @@ impl HelperResponse {
     }
 }
 
+fn load_host_policy(path: &Path) -> Result<Policy> {
+    let file = fs::File::open(path).map_err(|source| PetriError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Policy::load(file)
+        .map_err(|err| backend_error(format!("failed to load policy {}: {err}", path.display())))
+}
+
 fn default_state_dir() -> PathBuf {
     env::var_os("PETRI_STATE_DIR")
         .map(PathBuf::from)
@@ -1417,5 +1431,49 @@ mod tests {
             err.to_string(),
             "invalid lifecycle transition during dispatch: torn_down -> running_dispatch"
         );
+    }
+
+    fn write_policy(dir: &Path, network_enabled: bool) -> PathBuf {
+        let path = dir.join("policy.toml");
+        fs::write(
+            &path,
+            format!(
+                "[policy]\nnetwork_enabled = {network_enabled}\nallowed_commands = [\"git\"]\n\
+                 max_runtime_secs = 60\nmax_output_bytes = 1048576\nworkspace_path = \"/workspace\"\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn load_host_policy_reads_network_disabled() {
+        let dir = temp_dir("policy-network-disabled");
+        let path = write_policy(&dir, false);
+
+        let policy = load_host_policy(&path).unwrap();
+
+        assert!(!policy.network_enabled);
+    }
+
+    #[test]
+    fn load_host_policy_reads_network_enabled() {
+        let dir = temp_dir("policy-network-enabled");
+        let path = write_policy(&dir, true);
+
+        let policy = load_host_policy(&path).unwrap();
+
+        assert!(policy.network_enabled);
+    }
+
+    #[test]
+    fn load_host_policy_surfaces_parse_errors() {
+        let dir = temp_dir("policy-invalid");
+        let path = dir.join("policy.toml");
+        fs::write(&path, "not = valid = policy").unwrap();
+
+        let err = load_host_policy(&path).unwrap_err().to_string();
+
+        assert!(err.contains("failed to load policy"));
     }
 }
