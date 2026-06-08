@@ -179,6 +179,22 @@ impl MacosBackend {
         self.instance_dir(instance_id).join("instance.json")
     }
 
+    fn lock_path(&self, instance_id: &InstanceId) -> PathBuf {
+        self.instance_dir(instance_id).join("instance.lock")
+    }
+
+    /// Acquire the per-instance advisory lock, serializing the read-modify-write
+    /// of `instance.json`. The lock is held for the lifetime of the returned
+    /// guard and released when it drops (the file descriptor closes). See #33.
+    fn lock_instance(&self, instance_id: &InstanceId) -> Result<InstanceLock> {
+        let instance_dir = self.instance_dir(instance_id);
+        fs::create_dir_all(&instance_dir).map_err(|source| PetriError::Io {
+            path: instance_dir,
+            source,
+        })?;
+        InstanceLock::acquire(self.lock_path(instance_id))
+    }
+
     fn instance_dir(&self, instance_id: &InstanceId) -> PathBuf {
         self.state_dir.join(instance_id.as_str())
     }
@@ -535,6 +551,12 @@ impl HostBackend for MacosBackend {
         instance_id: &InstanceId,
         request: DispatchRequest,
     ) -> Result<DispatchResult> {
+        // Hold the per-instance lock across the whole dispatch so concurrent
+        // drivers serialize on the same instance instead of interleaving their
+        // read-modify-writes (which produced spurious `invalid lifecycle
+        // transition` errors and corrupted state). A second dispatch blocks here
+        // until the first finishes and returns the instance to `Ready` (#33).
+        let _lock = self.lock_instance(instance_id)?;
         let state = self.load_state(instance_id)?;
         let running = self.transition_state(state, LifecycleState::RunningDispatch, "dispatch")?;
         // Capture every transport error into `result` (rather than `?`-bailing
@@ -563,6 +585,9 @@ impl HostBackend for MacosBackend {
     }
 
     fn stop(&self, instance_id: &InstanceId) -> Result<()> {
+        // Serialize the whole stop against any concurrent dispatch/stop/teardown
+        // on this instance (#33).
+        let _lock = self.lock_instance(instance_id)?;
         let state = self.load_state(instance_id)?;
         let stopping = self.transition_state(state, LifecycleState::Stopping, "stop")?;
         let result = match stopping.transport {
@@ -589,6 +614,9 @@ impl HostBackend for MacosBackend {
     }
 
     fn teardown(&self, instance_id: &InstanceId) -> Result<()> {
+        // Hold the lock across the whole teardown so a concurrent dispatch/stop
+        // cannot observe the instance mid-removal or race the final delete (#33).
+        let _lock = self.lock_instance(instance_id)?;
         if let Ok(state) = self.load_state(instance_id) {
             let state = if state.lifecycle == LifecycleState::TornDown {
                 state
@@ -609,6 +637,57 @@ impl HostBackend for MacosBackend {
             }
         }
         self.remove_state(instance_id)
+    }
+}
+
+/// An advisory exclusive lock over a per-instance lockfile, used to serialize
+/// the read-modify-write of `instance.json` across processes and threads so
+/// concurrent dispatch/stop/teardown cannot interleave their state writes (#33).
+///
+/// On Unix this is a `flock(LOCK_EX)` held on an open file descriptor; the lock
+/// is released automatically when the descriptor closes (guard drop). On other
+/// platforms there is no microVM backend, so the guard is a no-op.
+#[cfg(unix)]
+struct InstanceLock {
+    // Kept open for the guard's lifetime: dropping the file closes the fd and
+    // releases the advisory lock.
+    _file: fs::File,
+}
+
+#[cfg(unix)]
+impl InstanceLock {
+    fn acquire(path: PathBuf) -> Result<Self> {
+        use std::os::unix::io::AsRawFd;
+
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| PetriError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        // SAFETY: `file` owns a valid open descriptor for the duration of the
+        // call. `flock(LOCK_EX)` blocks until the exclusive lock is granted.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(PetriError::Io {
+                path,
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+#[cfg(not(unix))]
+struct InstanceLock;
+
+#[cfg(not(unix))]
+impl InstanceLock {
+    fn acquire(_path: PathBuf) -> Result<Self> {
+        Ok(Self)
     }
 }
 
@@ -1523,6 +1602,66 @@ mod tests {
             recovered[0].state,
             LifecycleState::Ready,
             "transient dispatch error must not brick the instance to Failed"
+        );
+    }
+
+    #[test]
+    fn concurrent_dispatch_serializes_without_lifecycle_races() {
+        // Many drivers dispatching against the same `Ready` instance must each
+        // take a clean `Ready -> RunningDispatch -> Ready` turn under the
+        // per-instance lock. Without locking the unsynchronized read-modify-write
+        // interleaves and produces spurious `invalid lifecycle transition`
+        // errors and corrupted state. Regression test for #33.
+        use std::sync::Arc;
+
+        let state_dir = temp_dir("dispatch-concurrent");
+        let backend = Arc::new(MacosBackend::new(&state_dir, "petri-vz"));
+        let id = InstanceId::new("dispatch-concurrent").unwrap();
+        backend
+            .write_state(&runtime_state(id.clone(), LifecycleState::Ready))
+            .unwrap();
+
+        let threads: Vec<_> = (0..16)
+            .map(|n| {
+                let backend = Arc::clone(&backend);
+                let id = id.clone();
+                thread::spawn(move || {
+                    // Loopback transport pointing at a refused port: every
+                    // dispatch fails at connect time with a recoverable
+                    // transport error and must land the instance back in `Ready`.
+                    let request = DispatchRequest::bash_command(
+                        format!("request-{n}"),
+                        "pwd",
+                        Vec::new(),
+                        PathBuf::from("/workspace"),
+                        std::collections::BTreeMap::new(),
+                        None,
+                        None,
+                    );
+                    backend.dispatch(&id, request)
+                })
+            })
+            .collect();
+
+        for handle in threads {
+            let err = handle
+                .join()
+                .expect("dispatch thread panicked")
+                .expect_err("loopback dispatch to a refused port must fail");
+            // A lifecycle-transition error (the race symptom) is NOT
+            // dispatch-recoverable, so this assertion catches interleaving.
+            assert!(
+                err.dispatch_recoverable(),
+                "concurrent dispatch produced a non-recoverable error (lifecycle race?): {err}"
+            );
+        }
+
+        let instances = backend.list().unwrap();
+        assert_eq!(instances.len(), 1);
+        assert_eq!(
+            instances[0].state,
+            LifecycleState::Ready,
+            "every serialized dispatch must restore the instance to Ready"
         );
     }
 
