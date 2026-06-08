@@ -26,15 +26,25 @@ fix removed a path that stranded instances in `RunningDispatch` (errors
 used to `?`-escape before the recovery step). `Failed` is now reserved for
 genuinely unrecoverable states.
 
+The lifecycle state file is now concurrency-safe (#33, done): a
+per-instance advisory lock (`flock(LOCK_EX)` on `instance.lock`; no-op on
+non-Unix) is held across the **entire** `dispatch`/`stop`/`teardown`
+operation, so concurrent drivers serialize on an instance instead of
+interleaving the `load_state → transition → write_state` read-modify-write.
+A second `dispatch` blocks until the first returns the instance to `Ready`,
+eliminating the spurious `invalid lifecycle transition` errors. (`create`
+is deliberately left unlocked; concurrent same-ID create is a user-error
+case outside this fix's scope.)
+
 Only the macOS/Apple Virtualization backend exists. Known incomplete /
-broken: guest cancellation is unimplemented; the lifecycle state file has
-no locking (#33); byte-at-a-time vsock reads won't scale (#34).
-Operational flake: `petri sandbox create` intermittently hangs (~30 min,
-0 CPU, no instance dir) — workaround is `pkill -9 -f "sandbox create";
-pkill -9 -f petri-vz` and retry (was related to #32/#33; #32's recovery
-fix may reduce but not eliminate it, since the hang predates dispatch and
-#33's locking gap remains). Network domain filtering is good-faith, not a
-hard per-domain guarantee (shared-CDN-IP and DoH bypasses remain; ADR 0002).
+broken: guest cancellation is unimplemented; byte-at-a-time vsock reads
+won't scale (#34). Operational flake: `petri sandbox create` intermittently
+hangs (~30 min, 0 CPU, no instance dir) — workaround is `pkill -9 -f
+"sandbox create"; pkill -9 -f petri-vz` and retry. This hang predates
+dispatch and was historically linked to #32/#33; both are now fixed, so the
+next occurrence needs fresh diagnosis rather than being attributed to the
+old reliability bugs. Network domain filtering is good-faith, not a hard
+per-domain guarantee (shared-CDN-IP and DoH bypasses remain; ADR 0002).
 
 ## Active Direction
 An E2B-style sandbox you run on your own hardware (local or self-hosted
@@ -43,7 +53,9 @@ and runtime mode switching — and eventually a remote HTTP control plane.
 Near-term focus: with both capability axes now in place, harden the
 host↔guest dispatch path against the known reliability bugs (#32/#33/#34)
 before broadening surface (SDKs/backends). #32 (dispatch error recovery)
-is now done; #33 (state-file locking) and #34 (vsock read scaling) remain.
+and #33 (state-file locking) are now done; #34 (vsock read scaling) is the
+last of the named dispatch-reliability bugs. After #34 the path is clear to
+broaden surface (SDKs/backends).
 
 ## Known Deviations
 1. #31 was resolved more strongly than its `documentation` label implied:
@@ -66,14 +78,19 @@ is now done; #33 (state-file locking) and #34 (vsock read scaling) remain.
    base image (`14c9c78`); shipped base image rebuilt (`5a7055e`). Rebuild also
    fixed a chain of latent base-image build bugs (chroot mounts/env, TOML-array
    comment parsing, 2G→8G disk).
+5. #33's lock guards `dispatch`/`stop`/`teardown` but intentionally not
+   `create`. The issue named the three lifecycle ops; concurrent same-ID
+   `create` is a distinct user-error case and was left out of scope to keep
+   the fix tight. Revisit if a control plane ever issues creates concurrently.
 
 ## Next Actions
-1. #33 — lifecycle state file locking; concurrent dispatch races (bug). Top
-   priority: it's the remaining reliability defect on the dispatch path and
-   the still-live contributor to the `sandbox create` hang (the #32 fix
-   addressed error recovery but not the unlocked state file).
-2. #34 — byte-at-a-time vsock reads won't scale in the Swift helper.
-3. #35 — low-severity code-review cleanups (polish; batch opportunistically).
+1. #34 — byte-at-a-time vsock reads won't scale in the Swift helper. Now the
+   top priority: the last named dispatch-reliability bug, and the gate before
+   broadening surface (SDKs/backends).
+2. #35 — low-severity code-review cleanups (polish; batch opportunistically).
+3. Re-diagnose the `sandbox create` hang if it recurs. Its historical links
+   (#32/#33) are both fixed, so it can no longer be attributed to them; needs
+   a fresh root-cause pass (likely in the Swift helper boot/ready path).
 4. #23 — runtime full-policy replacement / `setPolicy` (`scope: deferred`):
    the residual beyond the two capability axes; needs the
    narrow-only-vs-redefine-ceiling design call before implementation.
