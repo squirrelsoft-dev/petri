@@ -363,6 +363,31 @@ ln -s ../run-petri.mount "$rootfs/etc/systemd/system/local-fs.target.wants/run-p
 mkdir -p "$rootfs/etc/systemd/system/multi-user.target.wants"
 ln -s ../petri-guest.service "$rootfs/etc/systemd/system/multi-user.target.wants/petri-guest.service"
 
+# Bring the network interface up via DHCP so in-guest egress can actually work.
+# The vz backend only attaches a (NAT) network device when the policy sets
+# network_enabled = true, so with networking disabled there is no interface for
+# this to match and no egress. Policy is still enforced entirely by the nftables
+# ruleset petri-guest installs at boot; networkd only provides connectivity.
+# systemd-resolved is deliberately NOT enabled so the DNS proxy's
+# /etc/resolv.conf (nameserver 127.0.0.1) is not overwritten. See ADR 0002 / #36.
+install -d "$rootfs/etc/systemd/network"
+cat > "$rootfs/etc/systemd/network/10-petri.network" <<'EOF'
+[Match]
+Name=en*
+
+[Network]
+DHCP=yes
+EOF
+# Offline-enable systemd-networkd; fall back to explicit symlinks (the units it
+# would create) if `systemctl --root` is unavailable in the build environment.
+systemctl --root="$rootfs" enable systemd-networkd.service 2>/dev/null || {
+  mkdir -p "$rootfs/etc/systemd/system/sockets.target.wants"
+  ln -sf /lib/systemd/system/systemd-networkd.service \
+    "$rootfs/etc/systemd/system/multi-user.target.wants/systemd-networkd.service"
+  ln -sf /lib/systemd/system/systemd-networkd.socket \
+    "$rootfs/etc/systemd/system/sockets.target.wants/systemd-networkd.socket"
+}
+
 kernel="$(find "$rootfs/boot" -maxdepth 1 -type f -name 'vmlinuz-*' | sort | tail -n 1)"
 initrd="$(find "$rootfs/boot" -maxdepth 1 -type f -name 'initrd.img-*' | sort | tail -n 1 || true)"
 
