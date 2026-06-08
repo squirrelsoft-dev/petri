@@ -126,6 +126,30 @@ audit metadata.
 
 ---
 
+## CLI
+
+The user-facing CLI follows an E2B-style sandbox command structure:
+
+```sh
+petri sandbox create [base] --workspace <path> --policy <path>   # -> sandbox id
+petri sandbox list [--state running|paused] [--format pretty|json]
+petri sandbox connect <sandbox-id>
+petri sandbox exec [--cwd <path>] [--env k=v,...] [--timeout-ms <ms>] <sandbox-id> <command> [args...]
+petri sandbox kill [--all | <sandbox-id>...]
+```
+
+`sandbox exec` pipes stdin through, so `echo foo | petri sandbox exec <id> cat`
+works. The earlier low-level commands remain as compatibility aliases during
+migration: `petri create`, `petri dispatch`, `petri stop`, `petri teardown`, and
+`petri image build`. Run `petri --help` for the full surface.
+
+For programmatic use, the same lifecycle and command surface is exposed as an
+E2B-style `Sandbox` SDK. See the [Sandbox SDK API](docs/sdk-api.md) for the
+language-agnostic contract (Rust, TypeScript, Python, Go) and
+[Protocol Schema](docs/protocol-schema.md) for the underlying wire contract.
+
+---
+
 ## Status
 
 🌱 **Early planning.** Architecture is being designed against spore-core's sandbox seam. The vsock protocol and guest agent spec will be stabilized before platform implementations begin.

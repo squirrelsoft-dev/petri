@@ -128,10 +128,7 @@ pub fn run_with_stdin(
         }
         Command::ImageBuild(command) => run_image_build(command, backend),
         Command::SandboxList(command) => run_sandbox_list(command, backend),
-        Command::SandboxConnect(command) => Err(PetriError::Cli(format!(
-            "sandbox connect is not implemented yet for instance {}",
-            command.instance_id
-        ))),
+        Command::SandboxConnect(command) => run_sandbox_connect(command, backend),
         Command::SandboxKill(command) => run_sandbox_kill(command, backend),
         Command::Stop(command) => {
             backend.stop(&command.instance_id)?;
@@ -787,6 +784,32 @@ fn run_sandbox_list(command: SandboxListCommand, backend: &impl HostBackend) -> 
             Ok(lines.join("\n"))
         }
     }
+}
+
+fn run_sandbox_connect(command: InstanceCommand, backend: &impl HostBackend) -> Result<String> {
+    // Connecting confirms the sandbox exists and is running without tearing it
+    // down on exit. Interactive PTY attach is deferred (#27/#29 v1), so this is
+    // a non-interactive readiness check that reports the live handle.
+    let handle = backend
+        .list()?
+        .into_iter()
+        .find(|instance| instance.id == command.instance_id)
+        .ok_or_else(|| PetriError::Cli(format!("no sandbox with id '{}'", command.instance_id)))?;
+
+    if !handle.state.is_running() {
+        return Err(PetriError::Cli(format!(
+            "sandbox '{}' is not running (state: {})",
+            handle.id,
+            handle.state.as_str()
+        )));
+    }
+
+    Ok(format!(
+        "connected to sandbox {} (backend {}, state {})",
+        handle.id,
+        handle.backend,
+        handle.state.as_str()
+    ))
 }
 
 fn run_sandbox_kill(command: SandboxKillCommand, backend: &impl HostBackend) -> Result<String> {
@@ -2342,9 +2365,83 @@ fn teardown_usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instance::{InstanceHandle, LifecycleState};
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    struct ConnectFakeBackend {
+        instances: Vec<InstanceHandle>,
+    }
+
+    impl HostBackend for ConnectFakeBackend {
+        fn name(&self) -> &str {
+            "fake"
+        }
+        fn create(&self, _config: InstanceConfig) -> Result<InstanceHandle> {
+            unimplemented!("create not used in connect tests")
+        }
+        fn list(&self) -> Result<Vec<InstanceHandle>> {
+            Ok(self.instances.clone())
+        }
+        fn dispatch(
+            &self,
+            _instance_id: &InstanceId,
+            _request: DispatchRequest,
+        ) -> Result<crate::dispatch::DispatchResult> {
+            unimplemented!("dispatch not used in connect tests")
+        }
+        fn stop(&self, _instance_id: &InstanceId) -> Result<()> {
+            Ok(())
+        }
+        fn teardown(&self, _instance_id: &InstanceId) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn connect_backend(state: crate::instance::LifecycleState) -> ConnectFakeBackend {
+        ConnectFakeBackend {
+            instances: vec![InstanceHandle {
+                id: InstanceId::new("dev-1").unwrap(),
+                backend: "macos".to_string(),
+                state,
+            }],
+        }
+    }
+
+    #[test]
+    fn parses_sandbox_connect_command() {
+        let command = parse(args(&["sandbox", "connect", "dev-1"])).unwrap();
+        let Command::SandboxConnect(command) = command else {
+            panic!("expected sandbox connect command");
+        };
+        assert_eq!(command.instance_id.as_str(), "dev-1");
+    }
+
+    #[test]
+    fn sandbox_connect_reports_running_instance() {
+        let backend = connect_backend(LifecycleState::Ready);
+        let output = run(args(&["sandbox", "connect", "dev-1"]), &backend).unwrap();
+        assert!(output.contains("connected to sandbox dev-1"), "{output}");
+    }
+
+    #[test]
+    fn sandbox_connect_rejects_stopped_instance() {
+        let backend = connect_backend(LifecycleState::TornDown);
+        let err = run(args(&["sandbox", "connect", "dev-1"]), &backend)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not running"), "{err}");
+    }
+
+    #[test]
+    fn sandbox_connect_rejects_unknown_instance() {
+        let backend = ConnectFakeBackend { instances: vec![] };
+        let err = run(args(&["sandbox", "connect", "missing"]), &backend)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no sandbox with id"), "{err}");
     }
 
     #[test]

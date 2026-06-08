@@ -8,6 +8,7 @@ pub mod cli;
 pub mod dispatch;
 pub mod error;
 pub mod instance;
+pub mod sdk;
 
 pub use backend::{HostBackend, MacosBackend, PetriBackend, StubBackend};
 pub use dispatch::{DispatchRequest, DispatchResult, ErrorFrame, RequestLimits, Status};
@@ -16,3 +17,4 @@ pub use instance::{
     GUEST_WORKSPACE_PATH, InstanceConfig, InstanceHandle, InstanceId, LifecycleState,
     WorkspaceContract,
 };
+pub use sdk::{CommandOptions, CommandResult, Commands, Sandbox, SandboxOptions};
