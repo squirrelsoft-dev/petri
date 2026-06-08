@@ -107,6 +107,7 @@ read_toml_array() {
     in_array && /\]/ { exit }
     in_array {
       line=$0
+      sub(/#.*/, "", line)        # strip TOML comments inside the array
       gsub(/[",]/, "", line)
       sub(/^[[:space:]]*/, "", line)
       sub(/[[:space:]]*$/, "", line)
@@ -225,9 +226,18 @@ fi
 rm -rf "$out_dir"
 mkdir -p "$out_dir"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/petri-base-image.XXXXXX")"
-trap 'rm -rf "$work_dir"' EXIT
-
 rootfs="$work_dir/rootfs"
+
+# Cleanup unmounts any chroot API filesystems (see lsp block) before removing the
+# work dir, so `rm -rf` never traverses into a live /proc or /dev bind mount.
+cleanup() {
+  for fs in dev/pts dev proc sys; do
+    umount -lf "$rootfs/$fs" 2>/dev/null || true
+  done
+  rm -rf "$work_dir"
+}
+trap cleanup EXIT
+
 mkdir -p "$rootfs"
 
 mmdebstrap \
@@ -242,7 +252,32 @@ mmdebstrap \
   "deb $security_mirror $suite-security main"
 
 install -Dm0755 "$guest_binary" "$rootfs$install_path"
-install -d "$rootfs$workspace_path" "$rootfs/run/petri" "$rootfs/etc/systemd/system" "$rootfs/etc/modules-load.d"
+install -d "$rootfs$workspace_path" "$rootfs/run/petri" "$rootfs/etc/systemd/system" "$rootfs/etc/modules-load.d" "$rootfs/etc/sysctl.d"
+
+# Unprivileged user the guest agent drops workload processes to (uid/gid 1000).
+# `petri-guest` runs as root but execs every tool as this user, so no workload
+# holds CAP_NET_ADMIN to touch nftables or can read root-only state. See ADR 0002.
+# Edit the account files directly so no target-arch binary runs in a chroot.
+if ! grep -q '^agent:' "$rootfs/etc/group"; then
+  echo 'agent:x:1000:' >> "$rootfs/etc/group"
+fi
+if ! grep -q '^agent:' "$rootfs/etc/passwd"; then
+  echo 'agent:x:1000:1000:Petri agent:/workspace:/usr/sbin/nologin' >> "$rootfs/etc/passwd"
+  echo 'agent:!:19000:0:99999:7:::' >> "$rootfs/etc/shadow"
+fi
+# Best-effort ownership of the workspace mountpoint. Note: when the host mounts
+# the workspace over virtio-fs, file ownership is mapped from the host side, so
+# guest-side writability must still be verified end-to-end (ADR 0002 gotcha).
+chown 1000:1000 "$rootfs$workspace_path"
+
+# Close the main re-escalation path for the unprivileged agent user: a uid-1000
+# process can otherwise gain full capabilities inside a new user namespace.
+# Combined with NoNewPrivileges on the service (neutering setuid-root binaries),
+# this leaves no in-guest route back to privilege for a workload. See ADR 0002.
+cat > "$rootfs/etc/sysctl.d/99-petri-hardening.conf" <<'EOF'
+kernel.unprivileged_userns_clone = 0
+user.max_user_namespaces = 0
+EOF
 
 # Provision Language Server Protocol servers into the image. Requires network
 # access and the ability to execute the target architecture (native or via
@@ -250,12 +285,25 @@ install -d "$rootfs$workspace_path" "$rootfs/run/petri" "$rootfs/etc/systemd/sys
 lsp_config_arg=""
 if [ "$lsp_enabled" = "true" ]; then
   need_tool chroot
+  # rustup (and other installers) probe /proc/self/exe and need the API
+  # filesystems present inside the chroot. Bind-mount them; `cleanup` unmounts.
+  for fs in proc sys dev; do
+    mkdir -p "$rootfs/$fs"
+    mount --bind "/$fs" "$rootfs/$fs"
+  done
+  mkdir -p "$rootfs/dev/pts"
+  mount --bind /dev/pts "$rootfs/dev/pts" 2>/dev/null || true
   install -d "$rootfs/etc/petri"
   lsp_py runtime > "$rootfs/etc/petri/lsp.toml"
   lsp_config_arg=" --lsp-config /etc/petri/lsp.toml"
 
-  # Shared env so every server binary lands on PATH at /usr/local/bin.
-  lsp_env='export PATH=/opt/rust/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin; export CARGO_HOME=/opt/rust RUSTUP_HOME=/opt/rust GOPATH=/opt/go GOBIN=/usr/local/bin npm_config_prefix=/usr/local'
+  # Shared env so every server binary lands on PATH at /usr/local/bin. Override
+  # TMPDIR to the chroot's own /tmp: the outer build exports TMPDIR to a host
+  # path (/var/tmp/petri-builder-tmp) that does not exist inside the rootfs, and
+  # rustup et al. would otherwise fail their `mktemp -d`.
+  # CGO_ENABLED=0: gopls is pure Go; without it `go install` pulls in runtime/cgo
+  # and fails on missing libc headers (grp.h) rather than adding a C toolchain.
+  lsp_env='export PATH=/opt/rust/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin; export HOME=/root TMPDIR=/tmp CGO_ENABLED=0 CARGO_HOME=/opt/rust RUSTUP_HOME=/opt/rust GOPATH=/opt/go GOBIN=/usr/local/bin GOCACHE=/opt/go/cache npm_config_prefix=/usr/local'
 
   # rust-analyzer is a rustup component, so bootstrap a minimal stable toolchain
   # first and expose the component binary on PATH.
@@ -272,6 +320,12 @@ if [ "$lsp_enabled" = "true" ]; then
   if lsp_py install | grep -q 'rustup'; then
     chroot "$rootfs" /bin/sh -euc "$lsp_env; ln -sf \"\$(rustup which rust-analyzer)\" /usr/local/bin/rust-analyzer"
   fi
+
+  # Unmount the API filesystems now that the chroot installs are done, so the
+  # later mke2fs -d does not try to copy live /proc, /sys, /dev into the image.
+  for fs in dev/pts dev proc sys; do
+    umount -lf "$rootfs/$fs" 2>/dev/null || true
+  done
 fi
 
 cat > "$rootfs/etc/modules-load.d/petri.conf" <<'EOF'
@@ -337,6 +391,31 @@ ln -s ../workspace.mount "$rootfs/etc/systemd/system/local-fs.target.wants/works
 ln -s ../run-petri.mount "$rootfs/etc/systemd/system/local-fs.target.wants/run-petri.mount"
 mkdir -p "$rootfs/etc/systemd/system/multi-user.target.wants"
 ln -s ../petri-guest.service "$rootfs/etc/systemd/system/multi-user.target.wants/petri-guest.service"
+
+# Bring the network interface up via DHCP so in-guest egress can actually work.
+# The vz backend only attaches a (NAT) network device when the policy sets
+# network_enabled = true, so with networking disabled there is no interface for
+# this to match and no egress. Policy is still enforced entirely by the nftables
+# ruleset petri-guest installs at boot; networkd only provides connectivity.
+# systemd-resolved is deliberately NOT enabled so the DNS proxy's
+# /etc/resolv.conf (nameserver 127.0.0.1) is not overwritten. See ADR 0002 / #36.
+install -d "$rootfs/etc/systemd/network"
+cat > "$rootfs/etc/systemd/network/10-petri.network" <<'EOF'
+[Match]
+Name=en*
+
+[Network]
+DHCP=yes
+EOF
+# Offline-enable systemd-networkd; fall back to explicit symlinks (the units it
+# would create) if `systemctl --root` is unavailable in the build environment.
+systemctl --root="$rootfs" enable systemd-networkd.service 2>/dev/null || {
+  mkdir -p "$rootfs/etc/systemd/system/sockets.target.wants"
+  ln -sf /lib/systemd/system/systemd-networkd.service \
+    "$rootfs/etc/systemd/system/multi-user.target.wants/systemd-networkd.service"
+  ln -sf /lib/systemd/system/systemd-networkd.socket \
+    "$rootfs/etc/systemd/system/sockets.target.wants/systemd-networkd.socket"
+}
 
 kernel="$(find "$rootfs/boot" -maxdepth 1 -type f -name 'vmlinuz-*' | sort | tail -n 1)"
 initrd="$(find "$rootfs/boot" -maxdepth 1 -type f -name 'initrd.img-*' | sort | tail -n 1 || true)"

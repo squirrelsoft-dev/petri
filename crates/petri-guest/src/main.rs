@@ -4,8 +4,10 @@ use std::io::{self, BufReader, BufWriter};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use petri_guest::lsp::{LspConfig, LspManager};
+use petri_guest::netstate::ActiveNetwork;
 use petri_guest::policy::Policy;
 use petri_guest::server;
 use petri_guest::transport::VsockListenerConfig;
@@ -37,6 +39,19 @@ fn main() -> ExitCode {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse(env::args().skip(1))?;
     let policy = Policy::load(File::open(&args.policy_path)?)?;
+
+    // The active network level is VM-global state shared between the dispatch
+    // server (which moves it via `set_mode`) and the DNS proxy (which reads it).
+    let active_network = Arc::new(ActiveNetwork::new(policy.network.default));
+
+    // Install the in-guest egress ruleset before accepting any dispatch, so no
+    // workload runs before network policy is in force. Fatal on failure: failing
+    // to apply a required restriction must not fall back to open egress (ADR 0002).
+    #[cfg(target_os = "linux")]
+    {
+        petri_guest::netfilter::apply_boot(&policy)?;
+        start_dns_proxy(&policy, active_network.clone())?;
+    }
     let lsp_config = match &args.lsp_config_path {
         Some(path) => LspConfig::load(File::open(path)?)?,
         None => LspConfig::disabled(),
@@ -49,7 +64,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Transport::Stdio => {
             let stdin = io::stdin();
             let stdout = io::stdout();
-            server::serve_lines(stdin.lock(), stdout.lock(), &policy, &lsp)?;
+            server::serve_lines(stdin.lock(), stdout.lock(), &policy, &lsp, &active_network)?;
         }
         Transport::Tcp(addr) => {
             let listener = TcpListener::bind(&addr)?;
@@ -58,7 +73,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let stream = stream?;
                 let reader = BufReader::new(stream.try_clone()?);
                 let writer = BufWriter::new(stream);
-                server::serve_lines(reader, writer, &policy, &lsp)?;
+                server::serve_lines(reader, writer, &policy, &lsp, &active_network)?;
             }
         }
         Transport::Vsock { port } => {
@@ -71,7 +86,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let stream = stream?;
                     let reader = BufReader::new(stream.try_clone()?);
                     let writer = BufWriter::new(stream);
-                    server::serve_lines(reader, writer, &policy, &lsp)?;
+                    server::serve_lines(reader, writer, &policy, &lsp, &active_network)?;
                 }
             }
             #[cfg(not(target_os = "linux"))]
@@ -81,6 +96,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    Ok(())
+}
+
+/// Start the in-guest DNS proxy when the policy's network allowlist contains
+/// domain names (IP/CIDR entries are enforced by nftables alone and need no
+/// proxy). Points the guest resolver at it and serves on a background thread.
+/// A no-op when networking is disabled or the guest is not root — the same
+/// conditions under which `netfilter::apply_boot` skips: without root there is
+/// no enforcement to install, and binding port 53 would fail anyway.
+#[cfg(target_os = "linux")]
+fn start_dns_proxy(
+    policy: &Policy,
+    active: Arc<ActiveNetwork>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use petri_guest::dnsproxy;
+
+    if !policy.network_enabled {
+        return Ok(());
+    }
+    // SAFETY: geteuid is async-signal-safe and has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    let Some(matcher) = dnsproxy::DomainMatcher::from_allowlist(&policy.network.allowlist) else {
+        return Ok(());
+    };
+    dnsproxy::force_local_resolver()?;
+    dnsproxy::start(active, matcher, dnsproxy::default_upstream())?;
+    eprintln!("petri-guest: DNS proxy active for domain allowlisting");
     Ok(())
 }
 

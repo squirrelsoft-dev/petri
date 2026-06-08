@@ -41,15 +41,23 @@ Petri also assumes the host-side caller may send malformed, unsupported, or poli
 
 The host provisions VMs, mounts the workspace, sends dispatch requests, and receives results. The host is trusted to select the VM image, policy config, workspace directory, and lifecycle controls.
 
-The host is not trusted to widen policy beyond what the boot policy authorized. Once the guest agent loads policy, host requests can only ask for work inside that policy's bounds. A request may narrow runtime or output limits for a single dispatch, but it cannot raise caps, change workspace roots, enable network access, or move a capability axis above its boot-declared ceiling.
+The host is not trusted to widen policy beyond what the boot policy authorized. Once the guest agent loads policy, host requests can only ask for work inside that policy's bounds. A request may narrow runtime or output limits for a single dispatch, but it cannot raise caps, change workspace roots, attach a network device the boot policy left off (`network_enabled = false`), or move a capability axis above its boot-declared ceiling.
 
-The command axis is a special case: the boot policy declares an escalation ceiling, and the host may move the VM's active level between boot-declared levels with `set_mode` (see [Immutable Policy Config](policy-config.md#runtime-mode-switching)). This is a control-plane action bounded by the immutable ceiling — the boot policy's `max` is still the maximum authority; only the starting point moves. It does not weaken the guarantee that matters: the untrusted guest workload cannot emit frames at all, so it can never escalate its own authority, and no request can lift the ceiling.
+Capability axes (`command` and `network`) are the controlled exception: the boot policy declares an escalation ceiling per axis, and the host may move an axis's active level between boot-declared levels with `set_mode` (see [Immutable Policy Config](policy-config.md#runtime-mode-switching)). This is a control-plane action bounded by the immutable ceiling — the boot policy's per-axis `max` is still the maximum authority; only the starting point moves. It does not weaken the guarantee that matters: the untrusted guest workload cannot emit frames at all, so it can never escalate its own authority, and no request can lift a ceiling.
 
 ### Guest VM
 
 The guest VM contains the workload, the guest operating system, and the `petri-guest` agent. Guest workload code is untrusted. The guest agent is part of the trusted computing base for policy enforcement inside the VM.
 
 The VM boundary is the primary containment boundary. A guest process escape from the VM is considered a critical break of the safety model.
+
+### Process Privilege Separation
+
+`petri-guest` runs as root (it needs root to apply nftables, serve the vsock listener, and spawn workload processes as another user), but **agent tools run as an unprivileged user** (`agent`, uid/gid 1000). Privilege is dropped per workload process, between `fork` and `exec`, so the guest agent stays privileged while no tool does.
+
+This is what lets in-guest policy enforcement hold against the workload: an unprivileged tool holds no capabilities (`CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, …), cannot edit the nftables ruleset, cannot read the root-only policy file, and is confined to the workspace it owns. The separation is hardened by `NoNewPrivileges=yes` on the guest service (neutering setuid-root binaries for descendants) and a sysctl disabling unprivileged user namespaces (closing the main re-escalation path for a uid-1000 process).
+
+The bound: this protects against the **untrusted workload**, not against a **guest-root compromise**. A kernel exploit or a bug in root `petri-guest` defeats it — the same limit that applies to every in-guest policy check. The VM boundary, not privilege separation, is what protects the host.
 
 ### Shared Workspace
 
@@ -127,7 +135,17 @@ When network access is enabled:
 
 - command allowlists, workspace checks, runtime caps, and output caps still apply
 - the policy should be considered higher risk and reviewed accordingly
-- callers should assume workloads can exfiltrate any data readable inside the guest, including workspace contents
+- egress may be narrowed by the network axis (`none` / `allowlist` / `full`); at `full`, or `allowlist` with broad entries, callers should assume workloads can exfiltrate any data readable inside the guest, including workspace contents
+
+### Egress Enforcement And Its Limits
+
+Egress filtering (the `none`/`allowlist`/`full` network axis) is **enforced inside the guest** by `petri-guest` via nftables, not at the VM boundary. This is a deliberate trade documented in [ADR 0002](adr/0002-policy-modes-and-runtime-mode-switching.md): the host-side boundary filter was ~130× slower (spike #36), and in-guest enforcement reuses Apple's full-speed NAT.
+
+The guarantee this provides, and its bound, must be understood:
+
+- **It holds against the untrusted workload.** Agent tools run as an unprivileged user with no `CAP_NET_ADMIN` (see [Process Privilege Separation](#process-privilege-separation)), so no workload — even at `command = yolo` — can load, flush, or edit the ruleset. `yolo` widens *what* runs, never *with what privilege*.
+- **It rests on guest privilege separation, the same basis as the command axis.** It is therefore exactly as strong as command enforcement, no weaker — but it does **not** survive a guest-root compromise (kernel exploit, or a bug in root `petri-guest`). An attacker with guest root can flush the ruleset, just as they could already bypass the command ceiling. A guarantee that survives full guest-root compromise is a separate, optional high-assurance mode (the stashed host-side filter), not the default.
+- **Domain allowlisting is good-faith, not hard.** Domains are enforced by an in-guest DNS proxy that pins allowed names' IPs into the ruleset. It cannot separate vhosts on a shared CDN/hosting IP (a forged Host/SNI reaches any name on an allowed IP), and it cannot stop DNS-over-HTTPS that rides an already-allowed IP. Treat domain allowlists as defense against casual/accidental egress, not as an exfiltration boundary against a determined workload. A hard per-domain guarantee needs L7 mediation (tracked separately).
 
 Network policy is documented in [Immutable Policy Config](policy-config.md).
 

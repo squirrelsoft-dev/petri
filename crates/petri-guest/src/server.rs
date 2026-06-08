@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value, json};
 
 use crate::lsp::{LspManager, LspOutcome};
-use crate::policy::{CommandLevel, Policy};
+use crate::netstate::ActiveNetwork;
+use crate::policy::{CommandLevel, NetworkLevel, Policy};
 use crate::protocol::{
     BashCommandArgs, DispatchRequest, PROTOCOL_VERSION, ResultFrame, SetModeArgs, Status,
     lsp_tools, request_id_from_value,
@@ -19,17 +20,20 @@ pub fn serve_lines(
     mut writer: impl Write,
     policy: &Policy,
     lsp: &LspManager,
+    active_network: &ActiveNetwork,
 ) -> Result<(), std::io::Error> {
     let reader = BufReader::new(reader);
-    // The active command level is per-connection mutable state. It starts at the
+    // The active command level is per-connection mutable state: it starts at the
     // boot policy default and may move up to (never past) the policy ceiling via
-    // `set_mode`. It can only be changed by host control frames, never inferred
-    // from workload processes. See ADR 0002.
+    // `set_mode`. The active *network* level is VM-global instead (the nftables
+    // ruleset and DNS proxy it drives are per-VM, not per-connection), so it is
+    // shared in. Both change only via host control frames, never inferred from
+    // workload processes. See ADR 0002.
     let mut active_command = policy.command.default;
 
     for line in reader.lines() {
         let line = line?;
-        let result = handle_frame(&line, policy, lsp, &mut active_command);
+        let result = handle_frame(&line, policy, lsp, &mut active_command, active_network);
         serde_json::to_writer(&mut writer, &result)?;
         writer.write_all(b"\n")?;
         writer.flush()?;
@@ -43,6 +47,7 @@ pub fn handle_frame(
     policy: &Policy,
     lsp: &LspManager,
     active_command: &mut CommandLevel,
+    active_network: &ActiveNetwork,
 ) -> ResultFrame {
     let started = Instant::now();
     let line = line.trim_end_matches('\r');
@@ -124,7 +129,9 @@ pub fn handle_frame(
                 "cancellation is not implemented in the skeleton guest",
                 None,
             ),
-            "set_mode" => handle_set_mode(request, policy, active_command, started),
+            "set_mode" => {
+                handle_set_mode(request, policy, active_command, active_network, started)
+            }
             _ => ResultFrame::rejected(
                 Some(request.id),
                 elapsed_ms(started.elapsed()),
@@ -274,19 +281,24 @@ fn handle_bash_command(
         args.stdin,
         timeout,
         max_output_bytes,
+        policy.drop_privileges,
         started,
     )
 }
 
-/// Handle a `set_mode` control frame. Moves the per-connection active command
-/// level, rejecting any request above the boot policy ceiling. Only the command
-/// axis is guest-enforced; the network axis is enforced host-side and is not
-/// accepted here (ADR 0002). Only host control frames reach this path; workload
-/// processes cannot emit dispatch frames.
+/// Handle a `set_mode` control frame. Moves the active command (per-connection)
+/// and/or network (VM-global) levels, rejecting any request above the relevant
+/// boot policy ceiling. At least one axis must be present; an omitted axis is
+/// left unchanged. Both axes are guest-enforced by design (ADR 0002): command
+/// via process-launch checks, network by re-applying the in-guest nftables
+/// ruleset (which the DNS proxy reads through the shared active level). Only
+/// host control frames reach this path; workload processes cannot emit dispatch
+/// frames.
 fn handle_set_mode(
     request: DispatchRequest,
     policy: &Policy,
     active_command: &mut CommandLevel,
+    active_network: &ActiveNetwork,
     started: Instant,
 ) -> ResultFrame {
     if request.target_id.is_some() || request.tool.is_some() {
@@ -322,57 +334,111 @@ fn handle_set_mode(
         }
     };
 
-    if args.network.is_some() {
-        // The network axis is enforced at the VM boundary by the host, not in the
-        // guest, so it is never carried in a guest-bound frame. See ADR 0002.
+    if args.command.is_none() && args.network.is_none() {
         return ResultFrame::rejected(
             Some(request.id),
             elapsed_ms(started.elapsed()),
             "invalid_request",
-            "network axis is enforced host-side and not accepted in a guest set_mode frame",
+            "set_mode requires a command or network level",
             None,
         );
     }
 
-    let Some(command_name) = args.command else {
-        return ResultFrame::rejected(
-            Some(request.id),
-            elapsed_ms(started.elapsed()),
-            "invalid_request",
-            "set_mode requires a command level",
-            None,
-        );
+    // Validate both axes before mutating any state, so a rejected frame leaves
+    // the active levels untouched.
+    let new_command = match args.command {
+        Some(name) => {
+            let Some(level) = CommandLevel::parse(&name) else {
+                return ResultFrame::rejected(
+                    Some(request.id),
+                    elapsed_ms(started.elapsed()),
+                    "invalid_request",
+                    format!("unknown command level '{name}'"),
+                    None,
+                );
+            };
+            if level > policy.command.max {
+                let mut details = Map::new();
+                details.insert("field".to_string(), Value::from("mode.command"));
+                details.insert("requested".to_string(), Value::from(level.as_str()));
+                details.insert("max".to_string(), Value::from(policy.command.max.as_str()));
+                return ResultFrame::rejected(
+                    Some(request.id),
+                    elapsed_ms(started.elapsed()),
+                    "policy_denied",
+                    "requested command level exceeds policy ceiling",
+                    Some(details),
+                );
+            }
+            Some(level)
+        }
+        None => None,
     };
 
-    let Some(level) = CommandLevel::parse(&command_name) else {
-        return ResultFrame::rejected(
-            Some(request.id),
-            elapsed_ms(started.elapsed()),
-            "invalid_request",
-            format!("unknown command level '{command_name}'"),
-            None,
-        );
+    let new_network = match args.network {
+        Some(name) => {
+            let Some(level) = NetworkLevel::parse(&name) else {
+                return ResultFrame::rejected(
+                    Some(request.id),
+                    elapsed_ms(started.elapsed()),
+                    "invalid_request",
+                    format!("unknown network level '{name}'"),
+                    None,
+                );
+            };
+            if level > policy.network.max {
+                let mut details = Map::new();
+                details.insert("field".to_string(), Value::from("mode.network"));
+                details.insert("requested".to_string(), Value::from(level.as_str()));
+                details.insert("max".to_string(), Value::from(policy.network.max.as_str()));
+                return ResultFrame::rejected(
+                    Some(request.id),
+                    elapsed_ms(started.elapsed()),
+                    "policy_denied",
+                    "requested network level exceeds policy ceiling",
+                    Some(details),
+                );
+            }
+            Some(level)
+        }
+        None => None,
     };
 
-    if level > policy.command.max {
-        let mut details = Map::new();
-        details.insert("field".to_string(), Value::from("mode.command"));
-        details.insert("requested".to_string(), Value::from(level.as_str()));
-        details.insert("max".to_string(), Value::from(policy.command.max.as_str()));
-        return ResultFrame::rejected(
-            Some(request.id),
-            elapsed_ms(started.elapsed()),
-            "policy_denied",
-            "requested command level exceeds policy ceiling",
-            Some(details),
-        );
+    // Re-apply the nftables ruleset for the new network level first: it is the
+    // only effectful step and can fail. Doing it before committing the active
+    // levels keeps a failed transition fail-closed — the prior ruleset and the
+    // reported active levels stay in agreement.
+    if let Some(level) = new_network {
+        #[cfg(target_os = "linux")]
+        if let Err(err) = crate::netfilter::apply(&policy.network, level) {
+            return ResultFrame::rejected(
+                Some(request.id),
+                elapsed_ms(started.elapsed()),
+                "internal_error",
+                format!("failed to apply network level: {err}"),
+                None,
+            );
+        }
+        // On the host build there is no kernel netfilter to program; the active
+        // level is still tracked so the host build can exercise this path.
+        #[cfg(not(target_os = "linux"))]
+        let _ = level;
     }
 
-    *active_command = level;
+    let mut mode = Map::new();
+    if let Some(level) = new_command {
+        *active_command = level;
+        mode.insert("command".to_string(), Value::from(level.as_str()));
+    }
+    if let Some(level) = new_network {
+        active_network.set(level);
+        mode.insert("network".to_string(), Value::from(level.as_str()));
+    }
+
     ResultFrame::data(
         request.id,
         elapsed_ms(started.elapsed()),
-        json!({ "mode": { "command": level.as_str() } }),
+        json!({ "mode": mode }),
     )
 }
 
@@ -462,6 +528,7 @@ fn execute_command(
     stdin: Option<String>,
     timeout: Duration,
     max_output_bytes: usize,
+    drop_privileges: bool,
     started: Instant,
 ) -> ResultFrame {
     let stdin_stdio = if stdin.is_some() {
@@ -469,15 +536,20 @@ fn execute_command(
     } else {
         Stdio::null()
     };
-    let mut child = match Command::new(&command)
-        .args(argv)
+    let mut cmd = Command::new(&command);
+    cmd.args(argv)
         .envs(env)
         .current_dir(cwd)
         .stdin(stdin_stdio)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    // Workload processes run as an unprivileged user so they hold no
+    // capabilities (no CAP_NET_ADMIN to touch nftables, etc.) and are confined
+    // to the workspace they own. The guest agent itself stays root. Trusted
+    // provisioning contexts (the image builder) disable this via policy so their
+    // commands keep root. See ADR 0002.
+    configure_privilege_drop(&mut cmd, drop_privileges);
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
             return guest_error(
@@ -559,6 +631,54 @@ fn execute_command(
         }
     }
 }
+
+/// Unprivileged user the guest drops workload processes to. Must match the
+/// `agent` user created in the VM image (`scripts/build-base-image.sh`).
+#[cfg(target_os = "linux")]
+const AGENT_UID: libc::uid_t = 1000;
+#[cfg(target_os = "linux")]
+const AGENT_GID: libc::gid_t = 1000;
+
+/// Arrange for a spawned workload process to drop to the unprivileged `agent`
+/// user before it execs. Only applies when the guest agent runs as root (the
+/// production case — the systemd unit runs `petri-guest` as root); when not root
+/// there is nothing to drop and we leave the child as-is so dev/test runs work.
+#[cfg(target_os = "linux")]
+fn configure_privilege_drop(cmd: &mut Command, drop_privileges: bool) {
+    use std::os::unix::process::CommandExt;
+
+    // Policy may disable the drop for trusted provisioning (the image builder),
+    // whose commands must keep the guest agent's privileges. SAFETY: geteuid is
+    // async-signal-safe and has no preconditions. Nothing to drop unless root.
+    if !drop_privileges || unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+
+    // SAFETY: the closure runs in the forked child between fork and exec and
+    // performs only async-signal-safe syscalls (no allocation, no locks). Order
+    // is load-bearing: clear supplementary groups, then gid, then uid — once the
+    // uid is dropped the process can no longer call setgroups/setgid. std's
+    // CommandExt::uid/gid do NOT clear supplementary groups, so we must.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setgroups(0, std::ptr::null()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setgid(AGENT_GID) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setuid(AGENT_UID) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Non-Linux builds (dev/test on macOS) run workloads in-process without a
+/// privilege drop; the production guest is always Linux.
+#[cfg(not(target_os = "linux"))]
+fn configure_privilege_drop(_cmd: &mut Command, _drop_privileges: bool) {}
 
 fn guest_error(id: String, elapsed_ms: u64, message: String) -> ResultFrame {
     ResultFrame {
@@ -737,6 +857,7 @@ mod tests {
     fn policy(allowed_commands: &[&str], workspace_path: PathBuf) -> Policy {
         Policy {
             network_enabled: false,
+            network: crate::policy::NetworkPolicy::disabled(),
             command: crate::policy::CommandPolicy {
                 default: CommandLevel::Edit,
                 max: CommandLevel::Yolo,
@@ -749,6 +870,7 @@ mod tests {
             max_runtime_secs: 60,
             max_output_bytes: 1024,
             workspace_path,
+            drop_privileges: false,
         }
     }
 
@@ -760,7 +882,8 @@ mod tests {
     /// policy's default command level.
     fn handle(line: &str, policy: &Policy) -> ResultFrame {
         let mut active = policy.command.default;
-        handle_frame(line, policy, &test_lsp(), &mut active)
+        let net = ActiveNetwork::new(policy.network.default);
+        handle_frame(line, policy, &test_lsp(), &mut active, &net)
     }
 
     #[test]
@@ -986,12 +1109,15 @@ mod tests {
         .to_string()
             + "\n";
         let mut output = Vec::new();
+        let policy = policy(&["printf"], workspace);
+        let active_network = ActiveNetwork::new(policy.network.default);
 
         serve_lines(
             input.as_bytes(),
             &mut output,
-            &policy(&["printf"], workspace),
+            &policy,
             &test_lsp(),
+            &active_network,
         )
         .unwrap();
 
@@ -1029,6 +1155,7 @@ mod tests {
         let workspace = workspace();
         let policy = Policy {
             network_enabled: false,
+            network: crate::policy::NetworkPolicy::disabled(),
             command: crate::policy::CommandPolicy {
                 default: CommandLevel::ReadOnly,
                 max: CommandLevel::Yolo,
@@ -1038,9 +1165,11 @@ mod tests {
             max_runtime_secs: 60,
             max_output_bytes: 1024,
             workspace_path: workspace.clone(),
+            drop_privileges: false,
         };
         let lsp = test_lsp();
         let mut active = policy.command.default;
+        let net = ActiveNetwork::new(policy.network.default);
 
         // printf is an `edit`-tier command; at the default `read_only` it is denied.
         let printf = serde_json::json!({
@@ -1050,14 +1179,14 @@ mod tests {
             "args": { "command": "printf", "argv": ["hi"], "cwd": workspace.clone() }
         })
         .to_string();
-        let denied = handle_frame(&printf, &policy, &lsp, &mut active);
+        let denied = handle_frame(&printf, &policy, &lsp, &mut active, &net);
         assert_eq!(denied.status, Status::Rejected);
         assert_eq!(denied.error.unwrap().code, "policy_denied");
 
         // Escalate to `edit`, which is within the `yolo` ceiling.
         let set =
             r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{"command":"edit"}}"#;
-        let switched = handle_frame(set, &policy, &lsp, &mut active);
+        let switched = handle_frame(set, &policy, &lsp, &mut active, &net);
         assert_eq!(switched.status, Status::Success);
         assert_eq!(
             switched.data.unwrap()["mode"]["command"],
@@ -1066,7 +1195,7 @@ mod tests {
         assert_eq!(active, CommandLevel::Edit);
 
         // The same command now runs.
-        let ok = handle_frame(&printf, &policy, &lsp, &mut active);
+        let ok = handle_frame(&printf, &policy, &lsp, &mut active, &net);
         assert_eq!(ok.status, Status::Success);
         assert_eq!(ok.stdout.as_deref(), Some("hi"));
     }
@@ -1075,6 +1204,7 @@ mod tests {
     fn set_mode_rejects_level_above_ceiling() {
         let policy = Policy {
             network_enabled: false,
+            network: crate::policy::NetworkPolicy::disabled(),
             command: crate::policy::CommandPolicy {
                 default: CommandLevel::ReadOnly,
                 max: CommandLevel::Edit,
@@ -1084,12 +1214,14 @@ mod tests {
             max_runtime_secs: 60,
             max_output_bytes: 1024,
             workspace_path: workspace(),
+            drop_privileges: false,
         };
         let mut active = policy.command.default;
+        let net = ActiveNetwork::new(policy.network.default);
 
         let set =
             r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{"command":"yolo"}}"#;
-        let result = handle_frame(set, &policy, &test_lsp(), &mut active);
+        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &net);
 
         assert_eq!(result.status, Status::Rejected);
         assert_eq!(result.error.unwrap().code, "policy_denied");
@@ -1097,14 +1229,91 @@ mod tests {
         assert_eq!(active, CommandLevel::ReadOnly);
     }
 
+    /// A policy whose network axis defaults to `none` but permits escalation up
+    /// to `max`. The host build does not touch nftables (apply is Linux-only),
+    /// so these tests exercise validation and the active-level bookkeeping only.
+    fn network_policy(max: NetworkLevel) -> Policy {
+        let mut policy = policy(&["printf"], workspace());
+        policy.network = crate::policy::NetworkPolicy {
+            default: NetworkLevel::None,
+            max,
+            allowlist: Vec::new(),
+        };
+        policy
+    }
+
     #[test]
-    fn set_mode_rejects_network_axis_for_now() {
-        let policy = policy(&["printf"], workspace());
+    fn set_mode_escalates_network_within_ceiling() {
+        let policy = network_policy(NetworkLevel::Full);
         let mut active = policy.command.default;
+        let net = ActiveNetwork::new(policy.network.default);
+        assert_eq!(net.get(), NetworkLevel::None);
 
         let set =
             r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{"network":"full"}}"#;
-        let result = handle_frame(set, &policy, &test_lsp(), &mut active);
+        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &net);
+
+        assert_eq!(result.status, Status::Success);
+        assert_eq!(result.data.unwrap()["mode"]["network"], Value::from("full"));
+        assert_eq!(net.get(), NetworkLevel::Full);
+    }
+
+    #[test]
+    fn set_mode_rejects_network_above_ceiling() {
+        let policy = network_policy(NetworkLevel::Allowlist);
+        let mut active = policy.command.default;
+        let net = ActiveNetwork::new(policy.network.default);
+
+        let set =
+            r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{"network":"full"}}"#;
+        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &net);
+
+        assert_eq!(result.status, Status::Rejected);
+        let err = result.error.unwrap();
+        assert_eq!(err.code, "policy_denied");
+        // The active level is unchanged after a rejected escalation.
+        assert_eq!(net.get(), NetworkLevel::None);
+    }
+
+    #[test]
+    fn set_mode_sets_both_axes_in_one_frame() {
+        let mut policy = network_policy(NetworkLevel::Full);
+        policy.command.max = CommandLevel::Yolo;
+        let mut active = policy.command.default;
+        let net = ActiveNetwork::new(policy.network.default);
+
+        let set = r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{"command":"edit","network":"full"}}"#;
+        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &net);
+
+        assert_eq!(result.status, Status::Success);
+        let mode = result.data.unwrap();
+        assert_eq!(mode["mode"]["command"], Value::from("edit"));
+        assert_eq!(mode["mode"]["network"], Value::from("full"));
+        assert_eq!(active, CommandLevel::Edit);
+        assert_eq!(net.get(), NetworkLevel::Full);
+    }
+
+    #[test]
+    fn set_mode_requires_at_least_one_axis() {
+        let policy = policy(&["printf"], workspace());
+        let mut active = policy.command.default;
+        let net = ActiveNetwork::new(policy.network.default);
+
+        let set = r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{}}"#;
+        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &net);
+
+        assert_eq!(result.status, Status::Rejected);
+        assert_eq!(result.error.unwrap().code, "invalid_request");
+    }
+
+    #[test]
+    fn set_mode_rejects_unknown_network_level() {
+        let policy = network_policy(NetworkLevel::Full);
+        let mut active = policy.command.default;
+        let net = ActiveNetwork::new(policy.network.default);
+
+        let set = r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{"network":"wide_open"}}"#;
+        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &net);
 
         assert_eq!(result.status, Status::Rejected);
         assert_eq!(result.error.unwrap().code, "invalid_request");
@@ -1114,9 +1323,10 @@ mod tests {
     fn set_mode_rejects_unknown_level() {
         let policy = policy(&["printf"], workspace());
         let mut active = policy.command.default;
+        let net = ActiveNetwork::new(policy.network.default);
 
         let set = r#"{"protocol_version":1,"id":"m1","control":"set_mode","args":{"command":"superuser"}}"#;
-        let result = handle_frame(set, &policy, &test_lsp(), &mut active);
+        let result = handle_frame(set, &policy, &test_lsp(), &mut active, &net);
 
         assert_eq!(result.status, Status::Rejected);
         assert_eq!(result.error.unwrap().code, "invalid_request");

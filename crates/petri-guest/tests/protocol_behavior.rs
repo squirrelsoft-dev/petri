@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use petri_guest::lsp::{LspConfig, LspManager};
-use petri_guest::policy::{CommandLevel, CommandPolicy, Policy};
+use petri_guest::netstate::ActiveNetwork;
+use petri_guest::policy::{CommandLevel, CommandPolicy, NetworkPolicy, Policy};
 use petri_guest::protocol::{DispatchRequest, ResultFrame, Status};
 use petri_guest::server::handle_frame;
 
@@ -11,7 +12,8 @@ use petri_guest::server::handle_frame;
 fn handle(line: &str, policy: &Policy) -> ResultFrame {
     let lsp = LspManager::new(LspConfig::disabled(), std::env::temp_dir());
     let mut active = policy.command.default;
-    handle_frame(line, policy, &lsp, &mut active)
+    let net = ActiveNetwork::new(policy.network.default);
+    handle_frame(line, policy, &lsp, &mut active, &net)
 }
 
 fn workspace() -> PathBuf {
@@ -30,6 +32,7 @@ fn workspace() -> PathBuf {
 fn policy(allowed_commands: &[&str], workspace_path: PathBuf) -> Policy {
     Policy {
         network_enabled: false,
+        network: NetworkPolicy::disabled(),
         command: CommandPolicy {
             default: CommandLevel::Edit,
             max: CommandLevel::Yolo,
@@ -42,6 +45,7 @@ fn policy(allowed_commands: &[&str], workspace_path: PathBuf) -> Policy {
         max_runtime_secs: 60,
         max_output_bytes: 1024,
         workspace_path,
+        drop_privileges: false,
     }
 }
 
@@ -87,6 +91,7 @@ fn guest_accepts_shared_bash_command_fixture() {
     request["args"]["cwd"] = serde_json::Value::from(workspace.display().to_string());
     let policy = Policy {
         network_enabled: false,
+        network: NetworkPolicy::disabled(),
         command: CommandPolicy {
             default: CommandLevel::Edit,
             max: CommandLevel::Yolo,
@@ -96,6 +101,7 @@ fn guest_accepts_shared_bash_command_fixture() {
         max_runtime_secs: 60,
         max_output_bytes: 1_048_576,
         workspace_path: workspace,
+        drop_privileges: false,
     };
 
     let result = handle(&request.to_string(), &policy);

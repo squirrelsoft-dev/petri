@@ -7,10 +7,17 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
     pub network_enabled: bool,
+    pub network: NetworkPolicy,
     pub command: CommandPolicy,
     pub max_runtime_secs: u64,
     pub max_output_bytes: u64,
     pub workspace_path: PathBuf,
+    /// Whether the guest drops each workload process to the unprivileged `agent`
+    /// user before exec (ADR 0002). Defaults to `true` — the secure posture for
+    /// untrusted sandboxes. Trusted provisioning contexts (the image builder)
+    /// set it `false` so commands run with the guest agent's privileges (root),
+    /// which they require to write `/etc`, install packages, etc.
+    pub drop_privileges: bool,
 }
 
 /// Ordered levels of the `command` capability axis. Higher levels grant
@@ -72,6 +79,63 @@ impl CommandPolicy {
     }
 }
 
+/// Ordered levels of the `network` capability axis. Higher levels grant strictly
+/// more egress. See [ADR 0002](../../../docs/adr/0002-policy-modes-and-runtime-mode-switching.md).
+///
+/// The derived ordering relies on declaration order: `None < Allowlist < Full`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NetworkLevel {
+    None,
+    Allowlist,
+    Full,
+}
+
+impl NetworkLevel {
+    /// Parse a wire-form level name (`"none"`, `"allowlist"`, `"full"`).
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "none" => Some(Self::None),
+            "allowlist" => Some(Self::Allowlist),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Allowlist => "allowlist",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// The `network` capability axis: the boot-default active level, the escalation
+/// ceiling (`max`), and the destinations permitted at the `allowlist` level. A
+/// live VM may move its active level up to `max` via `set_mode`, never past it.
+/// Enforced in-guest via nftables. The axis is layered on the immutable
+/// `network_enabled` boot gate: with no device attached it is pinned at `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkPolicy {
+    pub default: NetworkLevel,
+    pub max: NetworkLevel,
+    /// Destinations allowed at the `allowlist` level: IPs, CIDR blocks, and
+    /// domain names. Classification (IP/CIDR vs domain) and enforcement happen
+    /// in the guest's nftables/DNS layer.
+    pub allowlist: Vec<String>,
+}
+
+impl NetworkPolicy {
+    /// The axis with no egress, used when `network_enabled = false` (no device).
+    pub fn disabled() -> Self {
+        Self {
+            default: NetworkLevel::None,
+            max: NetworkLevel::None,
+            allowlist: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyDocument {
@@ -88,9 +152,20 @@ struct RawPolicy {
     /// Capability-lattice command axis. Mutually exclusive with `allowed_commands`.
     #[serde(default)]
     command: Option<RawCommandPolicy>,
+    /// Capability-lattice network axis. Requires `network_enabled = true`. When
+    /// omitted, network is governed solely by the `network_enabled` boolean.
+    #[serde(default)]
+    network: Option<RawNetworkPolicy>,
     max_runtime_secs: u64,
     max_output_bytes: u64,
     workspace_path: PathBuf,
+    /// See [`Policy::drop_privileges`]. Defaults to `true` (drop) when omitted.
+    #[serde(default = "default_drop_privileges")]
+    drop_privileges: bool,
+}
+
+fn default_drop_privileges() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +177,15 @@ struct RawCommandPolicy {
     read_only: Vec<String>,
     #[serde(default)]
     edit: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNetworkPolicy {
+    default: String,
+    max: String,
+    #[serde(default)]
+    allowlist: Vec<String>,
 }
 
 impl Policy {
@@ -140,13 +224,16 @@ impl Policy {
         }
 
         let command = build_command_policy(raw.allowed_commands, raw.command)?;
+        let network = build_network_policy(raw.network_enabled, raw.network)?;
 
         Ok(Self {
             network_enabled: raw.network_enabled,
+            network,
             command,
             max_runtime_secs: raw.max_runtime_secs,
             max_output_bytes: raw.max_output_bytes,
             workspace_path: raw.workspace_path,
+            drop_privileges: raw.drop_privileges,
         })
     }
 }
@@ -191,6 +278,77 @@ fn build_command_policy(
             })
         }
     }
+}
+
+/// Build the network axis. When `[policy.network]` is omitted, the axis is
+/// derived from the immutable `network_enabled` boolean (the legacy shape):
+/// `true` means full egress, `false` means none — both fixed (`default == max`).
+/// When present it requires `network_enabled = true`, since the level can only
+/// filter egress over an attached device.
+fn build_network_policy(
+    network_enabled: bool,
+    modern: Option<RawNetworkPolicy>,
+) -> Result<NetworkPolicy, PolicyError> {
+    match modern {
+        None => Ok(if network_enabled {
+            NetworkPolicy {
+                default: NetworkLevel::Full,
+                max: NetworkLevel::Full,
+                allowlist: Vec::new(),
+            }
+        } else {
+            NetworkPolicy::disabled()
+        }),
+        Some(raw) => {
+            if !network_enabled {
+                return Err(PolicyError::Invalid(
+                    "[policy.network] requires network_enabled = true".to_string(),
+                ));
+            }
+            let default = NetworkLevel::parse(&raw.default).ok_or_else(|| {
+                PolicyError::Invalid(format!("unknown network level '{}'", raw.default))
+            })?;
+            let max = NetworkLevel::parse(&raw.max).ok_or_else(|| {
+                PolicyError::Invalid(format!("unknown network level '{}'", raw.max))
+            })?;
+            if default > max {
+                return Err(PolicyError::Invalid(
+                    "network default level must not exceed max level".to_string(),
+                ));
+            }
+            let allowlist = validate_allowlist(raw.allowlist)?;
+            Ok(NetworkPolicy {
+                default,
+                max,
+                allowlist,
+            })
+        }
+    }
+}
+
+/// Light validation of allowlist entries: non-empty, no whitespace or shell
+/// metacharacters. Strict IP/CIDR/domain classification happens in the guest's
+/// enforcement layer, which must parse them anyway.
+fn validate_allowlist(entries: Vec<String>) -> Result<Vec<String>, PolicyError> {
+    let mut seen = HashSet::new();
+    for entry in &entries {
+        if entry.is_empty() {
+            return Err(PolicyError::Invalid(
+                "network allowlist entries must be non-empty".to_string(),
+            ));
+        }
+        if entry.chars().any(|ch| ch.is_whitespace()) {
+            return Err(PolicyError::Invalid(format!(
+                "network allowlist entry '{entry}' must not contain whitespace"
+            )));
+        }
+        if !seen.insert(entry.clone()) {
+            return Err(PolicyError::Invalid(format!(
+                "duplicate network allowlist entry '{entry}'"
+            )));
+        }
+    }
+    Ok(entries)
 }
 
 fn validate_command_set(
@@ -382,5 +540,91 @@ edit = ["sed", "tee"]
         let err = Policy::from_toml_str(&input).unwrap_err().to_string();
 
         assert!(err.contains("unknown command level 'superuser'"));
+    }
+
+    const NETWORK_POLICY: &str = r#"
+[policy]
+network_enabled = true
+allowed_commands = ["curl"]
+max_runtime_secs = 60
+max_output_bytes = 1048576
+workspace_path = "/workspace"
+
+[policy.network]
+default = "none"
+max = "allowlist"
+allowlist = ["1.1.1.1", "8.8.8.0/24", "*.crates.io"]
+"#;
+
+    #[test]
+    fn defaults_network_axis_from_boolean_when_block_absent() {
+        // network_enabled = false -> axis pinned at none.
+        let off = Policy::from_toml_str(VALID_POLICY).unwrap();
+        assert_eq!(off.network.default, NetworkLevel::None);
+        assert_eq!(off.network.max, NetworkLevel::None);
+
+        // network_enabled = true with no [policy.network] -> full egress, fixed.
+        let on = Policy::from_toml_str(&VALID_POLICY.replace(
+            "network_enabled = false",
+            "network_enabled = true",
+        ))
+        .unwrap();
+        assert_eq!(on.network.default, NetworkLevel::Full);
+        assert_eq!(on.network.max, NetworkLevel::Full);
+    }
+
+    #[test]
+    fn loads_network_axis() {
+        let policy = Policy::from_toml_str(NETWORK_POLICY).unwrap();
+        assert_eq!(policy.network.default, NetworkLevel::None);
+        assert_eq!(policy.network.max, NetworkLevel::Allowlist);
+        assert_eq!(
+            policy.network.allowlist,
+            vec!["1.1.1.1", "8.8.8.0/24", "*.crates.io"]
+        );
+    }
+
+    #[test]
+    fn rejects_network_block_without_enabled() {
+        let input = NETWORK_POLICY.replace("network_enabled = true", "network_enabled = false");
+
+        let err = Policy::from_toml_str(&input).unwrap_err().to_string();
+
+        assert!(err.contains("requires network_enabled = true"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_network_default_above_max() {
+        let input = NETWORK_POLICY
+            .replace("default = \"none\"", "default = \"full\"")
+            .replace("max = \"allowlist\"", "max = \"allowlist\"");
+
+        let err = Policy::from_toml_str(&input).unwrap_err().to_string();
+
+        assert!(
+            err.contains("network default level must not exceed max level"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_network_level() {
+        let input = NETWORK_POLICY.replace("max = \"allowlist\"", "max = \"wide_open\"");
+
+        let err = Policy::from_toml_str(&input).unwrap_err().to_string();
+
+        assert!(err.contains("unknown network level 'wide_open'"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_allowlist_entry() {
+        let input = NETWORK_POLICY.replace(
+            "[\"1.1.1.1\", \"8.8.8.0/24\", \"*.crates.io\"]",
+            "[\"1.1.1.1\", \"1.1.1.1\"]",
+        );
+
+        let err = Policy::from_toml_str(&input).unwrap_err().to_string();
+
+        assert!(err.contains("duplicate network allowlist entry"), "got: {err}");
     }
 }

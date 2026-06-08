@@ -1,0 +1,8 @@
+{
+  "protocol_version": 1,
+  "id": "fixture-set-mode-network",
+  "control": "set_mode",
+  "args": {
+    "network": "allowlist"
+  }
+}

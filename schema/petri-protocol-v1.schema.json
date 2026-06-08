@@ -113,7 +113,8 @@
     "SetModeArgs": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Command capability level for the guest-enforced command axis. The network axis is enforced host-side at the VM boundary and is not carried in a guest-bound frame; a `network` field here is rejected.",
+      "description": "Target capability levels. Both axes are guest-enforced (command via process-launch checks, network via in-guest nftables; see ADR 0002). At least one axis must be present; an omitted axis is left unchanged. Each requested level must be within that axis's boot-declared ceiling.",
+      "minProperties": 1,
       "properties": {
         "command": {
           "enum": ["none", "read_only", "edit", "yolo"]
