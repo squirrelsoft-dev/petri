@@ -1,5 +1,5 @@
 # PROJECT STATE
-_Last updated: 2026-06-07 by /close_
+_Last updated: 2026-06-08 by /close_
 
 ## Current State
 Petri is an early-stage microVM sandbox for running untrusted agent
@@ -44,6 +44,17 @@ result from ~4M syscalls to ~64. Applied to both the guest dispatch
 EOF/EINTR/error semantics preserved. Builds clean; framing-only change, not
 yet re-exercised against a booted VM.
 
+The wire protocol now has a published, enforced contract (#24, done): a
+single Rust source of truth (`petri-protocol` crate, shared host+guest), a
+checked-in JSON Schema (`schema/petri-protocol-v1.schema.json`), NDJSON
+framing/correlation docs, versioning rules, fixtures, and an SDK-module map
+(Sandbox/Commands/Filesystem/Git/Pty/Template). As of `8eb4452` the schema is
+enforced rather than illustrative: a `petri-protocol` test compiles the schema
+and validates every fixture against it, validates frames built from the Rust
+constructors (catching schema↔type drift), and asserts invalid frames are
+rejected. Generating first-party client types from the schema is deferred to
+#26; the E2B-style SDK shape that consumes it is #27.
+
 Only the macOS/Apple Virtualization backend exists. Known incomplete /
 broken: guest cancellation is unimplemented. Operational flake: `petri sandbox create` intermittently
 hangs (~30 min, 0 CPU, no instance dir) — workaround is `pkill -9 -f
@@ -60,10 +71,12 @@ and runtime mode switching — and eventually a remote HTTP control plane.
 Near-term focus: all three named dispatch-reliability bugs are now done
 (#32 dispatch error recovery, #33 state-file locking, #34 vsock read
 scaling), so the host↔guest dispatch path is hardened and the path is clear
-to broaden surface. Next phase is SDK/backend breadth: the protocol-schema
-extraction (#24), the E2B-style CLI/SDK shape (#27/#29), and client packages
-(#26) — with the residual `sandbox create` boot hang to re-diagnose if it
-recurs.
+to broaden surface. The shared protocol schema (#24) is now published and
+enforced, so the breadth phase has its contract. Next phase is SDK/backend
+breadth: an automated host↔guest dispatch test (#14) to lock the hardened path,
+then the E2B-style CLI/SDK shape (#27/#29) and client packages (#26) generated
+off the schema — with the residual `sandbox create` boot hang to re-diagnose if
+it recurs.
 
 ## Known Deviations
 1. #31 was resolved more strongly than its `documentation` label implied:
@@ -95,19 +108,26 @@ recurs.
    current call sites read exactly one frame per connection then close, so the
    retention isn't exercised today — it's there to keep the reader correct if a
    future caller reads multiple frames over one fd.
+7. #24 closed for protocol-definition scope only. The schema is published and
+   enforced, but generating actual first-party client *types* from it (the
+   "language clients can use the schema" criterion) was split out to #26, and
+   the SDK API shape that consumes it to #27. The schema also reserves planned
+   operation names (Filesystem/Git/Pty/Template) that have no runtime handler
+   yet — intentional, to let clients align naming ahead of implementation.
 
 ## Next Actions
-With dispatch reliability done, focus shifts to broadening surface. First
-two are the foundation everything else (SDKs, client packages) builds on.
-1. #24 — extract and publish a shared Petri protocol schema. Top priority:
-   the protocol is currently embedded; a published schema is the prerequisite
-   for the SDK shape (#27) and first-party client packages (#26).
-2. #14 — add an end-to-end host-to-guest dispatch test. Now that the dispatch
-   path is hardened (#32/#33/#34) but only manually VM-verified, lock the
-   behavior in with an automated round-trip test before building surface on
-   top of it.
-3. #27 / #29 — define the E2B-style Sandbox SDK API (#27) and align the CLI
-   command structure (#29). The user-facing shape of the breadth phase.
+Protocol contract (#24) is published and enforced. Focus stays on broadening
+surface; the dispatch path needs an automated guard before SDK work builds on it.
+1. #14 — add an end-to-end host-to-guest dispatch test. Top priority: the
+   dispatch path is hardened (#32/#33/#34) and the protocol contract is now
+   enforced at the schema level (#24), but the round trip is still only manually
+   VM-verified. Lock it in with an automated test before building surface on top.
+2. #27 / #29 — define the E2B-style Sandbox SDK API (#27) and align the CLI
+   command structure (#29). The user-facing shape of the breadth phase; both now
+   consume the published schema.
+3. #26 — first-party client packages (Rust/TS/Python/Go) generated off the
+   schema. The deferred half of #24; unblocked now that the schema is the
+   enforced contract.
 4. #35 — low-severity code-review cleanups (polish; batch opportunistically).
 5. Re-diagnose the `sandbox create` hang if it recurs. Historical links
    (#32/#33) are all fixed, so it can no longer be attributed to them; needs a
