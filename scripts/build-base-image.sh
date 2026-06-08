@@ -107,6 +107,7 @@ read_toml_array() {
     in_array && /\]/ { exit }
     in_array {
       line=$0
+      sub(/#.*/, "", line)        # strip TOML comments inside the array
       gsub(/[",]/, "", line)
       sub(/^[[:space:]]*/, "", line)
       sub(/[[:space:]]*$/, "", line)
@@ -225,9 +226,18 @@ fi
 rm -rf "$out_dir"
 mkdir -p "$out_dir"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/petri-base-image.XXXXXX")"
-trap 'rm -rf "$work_dir"' EXIT
-
 rootfs="$work_dir/rootfs"
+
+# Cleanup unmounts any chroot API filesystems (see lsp block) before removing the
+# work dir, so `rm -rf` never traverses into a live /proc or /dev bind mount.
+cleanup() {
+  for fs in dev/pts dev proc sys; do
+    umount -lf "$rootfs/$fs" 2>/dev/null || true
+  done
+  rm -rf "$work_dir"
+}
+trap cleanup EXIT
+
 mkdir -p "$rootfs"
 
 mmdebstrap \
@@ -275,12 +285,25 @@ EOF
 lsp_config_arg=""
 if [ "$lsp_enabled" = "true" ]; then
   need_tool chroot
+  # rustup (and other installers) probe /proc/self/exe and need the API
+  # filesystems present inside the chroot. Bind-mount them; `cleanup` unmounts.
+  for fs in proc sys dev; do
+    mkdir -p "$rootfs/$fs"
+    mount --bind "/$fs" "$rootfs/$fs"
+  done
+  mkdir -p "$rootfs/dev/pts"
+  mount --bind /dev/pts "$rootfs/dev/pts" 2>/dev/null || true
   install -d "$rootfs/etc/petri"
   lsp_py runtime > "$rootfs/etc/petri/lsp.toml"
   lsp_config_arg=" --lsp-config /etc/petri/lsp.toml"
 
-  # Shared env so every server binary lands on PATH at /usr/local/bin.
-  lsp_env='export PATH=/opt/rust/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin; export CARGO_HOME=/opt/rust RUSTUP_HOME=/opt/rust GOPATH=/opt/go GOBIN=/usr/local/bin npm_config_prefix=/usr/local'
+  # Shared env so every server binary lands on PATH at /usr/local/bin. Override
+  # TMPDIR to the chroot's own /tmp: the outer build exports TMPDIR to a host
+  # path (/var/tmp/petri-builder-tmp) that does not exist inside the rootfs, and
+  # rustup et al. would otherwise fail their `mktemp -d`.
+  # CGO_ENABLED=0: gopls is pure Go; without it `go install` pulls in runtime/cgo
+  # and fails on missing libc headers (grp.h) rather than adding a C toolchain.
+  lsp_env='export PATH=/opt/rust/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin; export HOME=/root TMPDIR=/tmp CGO_ENABLED=0 CARGO_HOME=/opt/rust RUSTUP_HOME=/opt/rust GOPATH=/opt/go GOBIN=/usr/local/bin GOCACHE=/opt/go/cache npm_config_prefix=/usr/local'
 
   # rust-analyzer is a rustup component, so bootstrap a minimal stable toolchain
   # first and expose the component binary on PATH.
@@ -297,6 +320,12 @@ if [ "$lsp_enabled" = "true" ]; then
   if lsp_py install | grep -q 'rustup'; then
     chroot "$rootfs" /bin/sh -euc "$lsp_env; ln -sf \"\$(rustup which rust-analyzer)\" /usr/local/bin/rust-analyzer"
   fi
+
+  # Unmount the API filesystems now that the chroot installs are done, so the
+  # later mke2fs -d does not try to copy live /proc, /sys, /dev into the image.
+  for fs in dev/pts dev proc sys; do
+    umount -lf "$rootfs/$fs" 2>/dev/null || true
+  done
 fi
 
 cat > "$rootfs/etc/modules-load.d/petri.conf" <<'EOF'

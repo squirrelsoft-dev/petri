@@ -6,7 +6,9 @@ debian_arch = "arm64"
 suite = "trixie"
 mirror = "https://deb.debian.org/debian"
 security_mirror = "https://deb.debian.org/debian-security"
-disk_size = "2G"
+# 8G: the full LSP toolchain (rust-analyzer, gopls, clangd, pylsp, node/npm) does
+# not fit in 2G. root.img is sparse, so the unused tail costs no real disk.
+disk_size = "8G"
 
 [guest]
 crate = "petri-guest"
