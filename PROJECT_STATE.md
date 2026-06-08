@@ -53,7 +53,21 @@ enforced rather than illustrative: a `petri-protocol` test compiles the schema
 and validates every fixture against it, validates frames built from the Rust
 constructors (catching schema↔type drift), and asserts invalid frames are
 rejected. Generating first-party client types from the schema is deferred to
-#26; the E2B-style SDK shape that consumes it is #27.
+#26.
+
+The E2B-style SDK shape and CLI now exist (#27/#29, done, `8a47c4c`). The CLI
+exposes `petri sandbox create|list|connect|exec|kill` with the old commands
+(`create`/`dispatch`/`stop`/`teardown`/`image build`) kept as compatibility
+aliases; `sandbox exec` supports `--cwd`/`--env`/`--timeout-ms`/
+`--max-output-bytes` and stdin passthrough, and `sandbox connect` is a
+non-interactive readiness check (interactive PTY attach deferred). The SDK is a
+documented language-agnostic contract (`docs/sdk-api.md`) plus a Rust reference
+implementation (`crates/petri/src/sdk.rs`): a `Sandbox` over `HostBackend` with
+`create`/`connect`/`list`/`kill` and a `commands().run()` returning a typed
+`CommandResult`, exercised by unit tests against an in-memory fake backend.
+`files`/`git`/`pty` are named and reserved but unimplemented in v1. Still
+missing for the breadth phase: an automated host↔guest dispatch test (#14) and
+generated first-party client packages (#26).
 
 Only the macOS/Apple Virtualization backend exists. Known incomplete /
 broken: guest cancellation is unimplemented. Operational flake: `petri sandbox create` intermittently
@@ -72,11 +86,11 @@ Near-term focus: all three named dispatch-reliability bugs are now done
 (#32 dispatch error recovery, #33 state-file locking, #34 vsock read
 scaling), so the host↔guest dispatch path is hardened and the path is clear
 to broaden surface. The shared protocol schema (#24) is now published and
-enforced, so the breadth phase has its contract. Next phase is SDK/backend
-breadth: an automated host↔guest dispatch test (#14) to lock the hardened path,
-then the E2B-style CLI/SDK shape (#27/#29) and client packages (#26) generated
-off the schema — with the residual `sandbox create` boot hang to re-diagnose if
-it recurs.
+enforced, so the breadth phase has its contract, and the E2B-style CLI/SDK
+shape (#27/#29) now sits on top of it. Remaining breadth work: an automated
+host↔guest dispatch test (#14) to lock the hardened path, and first-party
+client packages (#26) generated off the schema for TS/Python/Go — with the
+residual `sandbox create` boot hang to re-diagnose if it recurs.
 
 ## Known Deviations
 1. #31 was resolved more strongly than its `documentation` label implied:
@@ -114,21 +128,32 @@ it recurs.
    the SDK API shape that consumes it to #27. The schema also reserves planned
    operation names (Filesystem/Git/Pty/Template) that have no runtime handler
    yet — intentional, to let clients align naming ahead of implementation.
+8. #27/#29 shipped the SDK/CLI shape but several named-and-reserved pieces are
+   intentionally deferred per the issue bodies: `sandbox connect` is a
+   non-interactive readiness check (no PTY attach), `exec --background`/`--user`
+   error as not-yet-implemented, and the SDK `files`/`git`/`pty` modules plus
+   `setTimeout`/`setPolicy`/snapshots are named but unimplemented. SDK
+   `metadata` is accepted but not persisted/filtered by the local backend
+   (reserved for the remote control plane), so `sandbox list --metadata`
+   currently returns empty rather than filtering.
 
 ## Next Actions
-Protocol contract (#24) is published and enforced. Focus stays on broadening
-surface; the dispatch path needs an automated guard before SDK work builds on it.
+Protocol contract (#24) is enforced and the SDK/CLI shape (#27/#29) now sits on
+it. The dispatch path still needs an automated guard, and the SDK has no
+generated clients yet beyond the Rust reference.
 1. #14 — add an end-to-end host-to-guest dispatch test. Top priority: the
-   dispatch path is hardened (#32/#33/#34) and the protocol contract is now
-   enforced at the schema level (#24), but the round trip is still only manually
-   VM-verified. Lock it in with an automated test before building surface on top.
-2. #27 / #29 — define the E2B-style Sandbox SDK API (#27) and align the CLI
-   command structure (#29). The user-facing shape of the breadth phase; both now
-   consume the published schema.
-3. #26 — first-party client packages (Rust/TS/Python/Go) generated off the
-   schema. The deferred half of #24; unblocked now that the schema is the
-   enforced contract.
-4. #35 — low-severity code-review cleanups (polish; batch opportunistically).
-5. Re-diagnose the `sandbox create` hang if it recurs. Historical links
+   dispatch path is hardened (#32/#33/#34) and the protocol contract is enforced
+   at the schema level (#24), but the round trip is still only manually
+   VM-verified — and the SDK now builds on it, raising the cost of a regression.
+   Lock it in with an automated test.
+2. #26 — first-party client packages (TS/Python/Go) generated off the schema,
+   matching the `docs/sdk-api.md` contract the Rust SDK already implements. The
+   deferred half of #24; now unblocked by both the enforced schema and the
+   published SDK shape.
+3. #35 — low-severity code-review cleanups (polish; batch opportunistically).
+4. Re-diagnose the `sandbox create` hang if it recurs. Historical links
    (#32/#33) are all fixed, so it can no longer be attributed to them; needs a
    fresh root-cause pass (likely in the Swift helper boot/ready path).
+5. Optional follow-up to #27/#29: wire SDK `metadata` through to backend
+   persistence so `sandbox list --metadata` filters instead of returning empty
+   (currently reserved; see Known Deviation 8).
