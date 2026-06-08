@@ -512,7 +512,8 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
         defer { connection.close() }
 
         try writeAll(fd: connection.fileDescriptor, data: frame)
-        return try readLine(fd: connection.fileDescriptor)
+        let reader = BufferedReader(fd: connection.fileDescriptor)
+        return try reader.readLine()
     }
 
     private func connectToGuest() throws -> VZVirtioSocketConnection {
@@ -597,7 +598,8 @@ final class ControlServer {
         defer { close(fd) }
 
         do {
-            let line = try readLine(fd: fd)
+            let reader = BufferedReader(fd: fd)
+            let line = try reader.readLine()
             let request = try decoder.decode(HelperRequest.self, from: line)
             let response: HelperResponse
 
@@ -665,28 +667,48 @@ func writeAll(fd: Int32, data: Data) throws {
     }
 }
 
-func readLine(fd: Int32) throws -> Data {
-    var output = Data()
-    var byte = UInt8(0)
+/// Reads newline-delimited frames from a file descriptor, buffering each
+/// `read()` into a chunk and scanning for the `\n` delimiter rather than
+/// issuing one syscall per byte. Bytes read past a frame's delimiter are
+/// retained for the next `readLine()` call.
+final class BufferedReader {
+    private let fd: Int32
+    private let chunkSize: Int
+    private var pending = Data()
 
-    while true {
-        let result = Darwin.read(fd, &byte, 1)
-        if result < 0 {
-            if errno == EINTR {
-                continue
+    init(fd: Int32, chunkSize: Int = 64 * 1024) {
+        self.fd = fd
+        self.chunkSize = chunkSize
+    }
+
+    func readLine() throws -> Data {
+        while true {
+            if let newline = pending.firstIndex(of: 0x0A) {
+                let line = pending.subdata(in: pending.startIndex..<newline)
+                pending.removeSubrange(pending.startIndex...newline)
+                return line
             }
-            throw POSIXError("read")
-        }
-        if result == 0 {
-            if output.isEmpty {
-                throw HelperError("connection closed before a response frame")
+
+            var chunk = Data(count: chunkSize)
+            let result = chunk.withUnsafeMutableBytes { raw in
+                Darwin.read(fd, raw.baseAddress, chunkSize)
             }
-            return output
+            if result < 0 {
+                if errno == EINTR {
+                    continue
+                }
+                throw POSIXError("read")
+            }
+            if result == 0 {
+                if pending.isEmpty {
+                    throw HelperError("connection closed before a response frame")
+                }
+                let line = pending
+                pending.removeAll()
+                return line
+            }
+            pending.append(chunk.prefix(result))
         }
-        if byte == 0x0A {
-            return output
-        }
-        output.append(byte)
     }
 }
 
