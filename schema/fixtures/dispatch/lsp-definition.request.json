@@ -1,0 +1,10 @@
+{
+  "protocol_version": 1,
+  "id": "fixture-lsp-definition",
+  "tool": "lsp_definition",
+  "args": {
+    "file": "/workspace/src/main.rs",
+    "line": 42,
+    "col": 15
+  }
+}

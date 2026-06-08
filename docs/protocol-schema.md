@@ -60,7 +60,23 @@ new operation names, or new error metadata. Incompatible changes must increment
 
 Shared fixtures live under `schema/fixtures`. Client implementations should
 deserialize these files and assert that generated request/result types preserve
-the same wire shape.
+the same wire shape. The dispatch fixtures cover every request variant
+(`bash_command`, `cancel`, `set_mode` for both axes, and the `lsp_*` family) and
+the result variants (success, command failure, timeout, policy rejection,
+malformed, and structured `data` results).
 
-The guest integration tests consume the dispatch fixtures so fixture drift is
-caught by `cargo test`.
+The fixtures are enforced as the contract, not just examples:
+
+- `crates/petri-protocol/tests/schema_validation.rs` compiles
+  `schema/petri-protocol-v1.schema.json` and validates **every** fixture against
+  it, so a fixture that drifts from the published schema fails `cargo test`.
+- The same test serializes frames built from the Rust constructors and validates
+  those against the schema, so the hand-maintained schema cannot silently drift
+  from the wire types. It also asserts the schema rejects invalid frames (wrong
+  `protocol_version`, unknown status, missing required fields).
+- The guest integration tests (`crates/petri-guest/tests/protocol_behavior.rs`)
+  additionally feed the request fixtures through the live dispatch handler, so
+  fixture drift is caught against runtime behavior as well.
+
+Language clients should validate their generated payloads against the same
+schema file to stay aligned across Rust, TypeScript, Python, and Go.

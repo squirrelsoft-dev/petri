@@ -1,0 +1,8 @@
+{
+  "protocol_version": 1,
+  "id": "fixture-lsp-diagnostics",
+  "tool": "lsp_diagnostics",
+  "args": {
+    "file": "/workspace/src/main.rs"
+  }
+}

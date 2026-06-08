@@ -1,0 +1,11 @@
+{
+  "protocol_version": 1,
+  "id": "fixture-lsp-rename",
+  "tool": "lsp_rename",
+  "args": {
+    "file": "/workspace/src/main.rs",
+    "line": 42,
+    "col": 15,
+    "new_name": "renamed_symbol"
+  }
+}

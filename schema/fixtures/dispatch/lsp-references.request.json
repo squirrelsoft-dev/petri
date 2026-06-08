@@ -1,0 +1,10 @@
+{
+  "protocol_version": 1,
+  "id": "fixture-lsp-references",
+  "tool": "lsp_references",
+  "args": {
+    "file": "/workspace/src/main.rs",
+    "line": 42,
+    "col": 15
+  }
+}

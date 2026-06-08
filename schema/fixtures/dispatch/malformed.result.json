@@ -1,0 +1,10 @@
+{
+  "protocol_version": 1,
+  "id": null,
+  "status": "malformed",
+  "elapsed_ms": 0,
+  "error": {
+    "code": "malformed_frame",
+    "message": "dispatch frame is not valid JSON"
+  }
+}

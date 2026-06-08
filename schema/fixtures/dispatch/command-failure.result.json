@@ -1,0 +1,10 @@
+{
+  "protocol_version": 1,
+  "id": "fixture-command-failure",
+  "status": "failure",
+  "elapsed_ms": 2,
+  "stdout": "",
+  "stderr": "",
+  "exit_code": 1,
+  "output_truncated": false
+}

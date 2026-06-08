@@ -1,0 +1,14 @@
+{
+  "protocol_version": 1,
+  "id": "fixture-timeout",
+  "status": "timeout",
+  "elapsed_ms": 20,
+  "stdout": "",
+  "stderr": "",
+  "exit_code": null,
+  "output_truncated": false,
+  "error": {
+    "code": "timeout_exceeded",
+    "message": "request exceeded effective timeout"
+  }
+}
