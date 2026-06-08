@@ -312,6 +312,10 @@ impl MacosBackend {
             path: guest_policy.clone(),
             source,
         })?;
+        // The policy governs the sandbox's capability ceilings, so restrict the
+        // host-side copy to its owner (typically root): no group/other read or
+        // write. The guest mounts it read-only over virtiofs. See ADR 0002.
+        harden_policy_permissions(&guest_policy)?;
 
         let helper_stdout_path = self.helper_stdout_path(&config.id);
         let helper_stderr_path = self.helper_stderr_path(&config.id);
@@ -916,6 +920,25 @@ impl HelperResponse {
     }
 }
 
+/// Restrict the host-side policy file to owner-only read/write (`0o600`), so a
+/// non-root user on the host cannot read or tamper with the capability ceilings
+/// governing a running sandbox. A no-op on non-Unix hosts.
+#[cfg(unix)]
+fn harden_policy_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
+        PetriError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn harden_policy_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn load_host_policy(path: &Path) -> Result<Policy> {
     let file = fs::File::open(path).map_err(|source| PetriError::Io {
         path: path.to_path_buf(),
@@ -1475,5 +1498,21 @@ mod tests {
         let err = load_host_policy(&path).unwrap_err().to_string();
 
         assert!(err.contains("failed to load policy"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harden_policy_permissions_restricts_to_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("policy-perms");
+        let path = dir.join("policy.toml");
+        // Start world-readable to prove hardening tightens it.
+        fs::write(&path, "x").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        harden_policy_permissions(&path).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "policy file must be owner-only, got {mode:o}");
     }
 }
