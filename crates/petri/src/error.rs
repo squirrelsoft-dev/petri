@@ -23,6 +23,18 @@ pub enum PetriError {
         backend: String,
         message: String,
     },
+    /// A transport-level failure talking to the guest (connect/read/write/flush/
+    /// decode). Transient by nature: a momentary hiccup should not brick a live
+    /// instance, so dispatch returns it to `Ready` rather than `Failed`.
+    Transport {
+        message: String,
+    },
+    /// The guest helper was reached and answered with a structured error. The VM
+    /// is alive, so the failure is recoverable — the dispatch itself failed, not
+    /// the instance.
+    Guest {
+        message: String,
+    },
     LifecycleTransition {
         operation: &'static str,
         from: &'static str,
@@ -52,6 +64,8 @@ impl std::fmt::Display for PetriError {
                 write!(f, "backend '{backend}' does not implement {operation} yet")
             }
             Self::Backend { backend, message } => write!(f, "backend '{backend}': {message}"),
+            Self::Transport { message } => write!(f, "guest transport error: {message}"),
+            Self::Guest { message } => write!(f, "guest error: {message}"),
             Self::LifecycleTransition {
                 operation,
                 from,
@@ -65,11 +79,65 @@ impl std::fmt::Display for PetriError {
     }
 }
 
+impl PetriError {
+    /// Whether a dispatch failure leaves the guest VM presumed-alive, so the
+    /// instance can safely return to `Ready` instead of being bricked to
+    /// `Failed`. Transport hiccups, lower-level I/O on the control socket, and
+    /// guest-reported errors all qualify; `Failed` is reserved for genuinely
+    /// unrecoverable states (e.g. confirmed guest/VM death).
+    pub fn dispatch_recoverable(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport { .. } | Self::Guest { .. } | Self::Io { .. }
+        )
+    }
+}
+
 impl std::error::Error for PetriError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_and_guest_errors_are_recoverable() {
+        assert!(
+            PetriError::Transport {
+                message: "flaky read".to_string()
+            }
+            .dispatch_recoverable()
+        );
+        assert!(
+            PetriError::Guest {
+                message: "tool rejected".to_string()
+            }
+            .dispatch_recoverable()
+        );
+        assert!(
+            PetriError::Io {
+                path: PathBuf::from("/sock"),
+                source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+            }
+            .dispatch_recoverable()
+        );
+    }
+
+    #[test]
+    fn unrecoverable_errors_are_not_dispatch_recoverable() {
+        assert!(
+            !PetriError::Backend {
+                backend: "macos".to_string(),
+                message: "boom".to_string(),
+            }
+            .dispatch_recoverable()
+        );
+        assert!(!PetriError::InvalidConfig("bad".to_string()).dispatch_recoverable());
     }
 }

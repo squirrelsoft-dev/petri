@@ -537,50 +537,10 @@ impl HostBackend for MacosBackend {
     ) -> Result<DispatchResult> {
         let state = self.load_state(instance_id)?;
         let running = self.transition_state(state, LifecycleState::RunningDispatch, "dispatch")?;
-        let result = match running.transport {
-            GuestTransport::Vsock => {
-                let response: HelperResponse = send_helper_request(
-                    &required_control_socket(&running)?,
-                    &HelperRequest::Dispatch { request },
-                )?;
-                response.into_dispatch_result()
-            }
-            GuestTransport::TcpLoopback => {
-                let mut stream =
-                    TcpStream::connect(required_dispatch_addr(&running)?).map_err(|source| {
-                        backend_error(format!(
-                            "failed to connect to guest at {}: {source}",
-                            required_dispatch_addr(&running).unwrap_or("<missing>")
-                        ))
-                    })?;
-
-                serde_json::to_writer(&mut stream, &request).map_err(|err| {
-                    backend_error(format!("failed to encode dispatch request: {err}"))
-                })?;
-                stream.write_all(b"\n").map_err(|source| {
-                    backend_error(format!("failed to write dispatch frame: {source}"))
-                })?;
-                stream.flush().map_err(|source| {
-                    backend_error(format!("failed to flush dispatch frame: {source}"))
-                })?;
-
-                let mut response = String::new();
-                BufReader::new(stream)
-                    .read_line(&mut response)
-                    .map_err(|source| {
-                        backend_error(format!("failed to read guest response: {source}"))
-                    })?;
-
-                if response.is_empty() {
-                    return Err(backend_error(
-                        "guest closed the dispatch connection without a response".to_string(),
-                    ));
-                }
-
-                serde_json::from_str(&response)
-                    .map_err(|err| backend_error(format!("failed to decode guest response: {err}")))
-            }
-        };
+        // Capture every transport error into `result` (rather than `?`-bailing
+        // out of `dispatch`) so the recovery logic below always runs and the
+        // instance never gets stranded in `RunningDispatch` (#32).
+        let result = dispatch_over_transport(&running, request);
 
         match result {
             Ok(result) => {
@@ -588,7 +548,15 @@ impl HostBackend for MacosBackend {
                 Ok(result)
             }
             Err(err) => {
-                let _ = self.transition_state(running, LifecycleState::Failed, "dispatch");
+                // A transient transport hiccup or a guest-reported error leaves
+                // the VM alive, so return to `Ready` and let the caller retry.
+                // Reserve `Failed` for genuinely unrecoverable states (#32).
+                let recovery = if err.dispatch_recoverable() {
+                    LifecycleState::Ready
+                } else {
+                    LifecycleState::Failed
+                };
+                let _ = self.transition_state(running, recovery, "dispatch");
                 Err(err)
             }
         }
@@ -912,8 +880,10 @@ impl HelperResponse {
     fn into_dispatch_result(self) -> Result<DispatchResult> {
         match self {
             Self::DispatchResult { result } => Ok(result),
-            Self::Error { message } => Err(backend_error(message)),
-            other => Err(backend_error(format!(
+            // The guest answered, so it is alive: a structured error or an
+            // unexpected-but-well-formed response is recoverable, not fatal (#32).
+            Self::Error { message } => Err(guest_error(message)),
+            other => Err(transport_error(format!(
                 "helper returned non-dispatch response: {other:?}"
             ))),
         }
@@ -926,11 +896,9 @@ impl HelperResponse {
 #[cfg(unix)]
 fn harden_policy_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
-        PetriError::Io {
-            path: path.to_path_buf(),
-            source,
-        }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| PetriError::Io {
+        path: path.to_path_buf(),
+        source,
     })
 }
 
@@ -1175,6 +1143,60 @@ fn print_new_log_lines(label: &str, path: &Path, offset: &mut u64) {
 }
 
 #[cfg(unix)]
+/// Run a single dispatch over the instance's configured transport, returning the
+/// guest's `DispatchResult` or the transport/guest error. All failures are
+/// returned (never `?`-propagated past the caller) so `dispatch` can classify
+/// them and recover the instance's lifecycle state (#32).
+fn dispatch_over_transport(
+    running: &RuntimeState,
+    request: DispatchRequest,
+) -> Result<DispatchResult> {
+    match running.transport {
+        GuestTransport::Vsock => {
+            let response: HelperResponse = send_helper_request(
+                &required_control_socket(running)?,
+                &HelperRequest::Dispatch { request },
+            )?;
+            response.into_dispatch_result()
+        }
+        GuestTransport::TcpLoopback => {
+            let mut stream =
+                TcpStream::connect(required_dispatch_addr(running)?).map_err(|source| {
+                    transport_error(format!(
+                        "failed to connect to guest at {}: {source}",
+                        required_dispatch_addr(running).unwrap_or("<missing>")
+                    ))
+                })?;
+
+            serde_json::to_writer(&mut stream, &request).map_err(|err| {
+                transport_error(format!("failed to encode dispatch request: {err}"))
+            })?;
+            stream.write_all(b"\n").map_err(|source| {
+                transport_error(format!("failed to write dispatch frame: {source}"))
+            })?;
+            stream.flush().map_err(|source| {
+                transport_error(format!("failed to flush dispatch frame: {source}"))
+            })?;
+
+            let mut response = String::new();
+            BufReader::new(stream)
+                .read_line(&mut response)
+                .map_err(|source| {
+                    transport_error(format!("failed to read guest response: {source}"))
+                })?;
+
+            if response.is_empty() {
+                return Err(transport_error(
+                    "guest closed the dispatch connection without a response".to_string(),
+                ));
+            }
+
+            serde_json::from_str(&response)
+                .map_err(|err| transport_error(format!("failed to decode guest response: {err}")))
+        }
+    }
+}
+
 fn send_helper_request<T>(control_socket: &Path, request: &HelperRequest) -> Result<T>
 where
     T: serde::de::DeserializeOwned,
@@ -1184,25 +1206,25 @@ where
         source,
     })?;
     serde_json::to_writer(&mut stream, request)
-        .map_err(|err| backend_error(format!("failed to encode helper request: {err}")))?;
+        .map_err(|err| transport_error(format!("failed to encode helper request: {err}")))?;
     stream
         .write_all(b"\n")
-        .map_err(|source| backend_error(format!("failed to write helper request: {source}")))?;
+        .map_err(|source| transport_error(format!("failed to write helper request: {source}")))?;
     stream
         .flush()
-        .map_err(|source| backend_error(format!("failed to flush helper request: {source}")))?;
+        .map_err(|source| transport_error(format!("failed to flush helper request: {source}")))?;
 
     let mut response = String::new();
     BufReader::new(stream)
         .read_line(&mut response)
-        .map_err(|source| backend_error(format!("failed to read helper response: {source}")))?;
+        .map_err(|source| transport_error(format!("failed to read helper response: {source}")))?;
     if response.is_empty() {
-        return Err(backend_error(
+        return Err(transport_error(
             "helper closed the control connection without a response".to_string(),
         ));
     }
     serde_json::from_str(&response)
-        .map_err(|err| backend_error(format!("failed to decode helper response: {err}")))
+        .map_err(|err| transport_error(format!("failed to decode helper response: {err}")))
 }
 
 #[cfg(not(unix))]
@@ -1266,6 +1288,18 @@ fn backend_error(message: String) -> PetriError {
         backend: MACOS_BACKEND.to_string(),
         message,
     }
+}
+
+/// A transport-level failure communicating with the guest. Marked recoverable so
+/// a flaky read/write/connect does not brick the instance (see #32).
+fn transport_error(message: String) -> PetriError {
+    PetriError::Transport { message }
+}
+
+/// A structured error reported by a live guest helper. Recoverable: the VM
+/// answered, so the dispatch failed but the instance remains usable (see #32).
+fn guest_error(message: String) -> PetriError {
+    PetriError::Guest { message }
 }
 
 #[cfg(test)]
@@ -1453,6 +1487,42 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "invalid lifecycle transition during dispatch: torn_down -> running_dispatch"
+        );
+    }
+
+    #[test]
+    fn macos_backend_recovers_to_ready_after_transient_dispatch_error() {
+        // A dispatch that fails at the transport layer (here, a refused
+        // connection to a closed loopback port) must return the instance to
+        // `Ready`, not brick it to `Failed`. Regression test for #32.
+        let state_dir = temp_dir("dispatch-transient-recovery");
+        let backend = MacosBackend::new(&state_dir, "petri-vz");
+        let id = InstanceId::new("dispatch-transient-recovery").unwrap();
+        backend
+            .write_state(&runtime_state(id.clone(), LifecycleState::Ready))
+            .unwrap();
+        let request = DispatchRequest::bash_command(
+            "request-1",
+            "pwd",
+            Vec::new(),
+            PathBuf::from("/workspace"),
+            std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+
+        let err = backend.dispatch(&id, request).unwrap_err();
+
+        assert!(
+            err.dispatch_recoverable(),
+            "expected a recoverable transport error, got: {err}"
+        );
+        let recovered = backend.list().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].state,
+            LifecycleState::Ready,
+            "transient dispatch error must not brick the instance to Failed"
         );
     }
 
