@@ -1,5 +1,5 @@
 # PROJECT STATE
-_Last updated: 2026-06-08 by /close (#35 code-review polish complete)_
+_Last updated: 2026-06-08 by /close (#26 first-party clients complete)_
 
 ## Current State
 Petri is an early-stage microVM sandbox for running untrusted agent
@@ -95,6 +95,22 @@ caps the buffer it allocates from an untrusted LSP `Content-Length`; the dead
 Builds clean, all tests pass; the env change is covered by a new in-process unit
 test (the VM-backed e2e test was not re-run).
 
+First-party client packages now exist for all four languages (#26, done,
+`5f16cf8`): the Rust reference (`crates/petri/src/sdk.rs`) plus thin
+TypeScript/Python/Go clients under `clients/`, each exposing the same
+E2B-style `Sandbox` surface (`create`/`connect`/`list`/`kill`,
+`commands.run`, reserved `files`/`git`/`pty`) and a consistent typed-error
+family (not-found, not-ready, policy-denied, timeout, output-truncated,
+command-failed, protocol-version-mismatch). Because there is no HTTP control
+plane yet, the non-Rust clients are thin wrappers over the `petri` CLI: each
+call shells out to `petri sandbox ...`, captures stdout/stderr/exit, and
+parses the CLI's JSON. An injectable runner makes the whole surface testable
+without a binary or VM — TS 52 / Python 61 / Go 43 tests pass (all against
+mock runners; none exercised against a booted VM). The shared transport +
+CLI-mapping contract is in `clients/README.md`. Deferred per the issue body:
+the `files`/`git`/`pty` operations, and registry publishing (clients install
+from path today).
+
 Only the macOS/Apple Virtualization backend exists. Known incomplete /
 broken: guest cancellation is unimplemented. Operational flake: `petri sandbox create` intermittently
 hangs (~30 min, 0 CPU, no instance dir) — workaround is `pkill -9 -f
@@ -113,10 +129,13 @@ Near-term focus: all three named dispatch-reliability bugs are now done
 scaling), so the host↔guest dispatch path is hardened and the path is clear
 to broaden surface. The shared protocol schema (#24) is now published and
 enforced, so the breadth phase has its contract, and the E2B-style CLI/SDK
-shape (#27/#29) now sits on top of it. The hardened dispatch path is now locked
-by an automated real-VM end-to-end test (#14). Remaining breadth work:
-first-party client packages (#26) generated off the schema for TS/Python/Go —
-with the residual `sandbox create` boot hang to re-diagnose if it recurs.
+shape (#27/#29) now sits on top of it, the hardened dispatch path is locked by
+an automated real-VM end-to-end test (#14), and first-party clients for all four
+languages now ship (#26). The breadth phase is effectively complete: the surface
+is contracted, implemented, and client-accessible. The focus now shifts to
+**consumption** — wiring these clients into spore-core via the provider
+integration contract (#15) — with the residual `sandbox create` boot hang to
+re-diagnose if it recurs.
 
 ## Known Deviations
 1. #31 was resolved more strongly than its `documentation` label implied:
@@ -175,18 +194,32 @@ with the residual `sandbox create` boot hang to re-diagnose if it recurs.
    control socket (`<state_dir>/<id>/petri-vz.sock`) overflows under long temp
    paths, so the test uses a short `/tmp` base dir and short instance id. Both
    are test/runtime concerns only; neither changes product code.
+11. #26 closed for the issue's stated scope (thin client + lifecycle + command
+   execution + typed errors + reserved module names) — not its aspirational
+   ceiling. The clients are **CLI-subprocess wrappers**, not generated off the
+   JSON Schema as #24 originally imagined: with no HTTP control plane and a
+   macOS-only in-process backend, shelling out to `petri` was the only viable
+   transport today. The `files`/`git`/`pty` operations and registry publishing
+   are deferred per the issue body, and client tests run only against mock
+   runners (never a booted VM). The "spore-core providers can use these"
+   criterion is satisfied in principle but the actual wiring is #15.
 
 ## Next Actions
-Protocol contract (#24) is enforced, the SDK/CLI shape (#27/#29) sits on it, and
-the hardened dispatch path is now locked by an automated real-VM e2e test (#14).
-The SDK still has no generated clients beyond the Rust reference.
-1. #26 — first-party client packages (TS/Python/Go) generated off the schema,
-   matching the `docs/sdk-api.md` contract the Rust SDK already implements. Top
-   priority: the deferred half of #24, now unblocked by the enforced schema, the
-   published SDK shape, and an e2e-verified dispatch path to validate against.
+Breadth phase is effectively complete: protocol contract (#24) enforced, SDK/CLI
+shape (#27/#29) on top, dispatch locked by a real-VM e2e test (#14), and
+first-party clients for all four languages shipped (#26). The lever now is
+**consumption** — putting the clients to use in spore-core.
+1. #15 — define (and stand up) the spore-core sandbox provider integration
+   contract, now that blessed clients exist to back it. Top priority: it is the
+   path that makes #26's "providers use these clients rather than hand-rolled
+   protocol code" real, and the first external consumer that will pressure-test
+   the SDK surface.
 2. Re-diagnose the `sandbox create` hang if it recurs. Historical links
    (#32/#33) are all fixed, so it can no longer be attributed to them; needs a
    fresh root-cause pass (likely in the Swift helper boot/ready path).
 3. Consider wiring #14's e2e test into a macOS CI lane (build + codesign
    `petri-vz`, build the base image, run `--ignored`) so the dispatch path is
    guarded automatically rather than only on demand.
+4. Follow-ups spun off #26 when there's demand: implement the reserved
+   `files`/`git`/`pty` client operations, and publish the clients to
+   npm/PyPI/the Go module proxy (they install from path today).
