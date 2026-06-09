@@ -393,8 +393,19 @@ physical packing order in `layer.data`. Two seals of byte-identical content on
 top of identical parents produce the same content ID. This is the property that
 later makes content-addressed distribution and dedupe possible (§10).
 
-Hash function: a single, explicit choice (e.g. BLAKE3) recorded in the format,
-with the algorithm tagged in the ID so it can evolve.
+Hash function: **SHA-256** (Milestone 4), chosen for consistency with Petri's
+existing `SHA256SUMS` image-integrity convention rather than introducing a
+second hash family. The algorithm is tagged in `layer.meta` (`hash_algo` byte)
+so it can evolve. The canonical pre-image hashed is, in order: a domain
+separator, `block_size`, `virtual_size`, the parent IDs, then for each populated
+block in ascending block-number order the block number followed by the
+SHA-256 of that block's payload.
+
+The concrete on-disk sealed layer is a directory with `layer.meta` (a small
+fixed binary header: magic + schema version, geometry, `hash_algo`, the 32-byte
+content ID, parent IDs, and the `(block_number -> data_offset)` index) and
+`layer.data` (the live blocks packed densely in block-number order, dropping the
+append-log garbage of the scratch). `ImmutableLayer::open_sealed` reloads it.
 
 ---
 
@@ -508,9 +519,17 @@ The helper selects the boot disk via `--disk <path>` (local image) **or**
   is pending controlled in-guest markers via a working guest agent.)*
 
 ### Milestone 4 — Seal snapshot
-- Add `seal_scratch()` to convert a writable overlay into an immutable layer.
-- Store parent IDs and content ID.
-- Boot from `base + sealed + fresh scratch` and verify sealed changes are visible.
+- [x] Add sealing (`ScratchLayer::seal`) to convert a writable overlay into an
+  immutable packed layer (`layer.meta` + compacted `layer.data`), and
+  `ImmutableLayer::open_sealed` to reload it.
+- [x] Store parent IDs and a SHA-256 content ID; content ID is stable for
+  identical content and changes with content or parents (unit-tested).
+- [x] Compose `base + sealed + fresh scratch` and verify sealed blocks shadow the
+  base while fresh scratch starts empty (unit-tested at the block level).
+- [ ] Boot a VM from `base + sealed + fresh scratch` and verify sealed changes
+  are visible in-guest. *(Deferred with the M3 in-guest assertions — needs a
+  working guest agent for controlled markers; the block-level seal/compose
+  semantics are fully verified above.)*
 
 ### Milestone 5 — Performance and cleanup
 - Measure boot time and an image-build workload vs. raw disk attachment.
@@ -571,5 +590,7 @@ asserted.
   base `root.img` byte-unchanged.)*
 - [~] A scratch overlay can be discarded for a clean run. *(Mechanism exists — a
   fresh `ScratchLayer` per run; full reboot assertion deferred, see M3.)*
-- [ ] A scratch overlay can be sealed and reused as a read-only top layer. *(M4.)*
+- [x] A scratch overlay can be sealed and reused as a read-only (immutable) layer.
+  *(M4 — `seal()` → packed content-addressed layer, `open_sealed()` reload,
+  composed under a fresh scratch; verified at the block level.)*
 - [x] Tradeoffs vs. APFS clones are documented before expanding into registry support. *(§13)*

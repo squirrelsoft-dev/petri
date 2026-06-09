@@ -15,6 +15,6 @@ mod protocol;
 mod server;
 mod stack;
 
-pub use layer::{ImmutableLayer, ScratchLayer};
+pub use layer::{ImmutableLayer, LayerId, ScratchLayer};
 pub use server::{BindMode, NbdHandle, NbdServer, ServeOpts};
 pub use stack::{Geometry, LayeredDisk};

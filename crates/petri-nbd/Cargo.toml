@@ -6,3 +6,6 @@ description = "Layered block-device backend for Petri VM images (NBD)"
 license = "MIT"
 
 [dependencies]
+# SHA-256 for content-addressed layer identity (§8.1), matching Petri's
+# existing SHA256SUMS image-integrity convention.
+sha2 = "0.10"
