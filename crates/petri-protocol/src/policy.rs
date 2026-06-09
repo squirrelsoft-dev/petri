@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
@@ -198,10 +198,6 @@ impl Policy {
     pub fn from_toml_str(input: &str) -> Result<Self, PolicyError> {
         let document: PolicyDocument = toml::from_str(input)?;
         Self::validate(document.policy)
-    }
-
-    pub fn cwd_is_in_workspace(&self, cwd: &Path) -> bool {
-        cwd.is_absolute() && cwd.starts_with(&self.workspace_path)
     }
 
     fn validate(raw: RawPolicy) -> Result<Self, PolicyError> {
@@ -595,9 +591,7 @@ allowlist = ["1.1.1.1", "8.8.8.0/24", "*.crates.io"]
 
     #[test]
     fn rejects_network_default_above_max() {
-        let input = NETWORK_POLICY
-            .replace("default = \"none\"", "default = \"full\"")
-            .replace("max = \"allowlist\"", "max = \"allowlist\"");
+        let input = NETWORK_POLICY.replace("default = \"none\"", "default = \"full\"");
 
         let err = Policy::from_toml_str(&input).unwrap_err().to_string();
 

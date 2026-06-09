@@ -94,7 +94,7 @@ impl DomainMatcher {
     /// allowed.
     pub fn matches(&self, name: &str) -> bool {
         let name = normalize(name);
-        if self.exact.iter().any(|e| *e == name) {
+        if self.exact.contains(&name) {
             return true;
         }
         self.wildcard.iter().any(|suffix| name.ends_with(suffix))
@@ -146,12 +146,17 @@ impl Upstream for UdpUpstream {
     }
 }
 
+/// A resolved IPv4 address paired with its record TTL (seconds).
+type Ipv4Ttl = (Ipv4Addr, u32);
+/// A resolved IPv6 address paired with its record TTL (seconds).
+type Ipv6Ttl = (Ipv6Addr, u32);
+
 /// What to send back to the client plus any IPs to admit through nftables.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Resolution {
     pub response: Vec<u8>,
-    pub add4: Vec<(Ipv4Addr, u32)>,
-    pub add6: Vec<(Ipv6Addr, u32)>,
+    pub add4: Vec<Ipv4Ttl>,
+    pub add6: Vec<Ipv6Ttl>,
 }
 
 /// Handle one query for the given active level. Pure given an `Upstream`, so the
@@ -254,7 +259,7 @@ fn refusal(raw: &[u8], code: ResponseCode) -> Vec<u8> {
 }
 
 /// Pull A/AAAA records (address + TTL) out of a raw upstream response.
-fn extract_addrs(response: &[u8]) -> (Vec<(Ipv4Addr, u32)>, Vec<(Ipv6Addr, u32)>) {
+fn extract_addrs(response: &[u8]) -> (Vec<Ipv4Ttl>, Vec<Ipv6Ttl>) {
     let mut v4 = Vec::new();
     let mut v6 = Vec::new();
     let Ok(message) = Message::from_bytes(response) else {

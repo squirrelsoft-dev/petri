@@ -273,15 +273,17 @@ fn handle_bash_command(
     };
 
     execute_command(
-        request.id,
-        args.command,
-        args.argv,
-        cwd,
-        args.env,
-        args.stdin,
-        timeout,
-        max_output_bytes,
-        policy.drop_privileges,
+        CommandSpec {
+            id: request.id,
+            command: args.command,
+            argv: args.argv,
+            cwd,
+            env: args.env,
+            stdin: args.stdin,
+            timeout,
+            max_output_bytes,
+            drop_privileges: policy.drop_privileges,
+        },
         started,
     )
 }
@@ -519,7 +521,17 @@ fn effective_output_cap(request: &DispatchRequest, policy: &Policy) -> usize {
         .unwrap_or(policy_cap)
 }
 
-fn execute_command(
+/// Minimal environment handed to every workload before the request env is
+/// layered on. Deliberately small: just enough for bare command names to
+/// resolve. Anything else a command needs must come from the request.
+fn baseline_env() -> [(&'static str, &'static str); 1] {
+    [("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")]
+}
+
+/// Everything needed to launch one workload process. Bundled into a struct so
+/// the launch path takes two parameters (spec + clock) instead of a long
+/// positional argument list.
+struct CommandSpec {
     id: String,
     command: String,
     argv: Vec<String>,
@@ -529,15 +541,34 @@ fn execute_command(
     timeout: Duration,
     max_output_bytes: usize,
     drop_privileges: bool,
-    started: Instant,
-) -> ResultFrame {
+}
+
+fn execute_command(spec: CommandSpec, started: Instant) -> ResultFrame {
+    let CommandSpec {
+        id,
+        command,
+        argv,
+        cwd,
+        env,
+        stdin,
+        timeout,
+        max_output_bytes,
+        drop_privileges,
+    } = spec;
     let stdin_stdio = if stdin.is_some() {
         Stdio::piped()
     } else {
         Stdio::null()
     };
     let mut cmd = Command::new(&command);
+    // Start from a clean slate rather than inheriting the guest agent's full
+    // environment: a workload sees only a minimal baseline plus whatever the
+    // request explicitly sets. The baseline carries a standard PATH so bare
+    // command names still resolve; the request env is layered last so callers
+    // can override it.
     cmd.args(argv)
+        .env_clear()
+        .envs(baseline_env())
         .envs(env)
         .current_dir(cwd)
         .stdin(stdin_stdio)
@@ -560,9 +591,9 @@ fn execute_command(
         }
     };
 
-    if let Some(input) = stdin {
-        if let Some(mut child_stdin) = child.stdin.take() {
-            if let Err(err) = child_stdin.write_all(input.as_bytes()) {
+    if let Some(input) = stdin
+        && let Some(mut child_stdin) = child.stdin.take()
+            && let Err(err) = child_stdin.write_all(input.as_bytes()) {
                 let _ = child.kill();
                 return guest_error(
                     id,
@@ -570,8 +601,6 @@ fn execute_command(
                     format!("failed to write command stdin: {err}"),
                 );
             }
-        }
-    }
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -934,6 +963,38 @@ mod tests {
 
         assert_eq!(result.status, Status::Success);
         assert_eq!(result.stdout.as_deref(), Some("env-ok:stdin-ok"));
+    }
+
+    #[test]
+    fn child_does_not_inherit_guest_agent_env() {
+        // A variable present in the guest agent's own environment must not leak
+        // into a workload: execute_command starts from a clean env plus only the
+        // baseline and request env. PATH (baseline) is still present so the bare
+        // `sh` command resolves.
+        let var = format!("PETRI_LEAK_CHECK_{}", std::process::id());
+        // SAFETY: single-threaded test setup; the var name is unique to this
+        // process so no other test observes it.
+        unsafe { std::env::set_var(&var, "leaked") };
+
+        let workspace = workspace();
+        let line = serde_json::json!({
+            "protocol_version": 1,
+            "id": "req-1",
+            "tool": "bash_command",
+            "args": {
+                "command": "sh",
+                "argv": ["-c", format!("printf '%s' \"${{{var}:-clean}}\"")],
+                "cwd": workspace.clone(),
+            }
+        })
+        .to_string();
+
+        let result = handle(&line, &policy(&["sh"], workspace));
+
+        unsafe { std::env::remove_var(&var) };
+
+        assert_eq!(result.status, Status::Success);
+        assert_eq!(result.stdout.as_deref(), Some("clean"));
     }
 
     #[test]

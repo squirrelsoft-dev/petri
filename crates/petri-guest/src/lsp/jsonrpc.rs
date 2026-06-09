@@ -306,6 +306,11 @@ fn rpc_error(error: &Value) -> LspError {
     LspError::Rpc { code, message }
 }
 
+/// Upper bound on a single framed message body. A well-behaved LSP server stays
+/// well under this; it exists only to cap the buffer allocated from an untrusted
+/// `Content-Length` header so a bad value cannot OOM the guest.
+const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Write a `Content-Length`-framed JSON-RPC message.
 pub fn write_message(writer: &mut dyn Write, message: &Value) -> io::Result<()> {
     let body = serde_json::to_vec(message)?;
@@ -340,6 +345,16 @@ pub fn read_message(reader: &mut dyn BufRead) -> io::Result<Option<Value>> {
         io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
     })?;
 
+    // Guard against a compromised or buggy LSP server advertising an enormous
+    // Content-Length: don't pre-allocate an unbounded buffer from an untrusted
+    // header. Real LSP messages are far below this cap.
+    if length > MAX_MESSAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Content-Length {length} exceeds maximum {MAX_MESSAGE_BYTES}"),
+        ));
+    }
+
     let mut body = vec![0_u8; length];
     reader.read_exact(&mut body)?;
     let message = serde_json::from_slice::<Value>(&body)
@@ -372,6 +387,15 @@ mod tests {
     fn read_message_returns_none_on_clean_eof() {
         let mut cursor = Cursor::new(Vec::new());
         assert!(read_message(&mut cursor).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_message_rejects_oversized_content_length() {
+        // A header claiming a huge body must be refused before allocating it.
+        let header = format!("Content-Length: {}\r\n\r\n", MAX_MESSAGE_BYTES + 1);
+        let mut cursor = Cursor::new(header.into_bytes());
+        let err = read_message(&mut cursor).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     /// Spawn a fake server on a loopback socket. The closure receives the

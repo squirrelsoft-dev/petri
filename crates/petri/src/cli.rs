@@ -396,11 +396,11 @@ fn parse_sandbox_exec(args: impl Iterator<Item = String>) -> Result<Command> {
     }))
 }
 
-fn parse_sandbox_kill(mut args: impl Iterator<Item = String>) -> Result<Command> {
+fn parse_sandbox_kill(args: impl Iterator<Item = String>) -> Result<Command> {
     let mut all = false;
     let mut instance_ids = Vec::new();
 
-    while let Some(arg) = args.next() {
+    for arg in args {
         match arg.as_str() {
             "--all" => all = true,
             "--help" | "-h" => return Err(PetriError::Cli(sandbox_kill_usage())),
@@ -1619,7 +1619,7 @@ fn parse_hdiutil_attach(output: &str) -> Result<HdiutilAttach> {
         if is_hdiutil_whole_disk(device) {
             disk = Some((*device).to_string());
         }
-        if fields.iter().any(|field| *field == "EFI") {
+        if fields.contains(&"EFI") {
             efi_partition = Some((*device).to_string());
         }
     }

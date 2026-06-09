@@ -901,16 +901,13 @@ impl ImageManifest {
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 enum BootMode {
+    #[default]
     Linux,
     Efi,
 }
 
-impl Default for BootMode {
-    fn default() -> Self {
-        Self::Linux
-    }
-}
 
 impl BootMode {
     fn as_str(self) -> &'static str {
@@ -1083,14 +1080,13 @@ fn resolve_sibling_binary(configured: &Path) -> Result<PathBuf> {
         return Ok(configured.to_path_buf());
     }
 
-    if let Ok(current_exe) = env::current_exe() {
-        if let Some(dir) = current_exe.parent() {
+    if let Ok(current_exe) = env::current_exe()
+        && let Some(dir) = current_exe.parent() {
             let sibling = dir.join(configured);
             if sibling.is_file() {
                 return Ok(sibling);
             }
         }
-    }
 
     Ok(configured.to_path_buf())
 }
@@ -1121,8 +1117,8 @@ fn wait_for_helper_ready(
 ) -> Result<()> {
     let started = Instant::now();
     let mut next_progress = Instant::now() + Duration::from_secs(5);
-    let mut helper_stderr_offset = file_len(&progress.helper_stderr_path).unwrap_or(0);
-    let mut guest_console_offset = file_len(&progress.guest_console_path).unwrap_or(0);
+    let mut helper_stderr_offset = file_len(progress.helper_stderr_path).unwrap_or(0);
+    let mut guest_console_offset = file_len(progress.guest_console_path).unwrap_or(0);
     let mut bootstrap_log_offset = 0;
     loop {
         if let Some(status) = child
@@ -1315,6 +1311,12 @@ where
     ))
 }
 
+// Pick a free loopback port by binding ephemeral, reading the assigned port,
+// then dropping the listener so the guest helper can bind it. This has an
+// inherent TOCTOU window — another process could claim the port between the
+// drop and the guest's re-bind — but this path is the dev-only TCP-loopback
+// transport (vsock is used in production), so the race is tolerated rather than
+// closed with a handoff of the bound socket across the VM boundary.
 fn reserve_loopback_addr() -> Result<SocketAddr> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|source| {
         backend_error(format!("failed to reserve guest dispatch port: {source}"))
@@ -1342,21 +1344,16 @@ fn wait_for_guest(addr: &SocketAddr, timeout: Duration) -> Result<()> {
 }
 
 fn terminate_process(pid: u32) -> Result<()> {
-    let status = Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .status()
-        .map_err(|source| {
-            backend_error(format!(
-                "failed to invoke kill for guest process {pid}: {source}"
-            ))
-        })?;
-
-    if status.success() {
+    // Signal directly via libc rather than spawning /bin/kill: teardown should
+    // not depend on PATH or pay for a process launch. SAFETY: kill(2) takes a
+    // pid and signal number and has no memory-safety preconditions.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if rc == 0 {
         Ok(())
     } else {
         Err(backend_error(format!(
-            "failed to terminate guest process {pid}: kill exited with {status}"
+            "failed to terminate guest process {pid}: {}",
+            std::io::Error::last_os_error()
         )))
     }
 }
