@@ -33,6 +33,19 @@ impl LayerId {
         }
         s
     }
+
+    /// Parse a 64-char lowercase/uppercase hex string into a `LayerId`.
+    /// Returns `None` if the string is not exactly 32 hex-encoded bytes.
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        if hex.len() != 64 {
+            return None;
+        }
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+        }
+        Some(LayerId(bytes))
+    }
 }
 
 impl fmt::Display for LayerId {

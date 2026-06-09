@@ -532,9 +532,15 @@ The helper selects the boot disk via `--disk <path>` (local image) **or**
   semantics are fully verified above.)*
 
 ### Milestone 5 — Performance and cleanup
-- Measure boot time and an image-build workload vs. raw disk attachment.
-- Add cache cleanup and layer reference tracking.
-- Document when APFS clone-based local copies beat NBD layering (§13).
+- [x] Measure boot time vs. raw disk attachment
+  (`cargo run -p petri-nbd --example nbd_vs_raw_bench`). Result: NBD boot tracks
+  direct-disk boot within ±2% (noise); see §13.
+- [x] Add cache cleanup and layer reference tracking (`LayerStore`:
+  content-addressed dedupe + reachability GC over parent edges, unit-tested).
+- [x] Document when APFS clone-based local copies beat NBD layering (§13).
+- [ ] Measure a write-heavy image-build workload. *(Deferred: needs a working
+  guest agent to drive a build inside the VM; the benchmark so far covers the
+  read-dominated boot path.)*
 
 ---
 
@@ -571,13 +577,28 @@ against the simpler alternative: `clonefile()` / APFS copy-on-write clones of
 | Runtime cost | Native block device, no server | NBD hop + server process per run |
 | Platform reach | macOS/APFS only | NBD is portable to other backends |
 
-The honest read: for a **single flat base with no composition**, an APFS clone is
-simpler and faster at runtime, and Petri should keep using direct disk
-attachment there. `petri-nbd` earns its place when there is **real layer
-composition** (shared toolchain/runtime layers, sealed snapshots reused across
-many agents) or a need for a portable, content-addressed distribution story.
-Milestone 5 measures the runtime cost so this tradeoff is quantified, not
-asserted.
+**Measured (Milestone 5).** `nbd_vs_raw_bench` booted the 8 GiB base image to
+`login:` five times in each mode on this host (macOS 26.5, Apple silicon):
+
+| Mode | Per-run setup | Boot to `login:` |
+|---|---|---|
+| Raw, APFS clone (`cp -c`) | ~10–17 ms | ~3.64–3.75 s |
+| NBD layered (base + fresh scratch) | ~0–1 ms | ~3.63–3.73 s |
+
+NBD boot tracks direct-disk boot **within ±2% — i.e. within run-to-run noise** —
+for this read-dominated boot workload, and its per-run setup is actually *cheaper*
+than an APFS clone (no file copy at all: open the shared base, create an empty
+scratch, bind a socket). The NBD hop did not show up as boot-time overhead here.
+
+The honest read: even though the runtime cost is negligible, for a **single flat
+base with no composition** an APFS clone is operationally simpler (no server
+process, native block device) and Petri can keep using direct disk attachment
+there. `petri-nbd` earns its place when there is **real layer composition**
+(shared toolchain/runtime layers, sealed snapshots reused across many agents) or
+a need for a portable, content-addressed distribution story — and the benchmark
+shows it pays no measurable boot-time penalty for that capability. A write-heavy
+image-build comparison (where the NBD write path and scratch are stressed) is
+still outstanding and is the next number worth gathering.
 
 ---
 
