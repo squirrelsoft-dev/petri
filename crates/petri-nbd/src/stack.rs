@@ -7,8 +7,9 @@
 //! overlay — lower layers are never mutated.
 
 use std::io::{self, Error, ErrorKind};
+use std::path::Path;
 
-use crate::layer::{ImmutableLayer, ScratchLayer};
+use crate::layer::{ImmutableLayer, LayerId, ScratchLayer};
 
 /// Virtual disk geometry shared by every layer in a stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +225,12 @@ impl LayeredDisk {
     /// Make prior scratch writes durable.
     pub fn flush(&mut self) -> io::Result<()> {
         self.scratch.flush()
+    }
+
+    /// Seal this stack's scratch overlay into an immutable layer under `dir`
+    /// (design §9 step 7). The scratch remains usable afterward.
+    pub fn seal_scratch(&self, dir: &Path, parents: &[LayerId]) -> io::Result<ImmutableLayer> {
+        self.scratch.seal(dir, parents)
     }
 }
 

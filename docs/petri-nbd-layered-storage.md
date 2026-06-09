@@ -510,13 +510,10 @@ The helper selects the boot disk via `--disk <path>` (local image) **or**
   `scratch.data` while the 8 GiB `root.img` stayed byte-for-byte unchanged.
 - [x] Record which NBD URI form AVF accepted and which entitlements were
   required (§10).
-- [ ] Reboot with the same scratch -> persistence. *(Deferred: needs scratch
-  index persistence — currently in-memory, see §7 — or sealing from M4, plus a
-  controlled in-guest write. Within one server process the same `LayeredDisk`
-  already persists writes across a guest reboot.)*
-- [ ] Reboot with fresh scratch -> clean base. *(Deferred with the above; a fresh
-  `ScratchLayer` trivially yields a clean base, but the end-to-end VM assertion
-  is pending controlled in-guest markers via a working guest agent.)*
+- [x] Reboot with the same scratch -> persistence. *(`nbd_inguest_verify`: a
+  guest-written marker on the rootfs survives a reboot on the same scratch.)*
+- [x] Reboot with fresh scratch -> clean base. *(`nbd_inguest_verify`: the
+  marker is absent on a fresh scratch.)*
 
 ### Milestone 4 — Seal snapshot
 - [x] Add sealing (`ScratchLayer::seal`) to convert a writable overlay into an
@@ -526,10 +523,10 @@ The helper selects the boot disk via `--disk <path>` (local image) **or**
   identical content and changes with content or parents (unit-tested).
 - [x] Compose `base + sealed + fresh scratch` and verify sealed blocks shadow the
   base while fresh scratch starts empty (unit-tested at the block level).
-- [ ] Boot a VM from `base + sealed + fresh scratch` and verify sealed changes
-  are visible in-guest. *(Deferred with the M3 in-guest assertions — needs a
-  working guest agent for controlled markers; the block-level seal/compose
-  semantics are fully verified above.)*
+- [x] Boot a VM from `base + sealed + fresh scratch` and verify sealed changes
+  are visible in-guest. *(`nbd_inguest_verify`: a marker written by the VM, then
+  sealed via `seal_scratch`, is read back by a later VM booted from
+  `base + sealed + fresh scratch`.)*
 
 ### Milestone 5 — Performance and cleanup
 - [x] Measure boot time vs. raw disk attachment
@@ -609,8 +606,8 @@ still outstanding and is the next number worth gathering.
   NBD. *(M3 smoke test — booted to userspace off the NBD root.)*
 - [x] Guest writes are isolated to scratch. *(M3 — writes appended to scratch,
   base `root.img` byte-unchanged.)*
-- [~] A scratch overlay can be discarded for a clean run. *(Mechanism exists — a
-  fresh `ScratchLayer` per run; full reboot assertion deferred, see M3.)*
+- [x] A scratch overlay can be discarded for a clean run. *(M3 in-guest test — a
+  fresh scratch yields a clean base with no prior marker.)*
 - [x] A scratch overlay can be sealed and reused as a read-only (immutable) layer.
   *(M4 — `seal()` → packed content-addressed layer, `open_sealed()` reload,
   composed under a fresh scratch; verified at the block level.)*

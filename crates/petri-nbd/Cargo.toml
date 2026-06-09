@@ -9,3 +9,8 @@ license = "MIT"
 # SHA-256 for content-addressed layer identity (§8.1), matching Petri's
 # existing SHA256SUMS image-integrity convention.
 sha2 = "0.10"
+
+[dev-dependencies]
+# Used only by the in-guest verification example to build dispatch frames and
+# parse guest results over the petri-vz control socket.
+serde_json = "1.0"

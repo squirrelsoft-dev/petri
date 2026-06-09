@@ -9,12 +9,13 @@
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::layer::{ImmutableLayer, LayerId};
 use crate::protocol::*;
 use crate::stack::LayeredDisk;
 
@@ -60,6 +61,7 @@ impl NbdServer {
     /// Bind the endpoint and start serving `disk` until [`NbdHandle::shutdown`].
     pub fn serve(disk: LayeredDisk, opts: ServeOpts) -> io::Result<NbdHandle> {
         let disk = Arc::new(Mutex::new(disk));
+        let disk_handle = disk.clone();
         let running = Arc::new(AtomicBool::new(true));
         let export_name = Arc::new(opts.export_name);
         let read_only = opts.read_only;
@@ -71,7 +73,7 @@ impl NbdServer {
                 let bound = listener.local_addr()?;
                 let url = format!("nbd://127.0.0.1:{}/{}", bound.port(), export_name);
                 let accept = spawn_tcp_accept(listener, disk, running.clone(), export_name, read_only);
-                Ok(NbdHandle { url, running, accept: Some(accept), unix_path: None })
+                Ok(NbdHandle { url, running, accept: Some(accept), unix_path: None, disk: disk_handle })
             }
             BindMode::UnixSocket(path) => {
                 let _ = std::fs::remove_file(&path);
@@ -81,7 +83,7 @@ impl NbdServer {
                 // param (https://github.com/NetworkBlockDevice/nbd .../uri.md).
                 let url = format!("nbd+unix:///{}?socket={}", export_name, path.display());
                 let accept = spawn_unix_accept(listener, disk, running.clone(), export_name, read_only);
-                Ok(NbdHandle { url, running, accept: Some(accept), unix_path: Some(path) })
+                Ok(NbdHandle { url, running, accept: Some(accept), unix_path: Some(path), disk: disk_handle })
             }
         }
     }
@@ -93,12 +95,21 @@ pub struct NbdHandle {
     running: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
     unix_path: Option<PathBuf>,
+    disk: Arc<Mutex<LayeredDisk>>,
 }
 
 impl NbdHandle {
     /// The URL a client (or the AVF helper) uses to attach this export.
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Seal the served stack's scratch overlay into an immutable layer under
+    /// `dir`, without interrupting the export (the scratch stays live). Use
+    /// after the guest has quiesced its writes (e.g. VM stopped) for a
+    /// consistent snapshot.
+    pub fn seal_scratch(&self, dir: &Path, parents: &[LayerId]) -> io::Result<ImmutableLayer> {
+        self.disk.lock().expect("disk mutex poisoned").seal_scratch(dir, parents)
     }
 
     /// Stop accepting connections and join the accept loop.

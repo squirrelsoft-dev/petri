@@ -242,7 +242,11 @@ impl ScratchLayer {
     /// computed over the canonical content (§8.1), and `layer.meta` is written
     /// and fsync'd. `parents` records the immutable layers this overlay sat on
     /// top of, bottom-first.
-    pub fn seal(self, dir: &Path, parents: &[LayerId]) -> io::Result<ImmutableLayer> {
+    ///
+    /// Takes `&self` (a read-only snapshot of the live overlay): the scratch
+    /// remains usable afterward, so an overlay can be sealed without tearing
+    /// down the stack that is currently serving it.
+    pub fn seal(&self, dir: &Path, parents: &[LayerId]) -> io::Result<ImmutableLayer> {
         fs::create_dir_all(dir)?;
         let bs = self.geometry.block_size as usize;
         let data_path = dir.join("layer.data");
