@@ -1,5 +1,5 @@
 # PROJECT STATE
-_Last updated: 2026-06-08 by /close_
+_Last updated: 2026-06-08 by /close (SDK metadata persistence follow-up)_
 
 ## Current State
 Petri is an early-stage microVM sandbox for running untrusted agent
@@ -65,9 +65,14 @@ documented language-agnostic contract (`docs/sdk-api.md`) plus a Rust reference
 implementation (`crates/petri/src/sdk.rs`): a `Sandbox` over `HostBackend` with
 `create`/`connect`/`list`/`kill` and a `commands().run()` returning a typed
 `CommandResult`, exercised by unit tests against an in-memory fake backend.
-`files`/`git`/`pty` are named and reserved but unimplemented in v1. Still
-missing for the breadth phase: an automated host↔guest dispatch test (#14) and
-generated first-party client packages (#26).
+`files`/`git`/`pty` are named and reserved but unimplemented in v1. SDK/CLI
+`metadata` is now fully wired through (follow-up to #27/#29, done): it is
+persisted into `instance.json` (`RuntimeState`/`InstanceConfig`/`InstanceHandle`
+all carry it), surfaced on listed handles, rehydrated on `Sandbox::connect`, and
+filterable via `sandbox list --metadata` (and a new `sandbox create --metadata`
+flag) instead of the old behavior where any `--metadata` filter cleared the
+result set. Still missing for the breadth phase: an automated host↔guest
+dispatch test (#14) and generated first-party client packages (#26).
 
 Only the macOS/Apple Virtualization backend exists. Known incomplete /
 broken: guest cancellation is unimplemented. Operational flake: `petri sandbox create` intermittently
@@ -132,10 +137,9 @@ residual `sandbox create` boot hang to re-diagnose if it recurs.
    intentionally deferred per the issue bodies: `sandbox connect` is a
    non-interactive readiness check (no PTY attach), `exec --background`/`--user`
    error as not-yet-implemented, and the SDK `files`/`git`/`pty` modules plus
-   `setTimeout`/`setPolicy`/snapshots are named but unimplemented. SDK
-   `metadata` is accepted but not persisted/filtered by the local backend
-   (reserved for the remote control plane), so `sandbox list --metadata`
-   currently returns empty rather than filtering.
+   `setTimeout`/`setPolicy`/snapshots are named but unimplemented. (The SDK
+   `metadata` gap noted here previously is now closed — see Current State; it is
+   persisted and filterable.)
 
 ## Next Actions
 Protocol contract (#24) is enforced and the SDK/CLI shape (#27/#29) now sits on
@@ -154,6 +158,3 @@ generated clients yet beyond the Rust reference.
 4. Re-diagnose the `sandbox create` hang if it recurs. Historical links
    (#32/#33) are all fixed, so it can no longer be attributed to them; needs a
    fresh root-cause pass (likely in the Swift helper boot/ready path).
-5. Optional follow-up to #27/#29: wire SDK `metadata` through to backend
-   persistence so `sandbox list --metadata` filters instead of returning empty
-   (currently reserved; see Known Deviation 8).
