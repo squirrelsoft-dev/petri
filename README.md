@@ -147,6 +147,8 @@ For programmatic use, the same lifecycle and command surface is exposed as an
 E2B-style `Sandbox` SDK. See the [Sandbox SDK API](docs/sdk-api.md) for the
 language-agnostic contract (Rust, TypeScript, Python, Go) and
 [Protocol Schema](docs/protocol-schema.md) for the underlying wire contract.
+For embedding Petri as a tool-execution backend (e.g. in spore-core), see the
+[spore-core Integration Contract](docs/spore-core-integration.md).
 
 ---
 

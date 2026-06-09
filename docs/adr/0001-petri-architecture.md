@@ -140,6 +140,8 @@ The integration boundary is intentionally small:
 
 spore-core should not depend on a specific VM backend, guest OS, image format, snapshot format, or process-launch implementation. Petri owns those details behind its sandbox provider boundary.
 
+The full provider contract — Petri discovery and startup, session lifecycle, tool dispatch mapping, result mapping, error classes, and failure-recovery expectations — is specified in [spore-core Integration Contract](../spore-core-integration.md) (issue #15).
+
 ## Consequences
 
 This architecture keeps Petri's public contract small and portable. It lets platform backends evolve independently while requiring them to preserve the same lifecycle, workspace, policy, and dispatch semantics.
