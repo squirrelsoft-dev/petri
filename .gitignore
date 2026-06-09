@@ -1,6 +1,12 @@
 # Rust
 /target/
 
+# Client build artifacts
+/clients/typescript/node_modules/
+/clients/typescript/dist/
+__pycache__/
+*.pyc
+
 # SwiftPM
 /crates/petri-vz/.build/
 

@@ -2,9 +2,14 @@
 
 This is the language-agnostic contract for Petri's high-level sandbox SDK
 (issue #27). It models an E2B-style `Sandbox` object so users do not hand-roll
-the wire protocol. The contract is designed to be implemented consistently in
-Rust, TypeScript, Python, and Go; the Rust implementation in
+the wire protocol. The contract is implemented consistently in Rust,
+TypeScript, Python, and Go; the Rust implementation in
 [`crates/petri/src/sdk.rs`](../crates/petri/src/sdk.rs) is the reference.
+
+First-party client packages live under [`clients/`](../clients) (issue #26):
+the TypeScript, Python, and Go clients are thin wrappers over the `petri` CLI
+that expose this same surface — see [`clients/README.md`](../clients/README.md)
+for the transport and CLI-mapping details.
 
 All SDK calls ultimately produce protocol frames defined by the shared schema
 in [`schema/petri-protocol-v1.schema.json`](../schema/petri-protocol-v1.schema.json)
