@@ -302,9 +302,34 @@ Milestone 2 chooses between:
   device trait identical to `LayeredDisk` and avoids an external dependency's
   threading model.
 
-The decision is recorded as a short ADR or a note in this doc once Milestone 2
-spikes both. The `protocol.rs` / `server.rs` split exists so the backend choice
-does not leak into composition (`stack.rs`).
+The `protocol.rs` / `server.rs` split exists so the backend choice does not leak
+into composition (`stack.rs`).
+
+### 6.2 Decision (Milestone 2): minimal in-tree synchronous server
+
+**Chosen: a minimal in-tree NBD server.** Rationale from the crate survey:
+
+- The one actively-maintained Rust NBD *server* framework, `tokio-nbd`, is
+  async-only. This workspace **deliberately avoids tokio** — `petri-guest`
+  documents "std without tokio" and there is no tokio anywhere in `Cargo.lock`.
+  Pulling in a full async runtime for one localhost block server contradicts the
+  project's lean, synchronous-std posture.
+- The remaining synchronous crate (`nbd` / vi's `rust-nbd`) is old, explicitly
+  server-incomplete, and models a device as a single `Read + Write + Seek`
+  object — which does not map cleanly onto our per-block layered device or its
+  flush/trim semantics.
+- The protocol surface we actually need is small: the fixed-newstyle handshake
+  (`NBD_OPT_EXPORT_NAME` and `NBD_OPT_GO`) plus the simple-reply transmission
+  commands `READ` / `WRITE` / `FLUSH` / `DISC`, with optional `WRITE_ZEROES` /
+  `TRIM`. An in-tree server keeps the device interface identical to
+  `LayeredDisk`, advertises exactly the commands we implement (important for the
+  Milestone 3 AVF experiment), and adds zero dependencies.
+
+The server is **thread-per-connection, blocking IO** (`std::net` + `std::thread`),
+consistent with the rest of the host. The composed disk is shared behind a
+`Mutex`; writes serialize against reads, which is correct for a single-client
+block export. If profiling later shows the global lock is a bottleneck, the lock
+can be narrowed without changing the protocol layer.
 
 ---
 

@@ -11,7 +11,10 @@
 //! (`server`/`protocol`) and sealing/store (`store`) land in later milestones.
 
 mod layer;
+mod protocol;
+mod server;
 mod stack;
 
 pub use layer::{ImmutableLayer, ScratchLayer};
+pub use server::{BindMode, NbdHandle, NbdServer, ServeOpts};
 pub use stack::{Geometry, LayeredDisk};
