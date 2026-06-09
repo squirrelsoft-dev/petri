@@ -1,5 +1,5 @@
 # PROJECT STATE
-_Last updated: 2026-06-08 by /close (#26 first-party clients complete)_
+_Last updated: 2026-06-09 by /close (#15 spore-core integration contract complete)_
 
 ## Current State
 Petri is an early-stage microVM sandbox for running untrusted agent
@@ -95,6 +95,20 @@ caps the buffer it allocates from an untrusted LSP `Content-Length`; the dead
 Builds clean, all tests pass; the env change is covered by a new in-process unit
 test (the VM-backed e2e test was not re-run).
 
+The spore-core consumption boundary now has a published contract (#15, done,
+`cf0e257`): `docs/spore-core-integration.md` specifies the `PetriSandboxProvider`
+boundary end-to-end — Petri discovery/startup (binary resolution, host
+preconditions, the create boot-hang backstop), session lifecycle + state mapping
+(ready/busy/dead, one-in-flight-dispatch serialization), tool dispatch mapping
+(`commands.run`/`bash_command`, clean-env per #35, workspace/`cwd`), result
+mapping (the load-bearing rule that non-zero exit is *not* an integration error),
+the three error classes + typed-error family, and failure-recovery expectations
+(Petri's #32/#33 guarantees vs. provider retry/teardown/orphan-reaping
+obligations). It mandates building the provider on a first-party client (#26) so
+the future HTTP control plane swaps underneath unchanged. Documentation-only
+deliverable; the actual provider implementation lives in the spore-core repo
+(out of scope here). Linked from ADR 0001 and README.
+
 First-party client packages now exist for all four languages (#26, done,
 `5f16cf8`): the Rust reference (`crates/petri/src/sdk.rs`) plus thin
 TypeScript/Python/Go clients under `clients/`, each exposing the same
@@ -130,12 +144,16 @@ scaling), so the host↔guest dispatch path is hardened and the path is clear
 to broaden surface. The shared protocol schema (#24) is now published and
 enforced, so the breadth phase has its contract, and the E2B-style CLI/SDK
 shape (#27/#29) now sits on top of it, the hardened dispatch path is locked by
-an automated real-VM end-to-end test (#14), and first-party clients for all four
-languages now ship (#26). The breadth phase is effectively complete: the surface
-is contracted, implemented, and client-accessible. The focus now shifts to
-**consumption** — wiring these clients into spore-core via the provider
-integration contract (#15) — with the residual `sandbox create` boot hang to
-re-diagnose if it recurs.
+an automated real-VM end-to-end test (#14), first-party clients for all four
+languages ship (#26), and the spore-core consumption boundary is now a published
+contract (#15). The breadth + contract phase is complete: the surface is
+contracted, implemented, client-accessible, and the integration boundary is
+specified. Consumption proper — implementing the `PetriSandboxProvider` against
+this contract — now proceeds in the **spore-core repo** (out of scope here). The
+levers remaining in *this* repo are reliability (re-diagnose the `sandbox create`
+boot hang if it recurs; optionally guard #14 in macOS CI) and breadth of backends
+toward the multi-platform north star (Linux Firecracker #16, then Windows
+Hyper-V #18).
 
 ## Known Deviations
 1. #31 was resolved more strongly than its `documentation` label implied:
@@ -205,21 +223,27 @@ re-diagnose if it recurs.
    criterion is satisfied in principle but the actual wiring is #15.
 
 ## Next Actions
-Breadth phase is effectively complete: protocol contract (#24) enforced, SDK/CLI
-shape (#27/#29) on top, dispatch locked by a real-VM e2e test (#14), and
-first-party clients for all four languages shipped (#26). The lever now is
-**consumption** — putting the clients to use in spore-core.
-1. #15 — define (and stand up) the spore-core sandbox provider integration
-   contract, now that blessed clients exist to back it. Top priority: it is the
-   path that makes #26's "providers use these clients rather than hand-rolled
-   protocol code" real, and the first external consumer that will pressure-test
-   the SDK surface.
+Breadth + contract phase is complete: protocol contract (#24) enforced, SDK/CLI
+shape (#27/#29) on top, dispatch locked by a real-VM e2e test (#14), first-party
+clients shipped (#26), and the spore-core integration contract published (#15).
+Consumption proper (the `PetriSandboxProvider`) now happens in the spore-core
+repo. The remaining levers here are reliability and backend breadth — pick the
+next based on whether spore-core integration surfaces a reliability blocker first.
+1. #16 — implement the Linux Firecracker/KVM backend. Highest-leverage next step
+   toward the "run on your own hardware" north star: today only the macOS/Apple
+   Virtualization backend exists, which blocks self-hosted-server use. The
+   protocol/SDK/policy contracts are all backend-agnostic now, so this is a
+   well-scoped second backend behind a settled boundary.
 2. Re-diagnose the `sandbox create` hang if it recurs. Historical links
    (#32/#33) are all fixed, so it can no longer be attributed to them; needs a
-   fresh root-cause pass (likely in the Swift helper boot/ready path).
+   fresh root-cause pass (likely in the Swift helper boot/ready path). Promote to
+   #1 if spore-core integration hits it in practice.
 3. Consider wiring #14's e2e test into a macOS CI lane (build + codesign
    `petri-vz`, build the base image, run `--ignored`) so the dispatch path is
    guarded automatically rather than only on demand.
 4. Follow-ups spun off #26 when there's demand: implement the reserved
    `files`/`git`/`pty` client operations, and publish the clients to
    npm/PyPI/the Go module proxy (they install from path today).
+5. #28 — per-instance capability tokens for command authorization. The contract
+   (#15) and protocol already reserve `capability_denied`/`AuthorizationError`;
+   this fills in the enforcement behind that reserved surface.
