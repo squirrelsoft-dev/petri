@@ -25,6 +25,7 @@ struct Args {
     var kernel: String?
     var initrd: String?
     var disk: String?
+    var nbdDisk: String?
     var auxiliaryDisks: [String] = []
     var efiVariableStore: String?
     var workspace: String?
@@ -60,6 +61,8 @@ struct Args {
                 args.initrd = try next(arg)
             case "--disk":
                 args.disk = try next(arg)
+            case "--nbd-disk":
+                args.nbdDisk = try next(arg)
             case "--auxiliary-disk":
                 args.auxiliaryDisks.append(try next(arg))
             case "--efi-variable-store":
@@ -99,7 +102,6 @@ struct Args {
         for (name, value) in [
             ("--instance-id", instanceID),
             ("--control-socket", controlSocket),
-            ("--disk", disk),
             ("--workspace", workspace),
             ("--config-dir", configDir),
             ("--console-log", consoleLog),
@@ -107,6 +109,14 @@ struct Args {
             if value?.isEmpty ?? true {
                 throw HelperError("\(name) is required")
             }
+        }
+
+        // The boot disk is supplied either as a local image (--disk) or over
+        // NBD (--nbd-disk), but exactly one of the two.
+        let hasDisk = !(disk?.isEmpty ?? true)
+        let hasNbdDisk = !(nbdDisk?.isEmpty ?? true)
+        if hasDisk == hasNbdDisk {
+            throw HelperError("exactly one of --disk or --nbd-disk is required")
         }
 
         switch bootMode {
@@ -254,6 +264,8 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
     private var state: HelperState = .starting
     private var failureMessage: String?
     private var virtualMachine: VZVirtualMachine?
+    // Retained because `VZNetworkBlockDeviceStorageDeviceAttachment.delegate` is weak.
+    private var nbdDelegate: NBDAttachmentLogger?
 
     init(args: Args) {
         self.args = args
@@ -389,7 +401,7 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
         configuration.bootLoader = try bootLoader()
 
         var storageDevices: [VZStorageDeviceConfiguration] = [
-            VZVirtioBlockDeviceConfiguration(attachment: try diskAttachment(path: args.disk!, readOnly: false))
+            VZVirtioBlockDeviceConfiguration(attachment: try bootDiskAttachment())
         ]
         for auxiliaryDisk in args.auxiliaryDisks {
             storageDevices.append(
@@ -449,6 +461,35 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
             url: URL(fileURLWithPath: path),
             readOnly: readOnly
         )
+    }
+
+    /// The read-write boot disk, attached either from a local image (`--disk`)
+    /// or over NBD (`--nbd-disk`). Writes against an NBD-backed disk are routed
+    /// by the petri-nbd server into the per-run scratch overlay.
+    private func bootDiskAttachment() throws -> VZStorageDeviceAttachment {
+        if let nbdURL = args.nbdDisk, !nbdURL.isEmpty {
+            guard let url = URL(string: nbdURL) else {
+                throw HelperError("invalid --nbd-disk URL '\(nbdURL)'")
+            }
+            do {
+                try VZNetworkBlockDeviceStorageDeviceAttachment.validate(url)
+            } catch {
+                throw HelperError("invalid NBD URL '\(nbdURL)': \(error)")
+            }
+            log("attaching NBD boot disk: \(nbdURL)")
+            let delegate = NBDAttachmentLogger()
+            self.nbdDelegate = delegate
+            let attachment = try VZNetworkBlockDeviceStorageDeviceAttachment(
+                url: url,
+                timeout: 30,
+                isForcedReadOnly: false,
+                synchronizationMode: .full
+            )
+            attachment.delegate = delegate
+            return attachment
+        }
+        log("attaching local boot disk image: \(args.disk!)")
+        return try diskAttachment(path: args.disk!, readOnly: false)
     }
 
     private func networkDevice() -> VZVirtioNetworkDeviceConfiguration {
@@ -624,6 +665,18 @@ final class ControlServer {
     private func writeResponse(_ response: HelperResponse, fd: Int32) throws {
         let data = try encoder.encode(response) + Data([0x0A])
         try writeAll(fd: fd, data: data)
+    }
+}
+
+/// Logs NBD attachment connect/error transitions so the smoke test can see
+/// whether Apple's NBD client successfully reached the petri-nbd server.
+final class NBDAttachmentLogger: NSObject, VZNetworkBlockDeviceStorageDeviceAttachmentDelegate {
+    func attachmentWasConnected(_ attachment: VZNetworkBlockDeviceStorageDeviceAttachment) {
+        log("NBD client connected to server at \(attachment.url)")
+    }
+
+    func attachment(_ attachment: VZNetworkBlockDeviceStorageDeviceAttachment, didEncounterError error: Error) {
+        log("NBD client non-recoverable error for \(attachment.url): \(error)")
     }
 }
 

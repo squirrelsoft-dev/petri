@@ -446,22 +446,31 @@ Expected helper input (exact CLI/JSON schema TBD, modeled on current flags):
 }
 ```
 
-Constraints:
+Constraints (all confirmed in Milestone 3):
 
-- **Verify the accepted URI forms first.** Do not assume a Unix socket path is
-  valid for `VZNetworkBlockDeviceStorageDeviceAttachment` on the target macOS
-  versions. The `BindMode` enum in §5 exists so the server can offer loopback
-  TCP and/or a Unix socket and the helper can use whichever AVF accepts. This is
-  resolved empirically in Milestone 3 (§9, §11) and recorded in §12.
-- **Entitlements.** The helper currently holds only
-  `com.apple.security.virtualization` (`crates/petri-vz/petri-vz.entitlements`).
-  An NBD client over the network attachment will likely also need
-  `com.apple.security.network.client`. Add it when the smoke test requires it,
-  not speculatively.
-- **VM-queue discipline.** All `VZVirtualMachine` and socket interactions must
-  happen on the VM queue (currently the main queue), consistent with the
-  existing helper. The NBD attachment is configured during VM configuration on
-  that queue like every other device.
+- **Accepted URI form.** The SDK header
+  (`VZNetworkBlockDeviceStorageDeviceAttachment.h`, macOS 14.0+) documents a
+  standard NBD URI — its own example is `nbd://localhost:10809/myDisk`. The
+  smoke test booted successfully against `nbd://127.0.0.1:<port>/petri`, so the
+  loopback-TCP `BindMode` is proven. The Unix-socket form per the NBD URI spec is
+  `nbd+unix:///<export>?socket=<path>` (the server now emits exactly this); it is
+  not yet exercised end-to-end. The designated initializer is
+  `init(url:timeout:isForcedReadOnly:synchronizationMode:)`; the client connects
+  on VM **start** (not at init) and transparently reconnects on recoverable
+  errors, so the server must keep accepting connections for the VM's lifetime.
+- **Entitlements — required.** `com.apple.security.network.client` **is**
+  required (the attachment opens an outgoing network connection) in addition to
+  `com.apple.security.virtualization`. Both are now in
+  `crates/petri-vz/petri-vz.entitlements`; without the network entitlement the
+  NBD client cannot connect.
+- **VM-queue discipline.** All `VZVirtualMachine` and socket interactions happen
+  on the VM queue (main queue), consistent with the existing helper. The NBD
+  attachment is configured during VM configuration on that queue like every
+  other device. A small delegate (`NBDAttachmentLogger`) logs connect/error
+  transitions for diagnostics.
+
+The helper selects the boot disk via `--disk <path>` (local image) **or**
+`--nbd-disk <url>` (NBD), exactly one of the two.
 
 ---
 
@@ -481,12 +490,22 @@ Constraints:
 - Integration tests with an NBD client where available.
 
 ### Milestone 3 — AVF boot smoke test
-- Extend `petri-vz` to attach `VZNetworkBlockDeviceStorageDeviceAttachment`.
-- Boot an existing raw Petri image via NBD with a scratch overlay.
-- Confirm guest writes land in scratch, not base.
-- Reboot with the same scratch -> persistence.
-- Reboot with fresh scratch -> clean base.
-- Record which NBD URI form AVF accepted and which entitlements were required.
+- [x] Extend `petri-vz` to attach `VZNetworkBlockDeviceStorageDeviceAttachment`
+  (`--nbd-disk`), add the `network.client` entitlement.
+- [x] Boot an existing raw Petri image via NBD with a scratch overlay
+  (`cargo run -p petri-nbd --example nbd_boot_smoke`). The guest booted to
+  userspace (ext4 mount, systemd, login) off the NBD root.
+- [x] Confirm guest writes land in scratch, not base — ~15 MiB landed in
+  `scratch.data` while the 8 GiB `root.img` stayed byte-for-byte unchanged.
+- [x] Record which NBD URI form AVF accepted and which entitlements were
+  required (§10).
+- [ ] Reboot with the same scratch -> persistence. *(Deferred: needs scratch
+  index persistence — currently in-memory, see §7 — or sealing from M4, plus a
+  controlled in-guest write. Within one server process the same `LayeredDisk`
+  already persists writes across a guest reboot.)*
+- [ ] Reboot with fresh scratch -> clean base. *(Deferred with the above; a fresh
+  `ScratchLayer` trivially yields a clean base, but the end-to-end VM assertion
+  is pending controlled in-guest markers via a working guest agent.)*
 
 ### Milestone 4 — Seal snapshot
 - Add `seal_scratch()` to convert a writable overlay into an immutable layer.
@@ -507,7 +526,7 @@ relevant section above.
 
 | # | Question | Resolved in |
 |---|---|---|
-| 1 | Which NBD URI forms does `VZNetworkBlockDeviceStorageDeviceAttachment` accept on target macOS? | Milestone 3 (§10) |
+| 1 | Which NBD URI forms does `VZNetworkBlockDeviceStorageDeviceAttachment` accept on target macOS? | **Resolved**: `nbd://host:port/export` works (M3, §10); `nbd+unix:///export?socket=path` is the spec'd Unix form, not yet exercised |
 | 2 | Fixed-size blocks, variable extents, or both? | v0 fixed (§3.3); revisit Milestone 5 |
 | 3 | v0 block size: 4 KiB, 64 KiB, or NBD-request-aligned? | v0 64 KiB (§3.3); revisit Milestone 5 |
 | 4 | Immutable layers: sparse files, packed blobs, or content-addressed chunks? | v0 packed blob seal + sparse base (§4.2); chunks later (§10/§13) |
@@ -546,8 +565,11 @@ asserted.
 ## 14. Acceptance criteria (issue #22)
 
 - [x] A design document exists for local NBD layered disks. *(this document)*
-- [ ] A prototype boots a Petri VM from `base raw + scratch overlay` through AVF NBD.
-- [ ] Guest writes are isolated to scratch.
-- [ ] A scratch overlay can be discarded for a clean run.
-- [ ] A scratch overlay can be sealed and reused as a read-only top layer.
-- [ ] Tradeoffs vs. APFS clones are documented before expanding into registry support. *(§13)*
+- [x] A prototype boots a Petri VM from `base raw + scratch overlay` through AVF
+  NBD. *(M3 smoke test — booted to userspace off the NBD root.)*
+- [x] Guest writes are isolated to scratch. *(M3 — writes appended to scratch,
+  base `root.img` byte-unchanged.)*
+- [~] A scratch overlay can be discarded for a clean run. *(Mechanism exists — a
+  fresh `ScratchLayer` per run; full reboot assertion deferred, see M3.)*
+- [ ] A scratch overlay can be sealed and reused as a read-only top layer. *(M4.)*
+- [x] Tradeoffs vs. APFS clones are documented before expanding into registry support. *(§13)*

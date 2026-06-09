@@ -77,7 +77,9 @@ impl NbdServer {
                 let _ = std::fs::remove_file(&path);
                 let listener = UnixListener::bind(&path)?;
                 listener.set_nonblocking(true)?;
-                let url = format!("nbd+unix:///{}?export={}", path.display(), export_name);
+                // Canonical NBD URI form: export in the path, socket as a query
+                // param (https://github.com/NetworkBlockDevice/nbd .../uri.md).
+                let url = format!("nbd+unix:///{}?socket={}", export_name, path.display());
                 let accept = spawn_unix_accept(listener, disk, running.clone(), export_name, read_only);
                 Ok(NbdHandle { url, running, accept: Some(accept), unix_path: Some(path) })
             }
