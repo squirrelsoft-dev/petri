@@ -1,5 +1,5 @@
 # PROJECT STATE
-_Last updated: 2026-06-08 by /close (SDK metadata persistence follow-up)_
+_Last updated: 2026-06-08 by /close (#14 end-to-end dispatch test complete)_
 
 ## Current State
 Petri is an early-stage microVM sandbox for running untrusted agent
@@ -71,8 +71,20 @@ persisted into `instance.json` (`RuntimeState`/`InstanceConfig`/`InstanceHandle`
 all carry it), surfaced on listed handles, rehydrated on `Sandbox::connect`, and
 filterable via `sandbox list --metadata` (and a new `sandbox create --metadata`
 flag) instead of the old behavior where any `--metadata` filter cleared the
-result set. Still missing for the breadth phase: an automated host↔guest
-dispatch test (#14) and generated first-party client packages (#26).
+result set.
+
+The hardened dispatch path now has an automated guard (#14, done, `f5dcd24`):
+`crates/petri/tests/e2e_dispatch.rs` boots a real microVM through the public SDK
+(`Sandbox`/`MacosBackend`) and asserts the full round trip — a command's stdout
+returns over vsock, a host-seeded workspace file is read from the guest, a
+guest-written file is observed on the host, and the default `network_enabled =
+false` policy leaves only loopback attached (`ls /sys/class/net` == `lo`). A
+`VmGuard` Drop guard tears the VM down even on a failed assertion. Following the
+`lsp_real_server.rs` convention it is `#[ignore]`d and skips gracefully when
+prerequisites are absent (macOS, a codesigned `petri-vz`, a built base image
+bundle), so plain `cargo test` stays green everywhere. VM-verified: passes
+against a real VM in ~2.2s. Still missing for the breadth phase: generated
+first-party client packages (#26).
 
 Only the macOS/Apple Virtualization backend exists. Known incomplete /
 broken: guest cancellation is unimplemented. Operational flake: `petri sandbox create` intermittently
@@ -92,10 +104,10 @@ Near-term focus: all three named dispatch-reliability bugs are now done
 scaling), so the host↔guest dispatch path is hardened and the path is clear
 to broaden surface. The shared protocol schema (#24) is now published and
 enforced, so the breadth phase has its contract, and the E2B-style CLI/SDK
-shape (#27/#29) now sits on top of it. Remaining breadth work: an automated
-host↔guest dispatch test (#14) to lock the hardened path, and first-party
-client packages (#26) generated off the schema for TS/Python/Go — with the
-residual `sandbox create` boot hang to re-diagnose if it recurs.
+shape (#27/#29) now sits on top of it. The hardened dispatch path is now locked
+by an automated real-VM end-to-end test (#14). Remaining breadth work:
+first-party client packages (#26) generated off the schema for TS/Python/Go —
+with the residual `sandbox create` boot hang to re-diagnose if it recurs.
 
 ## Known Deviations
 1. #31 was resolved more strongly than its `documentation` label implied:
@@ -140,21 +152,27 @@ residual `sandbox create` boot hang to re-diagnose if it recurs.
    `setTimeout`/`setPolicy`/snapshots are named but unimplemented. (The SDK
    `metadata` gap noted here previously is now closed — see Current State; it is
    persisted and filterable.)
+9. #14's e2e test requires two host-setup steps that are easy to miss and are
+   documented in the test header: (a) the `petri-vz` helper must be codesigned
+   with `crates/petri-vz/petri-vz.entitlements` — an unsigned helper is rejected
+   at VM-config time with a "com.apple.security.virtualization entitlement"
+   error; (b) the macOS ~104-byte Unix-socket path cap means the backend's
+   control socket (`<state_dir>/<id>/petri-vz.sock`) overflows under long temp
+   paths, so the test uses a short `/tmp` base dir and short instance id. Both
+   are test/runtime concerns only; neither changes product code.
 
 ## Next Actions
-Protocol contract (#24) is enforced and the SDK/CLI shape (#27/#29) now sits on
-it. The dispatch path still needs an automated guard, and the SDK has no
-generated clients yet beyond the Rust reference.
-1. #14 — add an end-to-end host-to-guest dispatch test. Top priority: the
-   dispatch path is hardened (#32/#33/#34) and the protocol contract is enforced
-   at the schema level (#24), but the round trip is still only manually
-   VM-verified — and the SDK now builds on it, raising the cost of a regression.
-   Lock it in with an automated test.
-2. #26 — first-party client packages (TS/Python/Go) generated off the schema,
-   matching the `docs/sdk-api.md` contract the Rust SDK already implements. The
-   deferred half of #24; now unblocked by both the enforced schema and the
-   published SDK shape.
-3. #35 — low-severity code-review cleanups (polish; batch opportunistically).
-4. Re-diagnose the `sandbox create` hang if it recurs. Historical links
+Protocol contract (#24) is enforced, the SDK/CLI shape (#27/#29) sits on it, and
+the hardened dispatch path is now locked by an automated real-VM e2e test (#14).
+The SDK still has no generated clients beyond the Rust reference.
+1. #26 — first-party client packages (TS/Python/Go) generated off the schema,
+   matching the `docs/sdk-api.md` contract the Rust SDK already implements. Top
+   priority: the deferred half of #24, now unblocked by the enforced schema, the
+   published SDK shape, and an e2e-verified dispatch path to validate against.
+2. #35 — low-severity code-review cleanups (polish; batch opportunistically).
+3. Re-diagnose the `sandbox create` hang if it recurs. Historical links
    (#32/#33) are all fixed, so it can no longer be attributed to them; needs a
    fresh root-cause pass (likely in the Swift helper boot/ready path).
+4. Consider wiring #14's e2e test into a macOS CI lane (build + codesign
+   `petri-vz`, build the base image, run `--ignored`) so the dispatch path is
+   guarded automatically rather than only on demand.
