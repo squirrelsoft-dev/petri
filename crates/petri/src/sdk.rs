@@ -25,8 +25,8 @@ pub const DEFAULT_BACKEND: &str = "macos";
 ///
 /// `workspace` and `policy` are required by the current local backend; the
 /// remaining fields mirror the cross-language `SandboxOpts` shape. `metadata` is
-/// accepted and carried on the returned handle, but is not yet persisted by the
-/// backend (reserved for the remote control plane).
+/// persisted with the instance and can be filtered on via
+/// `Sandbox::list`/`sandbox list --metadata`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxOptions {
     /// Explicit sandbox id. When `None`, a unique id is generated.
@@ -39,7 +39,7 @@ pub struct SandboxOptions {
     pub workspace: PathBuf,
     /// Policy file applied at boot.
     pub policy: PathBuf,
-    /// Free-form metadata. Reserved; not yet persisted by the local backend.
+    /// Free-form metadata persisted with the instance and filterable via list.
     pub metadata: BTreeMap<String, String>,
 }
 
@@ -75,7 +75,7 @@ impl SandboxOptions {
         self
     }
 
-    /// Attach metadata to the sandbox (reserved; not yet persisted).
+    /// Attach metadata to the sandbox; persisted and filterable via list.
     pub fn with_metadata(mut self, metadata: BTreeMap<String, String>) -> Self {
         self.metadata = metadata;
         self
@@ -86,7 +86,8 @@ impl SandboxOptions {
             Some(id) => InstanceId::new(id)?,
             None => InstanceId::new(generate_sandbox_id()?)?,
         };
-        let mut config = InstanceConfig::new(id, self.backend, self.workspace, self.policy);
+        let mut config = InstanceConfig::new(id, self.backend, self.workspace, self.policy)
+            .with_metadata(self.metadata);
         if let Some(image) = self.image {
             config = config.with_image(image);
         }
@@ -163,14 +164,13 @@ pub struct Sandbox<B: HostBackend> {
 impl<B: HostBackend> Sandbox<B> {
     /// Create a new sandbox from the given options and return a handle to it.
     pub fn create(backend: B, options: SandboxOptions) -> Result<Self> {
-        let metadata = options.metadata.clone();
         let config = options.into_config()?;
         let handle = backend.create(config)?;
         Ok(Self {
             backend,
             id: handle.id,
             backend_name: handle.backend,
-            metadata,
+            metadata: handle.metadata,
         })
     }
 
@@ -197,7 +197,7 @@ impl<B: HostBackend> Sandbox<B> {
             backend,
             id: handle.id,
             backend_name: handle.backend,
-            metadata: BTreeMap::new(),
+            metadata: handle.metadata,
         })
     }
 
@@ -221,7 +221,7 @@ impl<B: HostBackend> Sandbox<B> {
         &self.backend_name
     }
 
-    /// Metadata supplied at creation (reserved; not persisted by the backend).
+    /// Metadata persisted with this sandbox (empty when none was set).
     pub fn metadata(&self) -> &BTreeMap<String, String> {
         &self.metadata
     }
@@ -334,6 +334,7 @@ mod tests {
                 id: InstanceId::new("dev-1").unwrap(),
                 backend: "fake".to_string(),
                 state,
+                metadata: BTreeMap::new(),
             });
             backend
         }
@@ -357,6 +358,7 @@ mod tests {
                 id: config.id,
                 backend: config.backend,
                 state: LifecycleState::Ready,
+                metadata: config.metadata,
             };
             self.instances.borrow_mut().push(handle.clone());
             Ok(handle)
@@ -430,6 +432,27 @@ mod tests {
 
         sandbox.kill().unwrap();
         assert!(!sandbox.is_running().unwrap());
+    }
+
+    #[test]
+    fn metadata_is_persisted_through_create_and_connect() {
+        let backend = FakeBackend::default();
+        let metadata = BTreeMap::from([("env".to_string(), "prod".to_string())]);
+        let created = Sandbox::create(&backend, options().with_metadata(metadata.clone())).unwrap();
+        assert_eq!(created.metadata(), &metadata);
+
+        // The backend recorded the metadata, so a fresh connect rehydrates it.
+        let connected = Sandbox::connect(&backend, "dev-1").unwrap();
+        assert_eq!(connected.metadata(), &metadata);
+
+        // And it surfaces on the listed handle.
+        let handles = Sandbox::list(&&backend).unwrap();
+        let handle = handles.iter().find(|h| h.id.as_str() == "dev-1").unwrap();
+        assert_eq!(handle.metadata, metadata);
+        assert!(handle.matches_metadata(&metadata));
+        assert!(
+            !handle.matches_metadata(&BTreeMap::from([("env".to_string(), "dev".to_string())]))
+        );
     }
 
     #[test]

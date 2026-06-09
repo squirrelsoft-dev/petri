@@ -244,6 +244,7 @@ fn parse_sandbox_create(mut args: impl Iterator<Item = String>) -> Result<Comman
     let mut image = None;
     let mut workspace = None;
     let mut policy = None;
+    let mut metadata = BTreeMap::new();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -252,6 +253,10 @@ fn parse_sandbox_create(mut args: impl Iterator<Item = String>) -> Result<Comman
             "--image" => image = Some(PathBuf::from(next_arg(&mut args, "--image")?)),
             "--workspace" => workspace = Some(PathBuf::from(next_arg(&mut args, "--workspace")?)),
             "--policy" => policy = Some(PathBuf::from(next_arg(&mut args, "--policy")?)),
+            "--metadata" => metadata.extend(parse_key_value_list(
+                next_arg(&mut args, "--metadata")?,
+                "--metadata",
+            )?),
             "--help" | "-h" => return Err(PetriError::Cli(sandbox_create_usage())),
             _ if arg.starts_with('-') => {
                 return Err(PetriError::Cli(format!(
@@ -276,7 +281,7 @@ fn parse_sandbox_create(mut args: impl Iterator<Item = String>) -> Result<Comman
         flag: "--workspace",
     })?;
     let policy = policy.ok_or(PetriError::MissingArgument { flag: "--policy" })?;
-    let mut config = InstanceConfig::new(id, backend, workspace, policy);
+    let mut config = InstanceConfig::new(id, backend, workspace, policy).with_metadata(metadata);
     let image = match (image, template.as_deref()) {
         (Some(image), _) => Some(image),
         (None, None | Some("base")) => Some(default_base_image()),
@@ -753,7 +758,7 @@ fn default_base_image() -> PathBuf {
 fn run_sandbox_list(command: SandboxListCommand, backend: &impl HostBackend) -> Result<String> {
     let mut instances = backend.list()?;
     if !command.metadata.is_empty() {
-        instances.clear();
+        instances.retain(|instance| instance.matches_metadata(&command.metadata));
     }
     if let Some(state) = command.state {
         instances.retain(|instance| match state {
@@ -2319,7 +2324,7 @@ fn sandbox_list_usage() -> String {
 }
 
 fn sandbox_create_usage() -> String {
-    "usage: petri sandbox create [base] --workspace <path> --policy <path> [--id <id>] [--image <path>] [--backend macos|stub]".to_string()
+    "usage: petri sandbox create [base] --workspace <path> --policy <path> [--id <id>] [--image <path>] [--backend macos|stub] [--metadata key=value,key2=value2]".to_string()
 }
 
 fn sandbox_connect_usage() -> String {
@@ -2406,6 +2411,7 @@ mod tests {
                 id: InstanceId::new("dev-1").unwrap(),
                 backend: "macos".to_string(),
                 state,
+                metadata: BTreeMap::new(),
             }],
         }
     }
@@ -2572,6 +2578,104 @@ mod tests {
         assert_eq!(command.state, Some(SandboxStateFilter::Running));
         assert_eq!(command.limit, Some(10));
         assert_eq!(command.format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn parses_sandbox_list_metadata() {
+        let command = parse(args(&[
+            "sandbox",
+            "list",
+            "--metadata",
+            "env=prod,team=core",
+        ]))
+        .unwrap();
+        let Command::SandboxList(command) = command else {
+            panic!("expected sandbox list command");
+        };
+        assert_eq!(
+            command.metadata.get("env").map(String::as_str),
+            Some("prod")
+        );
+        assert_eq!(
+            command.metadata.get("team").map(String::as_str),
+            Some("core")
+        );
+    }
+
+    #[test]
+    fn parses_sandbox_create_metadata_into_config() {
+        let workspace = std::env::temp_dir();
+        let command = parse(args(&[
+            "sandbox",
+            "create",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--policy",
+            "policy.toml",
+            "--id",
+            "dev-1",
+            "--metadata",
+            "env=prod",
+        ]))
+        .unwrap();
+        let Command::Create(command) = command else {
+            panic!("expected create command");
+        };
+        assert_eq!(
+            command.config.metadata.get("env").map(String::as_str),
+            Some("prod")
+        );
+    }
+
+    fn list_backend(instances: Vec<InstanceHandle>) -> ConnectFakeBackend {
+        ConnectFakeBackend { instances }
+    }
+
+    fn handle_with_metadata(id: &str, metadata: &[(&str, &str)]) -> InstanceHandle {
+        InstanceHandle {
+            id: InstanceId::new(id).unwrap(),
+            backend: "macos".to_string(),
+            state: LifecycleState::Ready,
+            metadata: metadata
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn sandbox_list_filters_by_metadata() {
+        let backend = list_backend(vec![
+            handle_with_metadata("dev-1", &[("env", "prod")]),
+            handle_with_metadata("dev-2", &[("env", "dev")]),
+            handle_with_metadata("dev-3", &[]),
+        ]);
+        let output = run(
+            args(&[
+                "sandbox",
+                "list",
+                "--metadata",
+                "env=prod",
+                "--format",
+                "json",
+            ]),
+            &backend,
+        )
+        .unwrap();
+        assert!(output.contains("dev-1"), "{output}");
+        assert!(!output.contains("dev-2"), "{output}");
+        assert!(!output.contains("dev-3"), "{output}");
+    }
+
+    #[test]
+    fn sandbox_list_metadata_no_match_is_empty() {
+        let backend = list_backend(vec![handle_with_metadata("dev-1", &[("env", "prod")])]);
+        let output = run(
+            args(&["sandbox", "list", "--metadata", "env=staging"]),
+            &backend,
+        )
+        .unwrap();
+        assert_eq!(output, "no sandboxes");
     }
 
     #[test]

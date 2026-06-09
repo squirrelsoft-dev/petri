@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -108,6 +109,9 @@ pub struct InstanceConfig {
     pub image: Option<PathBuf>,
     pub workspace: PathBuf,
     pub policy: PathBuf,
+    /// Free-form key/value metadata persisted with the instance so it can be
+    /// surfaced and filtered by `sandbox list --metadata`.
+    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -130,11 +134,17 @@ impl InstanceConfig {
             image: None,
             workspace: workspace.into(),
             policy: policy.into(),
+            metadata: BTreeMap::new(),
         }
     }
 
     pub fn with_image(mut self, image: impl Into<PathBuf>) -> Self {
         self.image = Some(image.into());
+        self
+    }
+
+    pub fn with_metadata(mut self, metadata: BTreeMap<String, String>) -> Self {
+        self.metadata = metadata;
         self
     }
 
@@ -169,6 +179,9 @@ pub struct InstanceHandle {
     pub id: InstanceId,
     pub backend: String,
     pub state: LifecycleState,
+    /// Free-form metadata supplied at creation. Empty when none was set.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
 }
 
 impl InstanceHandle {
@@ -177,7 +190,16 @@ impl InstanceHandle {
             id: config.id.clone(),
             backend: config.backend.clone(),
             state: LifecycleState::Provisioning,
+            metadata: config.metadata.clone(),
         }
+    }
+
+    /// Whether every `filter` entry is present in this handle's metadata with a
+    /// matching value. An empty filter matches every handle.
+    pub fn matches_metadata(&self, filter: &BTreeMap<String, String>) -> bool {
+        filter
+            .iter()
+            .all(|(key, value)| self.metadata.get(key) == Some(value))
     }
 }
 

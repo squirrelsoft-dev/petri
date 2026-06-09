@@ -98,7 +98,7 @@ type SandboxOpts = {
   policy?: string | Policy             // required by the local backend in v1
   backend?: "macos"                    // defaults to "macos"
   image?: string                       // defaults to the backend's base image
-  metadata?: Record<string, string>    // reserved; not yet persisted locally
+  metadata?: Record<string, string>    // persisted with the instance; filterable on list
   timeoutMs?: number                   // later
   requestTimeoutMs?: number            // later
 }
@@ -106,9 +106,9 @@ type SandboxOpts = {
 
 `workspace` and `policy` are optional in the cross-language type but **required**
 by the current local Petri backend; a binding may default them (e.g. `workspace`
-to the current directory) but must ultimately supply both. `metadata` is carried
-on the in-memory handle and reserved for the remote control plane; the local
-backend does not persist or filter on it yet.
+to the current directory) but must ultimately supply both. `metadata` is
+persisted with the instance state by the local backend, surfaced on listed
+handles, and filterable via `list({ metadata })` / `sandbox list --metadata`.
 
 ## `Commands`
 

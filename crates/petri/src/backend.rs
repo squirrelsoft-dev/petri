@@ -416,6 +416,7 @@ impl MacosBackend {
             host_policy: policy,
             guest_policy,
             image: Some(image.bundle_dir),
+            metadata: config.metadata.clone(),
             transport: GuestTransport::Vsock,
             vm: MacosVmSpec::from_image(&image.manifest),
         };
@@ -446,11 +447,7 @@ impl MacosBackend {
 
         let state = self.transition_state(state, LifecycleState::Ready, "create")?;
 
-        Ok(InstanceHandle {
-            id: state.id,
-            backend: state.backend,
-            state: state.lifecycle,
-        })
+        Ok(state.to_handle())
     }
 
     fn create_loopback(&self, config: InstanceConfig) -> Result<InstanceHandle> {
@@ -491,6 +488,7 @@ impl MacosBackend {
             host_policy: policy.clone(),
             guest_policy: policy,
             image: config.image.clone(),
+            metadata: config.metadata.clone(),
             transport: GuestTransport::TcpLoopback,
             vm: MacosVmSpec::loopback(config.image.clone()),
         };
@@ -503,11 +501,7 @@ impl MacosBackend {
 
         let state = self.transition_state(state, LifecycleState::Ready, "create")?;
 
-        Ok(InstanceHandle {
-            id: state.id,
-            backend: state.backend,
-            state: state.lifecycle,
-        })
+        Ok(state.to_handle())
     }
 }
 
@@ -534,16 +528,8 @@ impl HostBackend for MacosBackend {
     }
 
     fn list(&self) -> Result<Vec<InstanceHandle>> {
-        self.list_states().map(|states| {
-            states
-                .into_iter()
-                .map(|state| InstanceHandle {
-                    id: state.id,
-                    backend: state.backend,
-                    state: state.lifecycle,
-                })
-                .collect()
-        })
+        self.list_states()
+            .map(|states| states.iter().map(RuntimeState::to_handle).collect())
     }
 
     fn dispatch(
@@ -706,8 +692,21 @@ struct RuntimeState {
     host_policy: PathBuf,
     guest_policy: PathBuf,
     image: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    metadata: std::collections::BTreeMap<String, String>,
     transport: GuestTransport,
     vm: MacosVmSpec,
+}
+
+impl RuntimeState {
+    fn to_handle(&self) -> InstanceHandle {
+        InstanceHandle {
+            id: self.id.clone(),
+            backend: self.backend.clone(),
+            state: self.lifecycle,
+            metadata: self.metadata.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -1408,6 +1407,7 @@ mod tests {
             host_policy: PathBuf::from("/policy.toml"),
             guest_policy: PathBuf::from("/run/petri/policy.toml"),
             image: None,
+            metadata: std::collections::BTreeMap::new(),
             transport: GuestTransport::TcpLoopback,
             vm: MacosVmSpec::loopback(None),
         }
