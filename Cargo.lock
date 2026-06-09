@@ -768,6 +768,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "petri-nbd"
+version = "0.1.0"
+
+[[package]]
 name = "petri-protocol"
 version = "0.1.0"
 dependencies = [
