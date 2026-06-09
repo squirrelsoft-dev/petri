@@ -1,5 +1,5 @@
 # PROJECT STATE
-_Last updated: 2026-06-08 by /close (#14 end-to-end dispatch test complete)_
+_Last updated: 2026-06-08 by /close (#35 code-review polish complete)_
 
 ## Current State
 Petri is an early-stage microVM sandbox for running untrusted agent
@@ -86,6 +86,15 @@ bundle), so plain `cargo test` stays green everywhere. VM-verified: passes
 against a real VM in ~2.2s. Still missing for the breadth phase: generated
 first-party client packages (#26).
 
+A low-severity code-review polish pass is done (#35, `c4ac941`): workload
+processes now launch with a clean environment (`env_clear` + minimal PATH
+baseline) instead of inheriting the guest agent's full env; `terminate_process`
+signals via `libc::kill` instead of spawning `/bin/kill`; `jsonrpc::read_message`
+caps the buffer it allocates from an untrusted LSP `Content-Length`; the dead
+`Policy::cwd_is_in_workspace` was removed; and the workspace is clippy-clean.
+Builds clean, all tests pass; the env change is covered by a new in-process unit
+test (the VM-backed e2e test was not re-run).
+
 Only the macOS/Apple Virtualization backend exists. Known incomplete /
 broken: guest cancellation is unimplemented. Operational flake: `petri sandbox create` intermittently
 hangs (~30 min, 0 CPU, no instance dir) — workaround is `pkill -9 -f
@@ -152,7 +161,13 @@ with the residual `sandbox create` boot hang to re-diagnose if it recurs.
    `setTimeout`/`setPolicy`/snapshots are named but unimplemented. (The SDK
    `metadata` gap noted here previously is now closed — see Current State; it is
    persisted and filterable.)
-9. #14's e2e test requires two host-setup steps that are easy to miss and are
+9. #35 (low-severity polish) landed one behavior change worth flagging:
+   workload processes now run with a clean environment (`env_clear` + a minimal
+   PATH baseline) instead of inheriting the guest agent's full env. A command
+   that previously relied on an inherited variable other than PATH must now
+   receive it explicitly in the request env. The rest of #35 was hygiene
+   (libc::kill teardown, bounded LSP Content-Length, dead-code removal, clippy).
+10. #14's e2e test requires two host-setup steps that are easy to miss and are
    documented in the test header: (a) the `petri-vz` helper must be codesigned
    with `crates/petri-vz/petri-vz.entitlements` — an unsigned helper is rejected
    at VM-config time with a "com.apple.security.virtualization entitlement"
@@ -169,10 +184,9 @@ The SDK still has no generated clients beyond the Rust reference.
    matching the `docs/sdk-api.md` contract the Rust SDK already implements. Top
    priority: the deferred half of #24, now unblocked by the enforced schema, the
    published SDK shape, and an e2e-verified dispatch path to validate against.
-2. #35 — low-severity code-review cleanups (polish; batch opportunistically).
-3. Re-diagnose the `sandbox create` hang if it recurs. Historical links
+2. Re-diagnose the `sandbox create` hang if it recurs. Historical links
    (#32/#33) are all fixed, so it can no longer be attributed to them; needs a
    fresh root-cause pass (likely in the Swift helper boot/ready path).
-4. Consider wiring #14's e2e test into a macOS CI lane (build + codesign
+3. Consider wiring #14's e2e test into a macOS CI lane (build + codesign
    `petri-vz`, build the base image, run `--ignored`) so the dispatch path is
    guarded automatically rather than only on demand.
