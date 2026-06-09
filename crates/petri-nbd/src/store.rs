@@ -2,8 +2,9 @@
 //! collection (design §5 `store.rs`, Milestone 5 "cache cleanup and layer
 //! reference tracking").
 //!
-//! Sealed layers live at `<root>/layers/<content-id-hex>/{layer.meta,layer.data}`.
-//! Because the directory name *is* the content ID, sealing identical content
+//! Each sealed layer is a single self-describing file at
+//! `<root>/layers/<content-id-hex>` (packed blocks + embedded metadata footer).
+//! Because the file name *is* the content ID, sealing identical content
 //! twice is automatic dedupe: the second seal collapses onto the first. GC
 //! keeps every layer reachable from a caller-supplied set of roots by following
 //! recorded parent edges, and removes the rest.
@@ -25,7 +26,9 @@ impl LayerStore {
     pub fn open(root: &Path) -> io::Result<Self> {
         fs::create_dir_all(root.join("layers"))?;
         fs::create_dir_all(root.join(".staging"))?;
-        Ok(Self { root: root.to_path_buf() })
+        Ok(Self {
+            root: root.to_path_buf(),
+        })
     }
 
     fn layers_dir(&self) -> PathBuf {
@@ -40,20 +43,20 @@ impl LayerStore {
     /// the same content already exists, the new copy is discarded (dedupe) and
     /// the existing ID is returned.
     pub fn seal_into(&self, scratch: ScratchLayer, parents: &[LayerId]) -> io::Result<LayerId> {
-        // Seal to a private staging dir first so the content-addressed move is
+        // Seal to a private staging file first so the content-addressed move is
         // the commit point.
         let staging = self.root.join(".staging").join(unique_name());
         if staging.exists() {
-            fs::remove_dir_all(&staging)?;
+            fs::remove_file(&staging)?;
         }
         let sealed = scratch.seal(&staging, parents)?;
         let id = sealed.content_id().expect("sealed layer has a content id");
-        drop(sealed); // release file handles on the staging path
+        drop(sealed); // release the file handle on the staging path
 
         let dest = self.layer_path(&id);
         if dest.exists() {
             // Already stored with identical content — dedupe.
-            fs::remove_dir_all(&staging)?;
+            fs::remove_file(&staging)?;
         } else {
             fs::rename(&staging, &dest)?;
         }
@@ -81,7 +84,7 @@ impl LayerStore {
         let mut ids = Vec::new();
         for entry in fs::read_dir(self.layers_dir())? {
             let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+            if !entry.file_type()?.is_file() {
                 continue;
             }
             let name = entry.file_name();
@@ -117,7 +120,7 @@ impl LayerStore {
         let mut removed = Vec::new();
         for id in self.list()? {
             if !reachable.contains(&id) {
-                fs::remove_dir_all(self.layer_path(&id))?;
+                fs::remove_file(self.layer_path(&id))?;
                 removed.push(id);
             }
         }
@@ -150,7 +153,8 @@ mod tests {
         fn new() -> Self {
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!("petri-nbd-store-{}-{}", std::process::id(), n));
+            let dir =
+                std::env::temp_dir().join(format!("petri-nbd-store-{}-{}", std::process::id(), n));
             fs::create_dir_all(&dir).unwrap();
             TestDir(dir)
         }
@@ -166,8 +170,15 @@ mod tests {
     }
 
     /// Seal a one-block scratch (block 1 = `byte`) into the store.
-    fn seal_byte(store: &LayerStore, dir: &Path, tag: &str, byte: u8, parents: &[LayerId]) -> LayerId {
-        let mut scratch = ScratchLayer::create(&dir.join(format!("{tag}.data")), geometry()).unwrap();
+    fn seal_byte(
+        store: &LayerStore,
+        dir: &Path,
+        tag: &str,
+        byte: u8,
+        parents: &[LayerId],
+    ) -> LayerId {
+        let mut scratch =
+            ScratchLayer::create(&dir.join(format!("{tag}.data")), geometry()).unwrap();
         scratch.write_block(1, &vec![byte; BS as usize]).unwrap();
         store.seal_into(scratch, parents).unwrap()
     }
@@ -179,7 +190,11 @@ mod tests {
         let a = seal_byte(&store, &dir.0, "a", 0xAA, &[]);
         let b = seal_byte(&store, &dir.0, "b", 0xAA, &[]);
         assert_eq!(a, b, "identical content yields the same ID");
-        assert_eq!(store.list().unwrap().len(), 1, "duplicate content is deduped to one stored layer");
+        assert_eq!(
+            store.list().unwrap().len(),
+            1,
+            "duplicate content is deduped to one stored layer"
+        );
     }
 
     #[test]

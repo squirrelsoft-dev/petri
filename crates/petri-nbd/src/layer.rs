@@ -79,9 +79,12 @@ struct SealedMeta {
 enum ImmutableKind {
     /// A contiguous raw disk image; block N lives at `N * block_size`.
     RawBase { file: File, file_blocks: u64 },
-    /// A sealed packed layer: live blocks stored densely in `layer.data`,
-    /// addressed by an explicit `block -> offset` index.
-    Sealed { file: File, index: BTreeMap<u64, u64> },
+    /// A sealed packed layer: live blocks stored densely in the file's block
+    /// region (offset 0), addressed by an explicit `block -> offset` index.
+    Sealed {
+        file: File,
+        index: BTreeMap<u64, u64>,
+    },
 }
 
 impl ImmutableLayer {
@@ -103,16 +106,25 @@ impl ImmutableLayer {
         })
     }
 
-    /// Reopen a previously sealed layer from its directory (`layer.meta` +
-    /// `layer.data`).
-    pub fn open_sealed(dir: &Path) -> io::Result<Self> {
-        let meta = read_meta(&dir.join("layer.meta"))?;
-        let file = OpenOptions::new().read(true).open(dir.join("layer.data"))?;
+    /// Reopen a previously sealed layer from its single self-describing file.
+    ///
+    /// The file is laid out as `[ packed blocks | metadata blob | fixed footer ]`;
+    /// the trailing footer locates and checksums the metadata, so the layer
+    /// carries its own provenance with no external sidecar (see `ScratchLayer::seal`).
+    pub fn open_sealed(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new().read(true).open(path)?;
+        let meta = read_footer_meta(&file)?;
         let geometry = Geometry::new(meta.virtual_size, meta.block_size)?;
         Ok(Self {
             geometry,
-            kind: ImmutableKind::Sealed { file, index: meta.index },
-            sealed: Some(SealedMeta { content_id: meta.content_id, parents: meta.parents }),
+            kind: ImmutableKind::Sealed {
+                file,
+                index: meta.index,
+            },
+            sealed: Some(SealedMeta {
+                content_id: meta.content_id,
+                parents: meta.parents,
+            }),
         })
     }
 
@@ -127,7 +139,10 @@ impl ImmutableLayer {
 
     /// Parent layer IDs recorded at seal time (empty for a raw base).
     pub fn parent_ids(&self) -> &[LayerId] {
-        self.sealed.as_ref().map(|m| m.parents.as_slice()).unwrap_or(&[])
+        self.sealed
+            .as_ref()
+            .map(|m| m.parents.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Read block `block` into `out` (which must be exactly one block long).
@@ -235,27 +250,33 @@ impl ScratchLayer {
         self.data.sync_all()
     }
 
-    /// Seal this overlay into an immutable layer under `dir`.
+    /// Seal this overlay into an immutable, self-describing layer file at `path`.
     ///
-    /// Live blocks are compacted into a fresh densely-packed `layer.data` (the
-    /// append-log garbage from overwrites is dropped), a stable content ID is
-    /// computed over the canonical content (§8.1), and `layer.meta` is written
-    /// and fsync'd. `parents` records the immutable layers this overlay sat on
-    /// top of, bottom-first.
+    /// The output is a single portable file laid out as
+    /// `[ packed block payloads | metadata blob | fixed footer ]`: live blocks
+    /// are compacted densely in block-number order (dropping the append-log
+    /// garbage from overwrites), then the metadata (geometry, content ID,
+    /// parents, and the block index) and a fixed-size footer are appended. The
+    /// footer at the tail carries a magic, the metadata length, and a CRC so the
+    /// file reopens with no external sidecar — copy it anywhere and it stays
+    /// self-describing. A stable content ID is computed over the canonical
+    /// content (§8.1); `parents` records the immutable layers this overlay sat
+    /// on top of, bottom-first.
     ///
     /// Takes `&self` (a read-only snapshot of the live overlay): the scratch
     /// remains usable afterward, so an overlay can be sealed without tearing
     /// down the stack that is currently serving it.
-    pub fn seal(&self, dir: &Path, parents: &[LayerId]) -> io::Result<ImmutableLayer> {
-        fs::create_dir_all(dir)?;
+    pub fn seal(&self, path: &Path, parents: &[LayerId]) -> io::Result<ImmutableLayer> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let bs = self.geometry.block_size as usize;
-        let data_path = dir.join("layer.data");
         let out = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&data_path)?;
+            .open(path)?;
 
         // Canonical content pre-image: domain + geometry + parents + per block.
         let mut content = Sha256::new();
@@ -279,21 +300,32 @@ impl ScratchLayer {
             content.update(sha256(&buf));
             offset += bs as u64;
         }
+        let content_id = LayerId(content.finalize().into());
+
+        // Append the metadata blob and the fixed footer right after the packed
+        // block region (which ends at `offset`), then fsync the whole file.
+        let meta = encode_meta(&self.geometry, &content_id, parents, &new_index);
+        write_all_at(&out, offset, &meta)?;
+        let footer = encode_footer(meta.len() as u64, crc32(&meta));
+        write_all_at(&out, offset + meta.len() as u64, &footer)?;
         out.sync_all()?;
 
-        let content_id = LayerId(content.finalize().into());
-        write_meta(dir, &self.geometry, &content_id, parents, &new_index)?;
-
-        let file = OpenOptions::new().read(true).open(&data_path)?;
+        let file = OpenOptions::new().read(true).open(path)?;
         Ok(ImmutableLayer {
             geometry: self.geometry,
-            kind: ImmutableKind::Sealed { file, index: new_index },
-            sealed: Some(SealedMeta { content_id, parents: parents.to_vec() }),
+            kind: ImmutableKind::Sealed {
+                file,
+                index: new_index,
+            },
+            sealed: Some(SealedMeta {
+                content_id,
+                parents: parents.to_vec(),
+            }),
         })
     }
 }
 
-/// Decoded `layer.meta` contents.
+/// Decoded layer metadata: the blob embedded immediately ahead of the footer.
 struct Meta {
     block_size: u32,
     virtual_size: u64,
@@ -302,18 +334,23 @@ struct Meta {
     index: BTreeMap<u64, u64>,
 }
 
-const META_MAGIC: &[u8; 8] = b"PNBDLYR\x01";
+/// Footer magic; the trailing byte is the on-disk format version of the
+/// self-describing layer file (`\x02` = embedded footer, superseding the v1
+/// `layer.meta` sidecar).
+const FOOTER_MAGIC: &[u8; 8] = b"PNBDLYR\x02";
+/// Fixed footer: `metadata_len u64 | metadata_crc u32 | version u16 | flags u16 | magic [8]`.
+const FOOTER_SIZE: u64 = 24;
+const FORMAT_VERSION: u16 = 2;
 const HASH_ALGO_SHA256: u8 = 1;
 
-fn write_meta(
-    dir: &Path,
+/// Encode the metadata blob (everything but the trailing fixed footer).
+fn encode_meta(
     geometry: &Geometry,
     content_id: &LayerId,
     parents: &[LayerId],
     index: &BTreeMap<u64, u64>,
-) -> io::Result<()> {
+) -> Vec<u8> {
     let mut m = Vec::new();
-    m.extend_from_slice(META_MAGIC);
     m.extend_from_slice(&geometry.block_size.to_le_bytes());
     m.extend_from_slice(&geometry.virtual_size.to_le_bytes());
     m.push(HASH_ALGO_SHA256);
@@ -327,19 +364,68 @@ fn write_meta(
         m.extend_from_slice(&block.to_le_bytes());
         m.extend_from_slice(&offset.to_le_bytes());
     }
-
-    let mut f = File::create(dir.join("layer.meta"))?;
-    f.write_all(&m)?;
-    f.sync_all()
+    m
 }
 
-fn read_meta(path: &Path) -> io::Result<Meta> {
-    let bytes = fs::read(path)?;
-    let mut r = MetaReader { bytes: &bytes, pos: 0 };
+/// Encode the fixed-size footer that terminates a sealed layer file.
+fn encode_footer(metadata_len: u64, metadata_crc: u32) -> [u8; FOOTER_SIZE as usize] {
+    let mut f = [0u8; FOOTER_SIZE as usize];
+    f[0..8].copy_from_slice(&metadata_len.to_le_bytes());
+    f[8..12].copy_from_slice(&metadata_crc.to_le_bytes());
+    f[12..14].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    f[14..16].copy_from_slice(&0u16.to_le_bytes()); // flags (reserved)
+    f[16..24].copy_from_slice(FOOTER_MAGIC);
+    f
+}
 
-    if r.take(8)? != META_MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad layer.meta magic"));
+/// Read and validate a sealed layer's trailing footer, then its metadata blob.
+fn read_footer_meta(file: &File) -> io::Result<Meta> {
+    let file_len = file.metadata()?.len();
+    if file_len < FOOTER_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file shorter than layer footer",
+        ));
     }
+    let mut footer = [0u8; FOOTER_SIZE as usize];
+    read_exact_at(file, file_len - FOOTER_SIZE, &mut footer)?;
+    if &footer[16..24] != FOOTER_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad layer footer magic",
+        ));
+    }
+    let version = u16::from_le_bytes(footer[12..14].try_into().unwrap());
+    if version != FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported layer format version {version}"),
+        ));
+    }
+    let metadata_len = u64::from_le_bytes(footer[0..8].try_into().unwrap());
+    let metadata_crc = u32::from_le_bytes(footer[8..12].try_into().unwrap());
+    let meta_offset = (file_len - FOOTER_SIZE)
+        .checked_sub(metadata_len)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "layer metadata length overflows file",
+            )
+        })?;
+    let mut bytes = vec![0u8; metadata_len as usize];
+    read_exact_at(file, meta_offset, &mut bytes)?;
+    if crc32(&bytes) != metadata_crc {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "layer metadata checksum mismatch",
+        ));
+    }
+    decode_meta(&bytes)
+}
+
+/// Decode a metadata blob produced by [`encode_meta`].
+fn decode_meta(bytes: &[u8]) -> io::Result<Meta> {
+    let mut r = MetaReader { bytes, pos: 0 };
     let block_size = r.u32()?;
     let virtual_size = r.u64()?;
     let hash_algo = r.u8()?;
@@ -362,10 +448,30 @@ fn read_meta(path: &Path) -> io::Result<Meta> {
         let offset = r.u64()?;
         index.insert(block, offset);
     }
-    Ok(Meta { block_size, virtual_size, content_id, parents, index })
+    Ok(Meta {
+        block_size,
+        virtual_size,
+        content_id,
+        parents,
+        index,
+    })
 }
 
-/// Minimal little-endian byte reader with bounds checks for `layer.meta`.
+/// CRC-32 (IEEE 802.3, polynomial `0xEDB88320`) over `bytes` — detects
+/// corruption of the embedded metadata blob without pulling in a dependency.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in bytes {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// Minimal little-endian byte reader with bounds checks for the metadata blob.
 struct MetaReader<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -380,7 +486,10 @@ impl<'a> MetaReader<'a> {
                 self.pos = end;
                 Ok(slice)
             }
-            None => Err(io::Error::new(io::ErrorKind::InvalidData, "truncated layer.meta")),
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated layer.meta",
+            )),
         }
     }
     fn u8(&mut self) -> io::Result<u8> {
@@ -442,7 +551,8 @@ mod tests {
         fn new() -> Self {
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!("petri-nbd-seal-{}-{}", std::process::id(), n));
+            let dir =
+                std::env::temp_dir().join(format!("petri-nbd-seal-{}-{}", std::process::id(), n));
             fs::create_dir_all(&dir).unwrap();
             TestDir(dir)
         }
@@ -502,7 +612,8 @@ mod tests {
     }
 
     fn seal_with(dir: &TestDir, name: &str, byte: u8, parents: &[LayerId]) -> ImmutableLayer {
-        let mut scratch = ScratchLayer::create(&dir.path(&format!("{name}.data")), geometry()).unwrap();
+        let mut scratch =
+            ScratchLayer::create(&dir.path(&format!("{name}.data")), geometry()).unwrap();
         scratch.write_block(1, &block(byte)).unwrap();
         scratch.seal(&dir.path(name), parents).unwrap()
     }
@@ -544,6 +655,62 @@ mod tests {
         let mut buf = block(0);
         disk.read_at(BS as u64, &mut buf).unwrap();
         assert_eq!(buf, block(0xAA));
+    }
+
+    #[test]
+    fn sealed_layer_is_a_single_self_describing_file() {
+        let dir = TestDir::new();
+        let mut scratch = ScratchLayer::create(&dir.path("scratch.data"), geometry()).unwrap();
+        scratch.write_block(1, &block(0xAA)).unwrap();
+        let layer_path = dir.path("layer.bin");
+        let sealed = scratch.seal(&layer_path, &[]).unwrap();
+        let id = sealed.content_id().unwrap();
+        drop(sealed);
+
+        // The output is one regular file — no directory, no `.meta` sidecar.
+        assert!(layer_path.is_file());
+        assert!(!dir.path("layer.bin.meta").exists());
+        assert!(!dir.path("layer.meta").exists());
+
+        // It is portable: copied anywhere, it reopens with identity + data intact.
+        let moved = dir.path("moved-elsewhere.bin");
+        fs::copy(&layer_path, &moved).unwrap();
+        let reopened = ImmutableLayer::open_sealed(&moved).unwrap();
+        assert_eq!(reopened.content_id(), Some(id));
+        let mut buf = block(0);
+        assert!(reopened.read_block(1, &mut buf).unwrap());
+        assert_eq!(buf, block(0xAA));
+    }
+
+    #[test]
+    fn corrupt_footer_and_metadata_are_rejected() {
+        let dir = TestDir::new();
+        let mut scratch = ScratchLayer::create(&dir.path("scratch.data"), geometry()).unwrap();
+        scratch.write_block(1, &block(0xAA)).unwrap();
+        let layer_path = dir.path("layer.bin");
+        scratch.seal(&layer_path, &[]).unwrap();
+
+        // Truncating below the footer is rejected.
+        let truncated = dir.path("truncated.bin");
+        let bytes = fs::read(&layer_path).unwrap();
+        fs::write(&truncated, &bytes[..(FOOTER_SIZE as usize - 1)]).unwrap();
+        assert!(ImmutableLayer::open_sealed(&truncated).is_err());
+
+        // Clobbering the magic (last 8 bytes) is rejected.
+        let bad_magic = dir.path("bad-magic.bin");
+        let mut m = bytes.clone();
+        let n = m.len();
+        m[n - 1] ^= 0xFF;
+        fs::write(&bad_magic, &m).unwrap();
+        assert!(ImmutableLayer::open_sealed(&bad_magic).is_err());
+
+        // Flipping a metadata byte trips the CRC check.
+        let bad_meta = dir.path("bad-meta.bin");
+        let mut m = bytes.clone();
+        let meta_byte = m.len() - FOOTER_SIZE as usize - 1; // last byte of the metadata blob
+        m[meta_byte] ^= 0xFF;
+        fs::write(&bad_meta, &m).unwrap();
+        assert!(ImmutableLayer::open_sealed(&bad_meta).is_err());
     }
 
     #[test]

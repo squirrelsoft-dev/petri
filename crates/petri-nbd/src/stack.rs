@@ -26,7 +26,10 @@ impl Geometry {
     /// `virtual_size` evenly (v0 uses whole fixed-size blocks).
     pub fn new(virtual_size: u64, block_size: u32) -> io::Result<Self> {
         if block_size == 0 {
-            return Err(Error::new(ErrorKind::InvalidInput, "block_size must be non-zero"));
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "block_size must be non-zero",
+            ));
         }
         if !virtual_size.is_multiple_of(block_size as u64) {
             return Err(Error::new(
@@ -34,7 +37,10 @@ impl Geometry {
                 "virtual_size must be a multiple of block_size",
             ));
         }
-        Ok(Self { virtual_size, block_size })
+        Ok(Self {
+            virtual_size,
+            block_size,
+        })
     }
 
     /// Number of blocks spanning the virtual disk.
@@ -81,7 +87,12 @@ impl LayeredDisk {
             }
         }
         let block_buf = vec![0u8; geometry.block_size as usize];
-        Ok(Self { geometry, lower, scratch, block_buf })
+        Ok(Self {
+            geometry,
+            lower,
+            scratch,
+            block_buf,
+        })
     }
 
     pub fn geometry(&self) -> Geometry {
@@ -227,10 +238,10 @@ impl LayeredDisk {
         self.scratch.flush()
     }
 
-    /// Seal this stack's scratch overlay into an immutable layer under `dir`
-    /// (design §9 step 7). The scratch remains usable afterward.
-    pub fn seal_scratch(&self, dir: &Path, parents: &[LayerId]) -> io::Result<ImmutableLayer> {
-        self.scratch.seal(dir, parents)
+    /// Seal this stack's scratch overlay into a self-describing immutable layer
+    /// file at `path` (design §9 step 7). The scratch remains usable afterward.
+    pub fn seal_scratch(&self, path: &Path, parents: &[LayerId]) -> io::Result<ImmutableLayer> {
+        self.scratch.seal(path, parents)
     }
 }
 

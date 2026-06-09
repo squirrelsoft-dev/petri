@@ -132,52 +132,83 @@ efficiency for the prototype.
 
 ## 4. On-disk format
 
-A layer is a directory (or a pair of files) with **separate metadata and data**.
+A sealed layer is a **single self-describing file** whose metadata travels with
+the block data — no external sidecar, no registry entry needed to resolve it.
 The durable format is **not** an in-memory `HashMap<u64, Block>` — that is
 acceptable only inside unit tests.
 
 ```text
-<layer-id>/
-  layer.meta        # metadata: versioned, small, fsync'd on seal
-  layer.data        # block payloads: sparse file or packed blob
+<layer-id>                       # one file; the file name IS the content ID
+  ┌───────────────────────────┐
+  │ packed block payloads      │  offset 0 .. data_len   (raw block region)
+  ├───────────────────────────┤
+  │ metadata blob              │  geometry, IDs, block index (see §4.1)
+  ├───────────────────────────┤
+  │ fixed footer (24 bytes)    │  locates + checksums the metadata (see §4.2)
+  └───────────────────────────┘
 ```
 
-### 4.1 `layer.meta`
+To open: read the file length, seek to `len - 24`, read the footer, validate the
+magic, then seek back `metadata_len` bytes to read and CRC-check the metadata
+blob. The block region begins at offset 0 and is never shifted by metadata, so a
+layer file can be copied or moved anywhere and stays fully self-describing.
+
+### 4.1 Metadata blob
+
+A compact little-endian record appended directly after the block region:
 
 ```text
-schema_version       u32     format version of this metadata
-virtual_size         u64     virtual disk size in bytes (same across the stack)
 block_size           u32     stored block size in bytes (64 KiB for v0)
-parent_ids           [ID]    content IDs of the layers this was sealed on top of
-content_id           ID      stable content identity of this layer (sealed only)
-state                enum    { writable, sealed }
-block_index          ...     map: virtual block number -> location in layer.data
-created_at, builder  ...     creation metadata (informational, excluded from ID)
+virtual_size         u64     virtual disk size in bytes (same across the stack)
+hash_algo            u8      content-ID hash family (1 = SHA-256)
+content_id           [32]    stable content identity of this layer
+parent_count         u16
+parent_ids           [32*N]  content IDs of the layers this was sealed on top of
+index_count          u64
+block_index          [16*M]  (u64 virtual_block -> u64 packed_offset) entries
 ```
 
-The **block index** is the populated-block map. For v0 it is a sorted list of
+The **block index** is the populated-block map: a sorted list of
 `(virtual_block_number -> data_offset)` entries; absence means "hole, fall
 through." A sorted index gives `O(log n)` lookup and streams cleanly to disk. A
-writable scratch layer keeps this index in memory and appends to `layer.data`;
-sealing writes the final index out and fsyncs.
+writable scratch layer keeps this index in memory and appends to its append-log;
+sealing writes the final index into the metadata blob and fsyncs the whole file.
 
-### 4.2 `layer.data`
+### 4.2 Footer
 
-Two viable representations; v0 picks one and the format records which:
+A fixed 24-byte trailer at the very end of the file, so the metadata can be
+found without scanning:
 
-- **Sparse raw file** — `layer.data` is a virtual-size-shaped file with holes;
-  block N lives at offset `N * block_size`. Pros: trivial mapping, OS-level
-  sparseness, `pread`/`pwrite` directly. Cons: relies on filesystem hole support
-  (APFS supports sparse files); `du` vs apparent size can confuse tooling.
+```text
+metadata_len         u64     length of the metadata blob preceding the footer
+metadata_crc         u32     CRC-32 (IEEE) of the metadata blob (corruption check)
+format_version       u16     on-disk format version (2 = embedded footer)
+flags                u16     reserved (0)
+magic                [8]     "PNBDLYR\x02"
+```
+
+The trailing byte of the magic doubles as the format version: `\x02` is the
+embedded-footer format that superseded the v1 `layer.meta` sidecar.
+
+### 4.3 Block region representation
+
+Two viable representations for the block region; v0 picks one and the metadata
+records the layout via the block index:
+
+- **Sparse raw file** — block N lives at offset `N * block_size`. Pros: trivial
+  mapping, OS-level sparseness, `pread`/`pwrite` directly. Cons: relies on
+  filesystem hole support (APFS supports sparse files); `du` vs apparent size can
+  confuse tooling.
 - **Packed blob** — populated blocks are appended densely and the `block_index`
   maps virtual block -> packed offset. Pros: compact, explicit, portable to a
-  content-addressed chunk store later. Cons: needs the index to read anything.
+  content-addressed chunk store. Cons: needs the index to read anything.
 
 **v0 decision:** scratch overlays use a **packed blob with an append log**
 (simple to grow and to seal), and the base raw image is consumed as a **sparse
 raw file** directly (it already exists as `root.img`). Sealing a scratch
-produces a packed-blob immutable layer. This keeps the writable path append-only
-(good for crash consistency, §7) and lets the base image be used untouched.
+compacts the live blocks into a packed-blob region and appends the metadata +
+footer in one file. This keeps the writable path append-only (good for crash
+consistency, §7) and lets the base image be used untouched.
 
 ---
 
@@ -369,11 +400,12 @@ not require rewriting the data format.
 
 `seal_scratch()` converts a writable overlay into an immutable layer:
 
-1. Flush and fsync `layer.data`.
-2. Write the final `block_index` and metadata, then fsync `layer.meta`.
-3. Compute a **stable content ID** over the layer's content.
-4. Mark the layer `sealed` (immutable) and move it to its content-addressed
-   location in the store.
+1. Compact the live blocks into a fresh packed block region.
+2. Compute a **stable content ID** over the layer's content.
+3. Append the final `block_index` + metadata blob and the fixed footer, then
+   fsync the whole layer file.
+4. Mark the layer `sealed` (immutable) and move the single file to its
+   content-addressed location in the store.
 
 ### 8.1 Content ID stability
 
@@ -389,23 +421,24 @@ The ID is computed over:
   sorted by block number, where `block_hash` is a hash of the block payload.
 
 The ID **excludes** `created_at`, builder identity, file mtimes, and the
-physical packing order in `layer.data`. Two seals of byte-identical content on
+physical packing order in the block region. Two seals of byte-identical content on
 top of identical parents produce the same content ID. This is the property that
 later makes content-addressed distribution and dedupe possible (§10).
 
 Hash function: **SHA-256** (Milestone 4), chosen for consistency with Petri's
 existing `SHA256SUMS` image-integrity convention rather than introducing a
-second hash family. The algorithm is tagged in `layer.meta` (`hash_algo` byte)
-so it can evolve. The canonical pre-image hashed is, in order: a domain
+second hash family. The algorithm is tagged in the metadata blob (`hash_algo`
+byte) so it can evolve. The canonical pre-image hashed is, in order: a domain
 separator, `block_size`, `virtual_size`, the parent IDs, then for each populated
 block in ascending block-number order the block number followed by the
 SHA-256 of that block's payload.
 
-The concrete on-disk sealed layer is a directory with `layer.meta` (a small
-fixed binary header: magic + schema version, geometry, `hash_algo`, the 32-byte
-content ID, parent IDs, and the `(block_number -> data_offset)` index) and
-`layer.data` (the live blocks packed densely in block-number order, dropping the
-append-log garbage of the scratch). `ImmutableLayer::open_sealed` reloads it.
+The concrete on-disk sealed layer is a single self-describing file (§4): the
+live blocks packed densely in block-number order (dropping the append-log
+garbage of the scratch), followed by the metadata blob (geometry, `hash_algo`,
+the 32-byte content ID, parent IDs, and the `(block_number -> data_offset)`
+index) and a fixed CRC-checked footer that locates the metadata.
+`ImmutableLayer::open_sealed` reloads it from the footer.
 
 ---
 
@@ -517,8 +550,8 @@ The helper selects the boot disk via `--disk <path>` (local image) **or**
 
 ### Milestone 4 — Seal snapshot
 - [x] Add sealing (`ScratchLayer::seal`) to convert a writable overlay into an
-  immutable packed layer (`layer.meta` + compacted `layer.data`), and
-  `ImmutableLayer::open_sealed` to reload it.
+  immutable packed layer (a single self-describing file: compacted blocks +
+  embedded metadata footer), and `ImmutableLayer::open_sealed` to reload it.
 - [x] Store parent IDs and a SHA-256 content ID; content ID is stable for
   identical content and changes with content or parents (unit-tested).
 - [x] Compose `base + sealed + fresh scratch` and verify sealed blocks shadow the

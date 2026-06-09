@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use petri_nbd::{
     BindMode, Geometry, ImmutableLayer, LayeredDisk, NbdServer, ScratchLayer, ServeOpts,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const BLOCK_SIZE: u32 = 64 * 1024;
 const MARKER_PATH: &str = "/persist-marker";
@@ -41,7 +41,10 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
-    let bundle = PathBuf::from(args.next().unwrap_or_else(|| "target/petri-images/base".into()));
+    let bundle = PathBuf::from(
+        args.next()
+            .unwrap_or_else(|| "target/petri-images/base".into()),
+    );
 
     let env = BootEnv::resolve(&bundle)?;
     let work = PathBuf::from(format!("target/nbd-verify/{}", std::process::id()));
@@ -59,27 +62,40 @@ fn run() -> Result<(), String> {
     {
         let mut vm = Vm::boot(&env, &work, "s1a", server.url())?;
         vm.wait_ready()?;
-        let w = vm.dispatch("sh", &["-c", &format!("echo {MARKER_TEXT} > {MARKER_PATH} && sync")])?;
-        println!("   write marker: status={} exit={:?}", w.status, w.exit_code);
+        let w = vm.dispatch(
+            "sh",
+            &["-c", &format!("echo {MARKER_TEXT} > {MARKER_PATH} && sync")],
+        )?;
+        println!(
+            "   write marker: status={} exit={:?}",
+            w.status, w.exit_code
+        );
         vm.stop();
     }
     let persisted = {
         let mut vm = Vm::boot(&env, &work, "s1b", server.url())?;
         vm.wait_ready()?;
         let r = vm.dispatch("cat", &[MARKER_PATH])?;
-        println!("   reread marker: status={} stdout={:?}", r.status, r.stdout.trim());
+        println!(
+            "   reread marker: status={} stdout={:?}",
+            r.status,
+            r.stdout.trim()
+        );
         vm.stop();
         r.stdout.contains(MARKER_TEXT)
     };
     results.push(("same scratch -> marker persists", persisted));
 
     // Seal this scratch for scenario 3 before tearing the server down.
-    let sealed_dir = work.join("sealed");
+    let sealed_path = work.join("sealed");
     let sealed_id = server
-        .seal_scratch(&sealed_dir, &[])
+        .seal_scratch(&sealed_path, &[])
         .map_err(|e| format!("seal_scratch: {e}"))?
         .content_id();
-    println!("   sealed scratch -> layer {}", sealed_id.map(|i| i.to_hex()).unwrap_or_default());
+    println!(
+        "   sealed scratch -> layer {}",
+        sealed_id.map(|i| i.to_hex()).unwrap_or_default()
+    );
     server.shutdown().map_err(|e| e.to_string())?;
 
     // ---- Scenario 2: fresh scratch -> clean base (marker absent) ----
@@ -89,7 +105,12 @@ fn run() -> Result<(), String> {
         let mut vm = Vm::boot(&env, &work, "s2", server.url())?;
         vm.wait_ready()?;
         let r = vm.dispatch("cat", &[MARKER_PATH])?;
-        println!("   read marker: status={} exit={:?} stderr={:?}", r.status, r.exit_code, r.stderr.trim());
+        println!(
+            "   read marker: status={} exit={:?} stderr={:?}",
+            r.status,
+            r.exit_code,
+            r.stderr.trim()
+        );
         vm.stop();
         let _ = server.shutdown();
         // Clean base: the file should NOT exist (cat fails, no marker text).
@@ -101,18 +122,27 @@ fn run() -> Result<(), String> {
     println!("\n== scenario 3: base + sealed + fresh scratch -> sealed marker visible ==");
     let sealed_visible = {
         let base = ImmutableLayer::open_raw_base(&env.disk, geometry).map_err(|e| e.to_string())?;
-        let sealed = ImmutableLayer::open_sealed(&sealed_dir).map_err(|e| e.to_string())?;
-        let scratch = ScratchLayer::create(&work.join("scratch3.data"), geometry).map_err(|e| e.to_string())?;
+        let sealed = ImmutableLayer::open_sealed(&sealed_path).map_err(|e| e.to_string())?;
+        let scratch = ScratchLayer::create(&work.join("scratch3.data"), geometry)
+            .map_err(|e| e.to_string())?;
         let layered = LayeredDisk::new(vec![base, sealed], scratch).map_err(|e| e.to_string())?;
         let server = NbdServer::serve(
             layered,
-            ServeOpts { bind: BindMode::LoopbackTcp(0), export_name: "petri".into(), read_only: false },
+            ServeOpts {
+                bind: BindMode::LoopbackTcp(0),
+                export_name: "petri".into(),
+                read_only: false,
+            },
         )
         .map_err(|e| e.to_string())?;
         let mut vm = Vm::boot(&env, &work, "s3", server.url())?;
         vm.wait_ready()?;
         let r = vm.dispatch("cat", &[MARKER_PATH])?;
-        println!("   read marker: status={} stdout={:?}", r.status, r.stdout.trim());
+        println!(
+            "   read marker: status={} stdout={:?}",
+            r.status,
+            r.stdout.trim()
+        );
         vm.stop();
         let _ = server.shutdown();
         r.stdout.contains(MARKER_TEXT)
@@ -135,13 +165,21 @@ fn run() -> Result<(), String> {
     }
 }
 
-fn serve(env: &BootEnv, geometry: Geometry, scratch_path: &Path) -> Result<petri_nbd::NbdHandle, String> {
+fn serve(
+    env: &BootEnv,
+    geometry: Geometry,
+    scratch_path: &Path,
+) -> Result<petri_nbd::NbdHandle, String> {
     let base = ImmutableLayer::open_raw_base(&env.disk, geometry).map_err(|e| e.to_string())?;
     let scratch = ScratchLayer::create(scratch_path, geometry).map_err(|e| e.to_string())?;
     let layered = LayeredDisk::new(vec![base], scratch).map_err(|e| e.to_string())?;
     NbdServer::serve(
         layered,
-        ServeOpts { bind: BindMode::LoopbackTcp(0), export_name: "petri".into(), read_only: false },
+        ServeOpts {
+            bind: BindMode::LoopbackTcp(0),
+            export_name: "petri".into(),
+            read_only: false,
+        },
     )
     .map_err(|e| e.to_string())
 }
@@ -170,7 +208,14 @@ impl BootEnv {
         }
         let cmdline = extract_cmdline(&manifest)?;
         let base_len = fs::metadata(&disk).map_err(|e| e.to_string())?.len();
-        Ok(Self { helper, kernel, initrd, disk, cmdline, base_len })
+        Ok(Self {
+            helper,
+            kernel,
+            initrd,
+            disk,
+            cmdline,
+            base_len,
+        })
     }
 }
 
@@ -314,7 +359,9 @@ struct DispatchOut {
 fn extract_cmdline(manifest: &Path) -> Result<String, String> {
     let text = fs::read_to_string(manifest).map_err(|e| e.to_string())?;
     let key = "\"kernel_command_line\"";
-    let start = text.find(key).ok_or("manifest has no kernel_command_line")?;
+    let start = text
+        .find(key)
+        .ok_or("manifest has no kernel_command_line")?;
     let after = &text[start + key.len()..];
     let q1 = after.find('"').ok_or("malformed kernel_command_line")?;
     let rest = &after[q1 + 1..];
