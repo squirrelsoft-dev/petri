@@ -279,10 +279,21 @@ kernel.unprivileged_userns_clone = 0
 user.max_user_namespaces = 0
 EOF
 
+# Always ship a runtime LSP config and point the guest at it. The base (no
+# toolchain) ships a disabled two-line stub so the hardcoded
+# `--lsp-config /etc/petri/lsp.toml` flag in petri-guest.service is valid and
+# parses to "LSP off"; the enabled build overwrites this stub below with the real
+# server list. The stub must not be empty: the guest requires an `[lsp]` table.
+install -d "$rootfs/etc/petri"
+cat > "$rootfs/etc/petri/lsp.toml" <<'EOF'
+[lsp]
+enabled = false
+EOF
+lsp_config_arg=" --lsp-config /etc/petri/lsp.toml"
+
 # Provision Language Server Protocol servers into the image. Requires network
 # access and the ability to execute the target architecture (native or via
 # binfmt/qemu) inside a chroot.
-lsp_config_arg=""
 if [ "$lsp_enabled" = "true" ]; then
   need_tool chroot
   # rustup (and other installers) probe /proc/self/exe and need the API
@@ -293,9 +304,8 @@ if [ "$lsp_enabled" = "true" ]; then
   done
   mkdir -p "$rootfs/dev/pts"
   mount --bind /dev/pts "$rootfs/dev/pts" 2>/dev/null || true
-  install -d "$rootfs/etc/petri"
+  # Overwrite the disabled stub with the real enabled config + server list.
   lsp_py runtime > "$rootfs/etc/petri/lsp.toml"
-  lsp_config_arg=" --lsp-config /etc/petri/lsp.toml"
 
   # Shared env so every server binary lands on PATH at /usr/local/bin. Override
   # TMPDIR to the chroot's own /tmp: the outer build exports TMPDIR to a host
