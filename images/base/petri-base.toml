@@ -1,0 +1,46 @@
+[image]
+name = "petri-base"
+architecture = "aarch64"
+distro = "debian"
+debian_arch = "arm64"
+suite = "trixie"
+mirror = "https://deb.debian.org/debian"
+security_mirror = "https://deb.debian.org/debian-security"
+# 8G: this lean base layer only populates a few hundred MB, but in the layer
+# model every layer in a stack shares one virtual-disk geometry, and the builder
+# layer stacked on top needs the full 8 GiB virtual size. root.img is sparse, so
+# the unused tail costs no real disk.
+disk_size = "8G"
+
+[guest]
+crate = "petri-guest"
+target = "aarch64-unknown-linux-musl"
+install_path = "/usr/local/bin/petri-guest"
+policy_path = "/run/petri/policy.toml"
+workspace_path = "/workspace"
+dispatch_port = 7777
+
+[packages]
+base = [
+  "ca-certificates",
+  "linux-image-cloud-arm64",
+  "systemd",
+  "systemd-sysv",
+  "udev",
+  "mount",
+  "procps",
+  # In-guest network egress enforcement (#36): iproute2 brings the device up,
+  # nftables provides `nft` for the policy-driven egress ruleset.
+  "iproute2",
+  "nftables",
+]
+
+# Lean base layer: the language toolchain (clangd, gcc, go, node/npm, python and
+# the LSP servers) is deliberately omitted. The build still writes a disabled
+# two-line stub to /etc/petri/lsp.toml so the guest's hardcoded
+# `--lsp-config /etc/petri/lsp.toml` flag is valid and parses to "LSP off". A
+# future builder layer stacked on top overwrites that stub with an
+# `enabled = true` config and ships the server binaries. See
+# images/base/petri-base-image.toml for the toolchain-enabled (builder) source.
+[lsp]
+enabled = false
