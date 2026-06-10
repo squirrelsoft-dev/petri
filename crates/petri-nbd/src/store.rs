@@ -63,6 +63,29 @@ impl LayerStore {
         Ok(id)
     }
 
+    /// Adopt an already-sealed layer file (e.g. produced by
+    /// [`crate::NbdHandle::seal_scratch`]) into the store under its content id.
+    /// Dedupes: if a layer with the same content already exists, the incoming
+    /// file is removed and the existing id returned. The source file is consumed
+    /// (renamed into the store) on success.
+    pub fn adopt_sealed(&self, sealed_path: &Path) -> io::Result<LayerId> {
+        let layer = ImmutableLayer::open_sealed(sealed_path)?;
+        let id = layer.content_id().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "adopted file is not a sealed layer",
+            )
+        })?;
+        drop(layer); // release the handle before moving the file
+        let dest = self.layer_path(&id);
+        if dest.exists() {
+            fs::remove_file(sealed_path)?;
+        } else {
+            fs::rename(sealed_path, &dest)?;
+        }
+        Ok(id)
+    }
+
     /// Open a stored layer by ID.
     pub fn open_layer(&self, id: &LayerId) -> io::Result<ImmutableLayer> {
         let path = self.layer_path(id);
@@ -77,6 +100,17 @@ impl LayerStore {
 
     pub fn contains(&self, id: &LayerId) -> bool {
         self.layer_path(id).exists()
+    }
+
+    /// Remove a stored layer file by id. Idempotent: a no-op if the layer is
+    /// already absent. The caller is responsible for not deleting a layer that
+    /// is still referenced as a parent (the store does not track child edges).
+    pub fn delete(&self, id: &LayerId) -> io::Result<()> {
+        match fs::remove_file(self.layer_path(id)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 
     /// List the content IDs of every stored layer.
@@ -208,6 +242,49 @@ mod tests {
         assert!(layer.read_block(1, &mut buf).unwrap()); // pub(crate), same-crate test
         assert_eq!(buf, vec![0x5A; BS as usize]);
         assert!(!store.contains(&LayerId::from_hex(&"0".repeat(64)).unwrap()));
+    }
+
+    #[test]
+    fn adopt_sealed_imports_and_dedupes() {
+        let dir = TestDir::new();
+        let store = LayerStore::open(&dir.0.join("store")).unwrap();
+
+        // Seal a scratch to a loose path, then adopt it into the store.
+        let mut scratch =
+            ScratchLayer::create(&dir.0.join("loose.data"), geometry()).unwrap();
+        scratch.write_block(1, &vec![0x5A; BS as usize]).unwrap();
+        let loose = dir.0.join("loose.layer");
+        let sealed = scratch.seal(&loose, &[]).unwrap();
+        let expected = sealed.content_id().unwrap();
+        drop(sealed);
+
+        let id = store.adopt_sealed(&loose).unwrap();
+        assert_eq!(id, expected);
+        assert!(store.contains(&id));
+        assert!(!loose.exists(), "adopt consumes the source file");
+
+        // Adopting identical content again dedupes onto the existing layer.
+        let mut scratch2 =
+            ScratchLayer::create(&dir.0.join("loose2.data"), geometry()).unwrap();
+        scratch2.write_block(1, &vec![0x5A; BS as usize]).unwrap();
+        let loose2 = dir.0.join("loose2.layer");
+        scratch2.seal(&loose2, &[]).unwrap();
+        let id2 = store.adopt_sealed(&loose2).unwrap();
+        assert_eq!(id2, id);
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert!(!loose2.exists());
+    }
+
+    #[test]
+    fn delete_removes_layer_and_is_idempotent() {
+        let dir = TestDir::new();
+        let store = LayerStore::open(&dir.0.join("store")).unwrap();
+        let id = seal_byte(&store, &dir.0, "x", 0x5A, &[]);
+        assert!(store.contains(&id));
+        store.delete(&id).unwrap();
+        assert!(!store.contains(&id));
+        // Deleting an absent layer is a no-op.
+        store.delete(&id).unwrap();
     }
 
     #[test]

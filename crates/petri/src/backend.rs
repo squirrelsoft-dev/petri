@@ -36,7 +36,64 @@ pub trait HostBackend {
     ) -> Result<DispatchResult>;
     fn stop(&self, instance_id: &InstanceId) -> Result<()>;
     fn teardown(&self, instance_id: &InstanceId) -> Result<()>;
+
+    /// Boot a disposable EFI builder VM from a nocloud `--disk`, attach the
+    /// image scratch over NBD as a `--data-disk`, optionally run the provision
+    /// script over the control socket, then stop. The caller owns the live
+    /// `NbdHandle` exporting the scratch and seals it afterward. macOS-only;
+    /// the default implementation reports the backend cannot build images.
+    fn run_bootstrap_builder(
+        &self,
+        _params: BootstrapBuilderParams,
+    ) -> Result<BootstrapBuilderRun> {
+        Err(PetriError::Backend {
+            backend: self.name().to_string(),
+            message: "bootstrap builder requires the macOS Virtualization backend".to_string(),
+        })
+    }
 }
+
+/// Inputs for [`HostBackend::run_bootstrap_builder`].
+#[derive(Debug, Clone)]
+pub struct BootstrapBuilderParams {
+    pub instance_id: InstanceId,
+    /// Nocloud EFI boot disk (becomes `vda` in the builder VM).
+    pub nocloud_disk: PathBuf,
+    /// `nbd://…` URL of the scratch being built (attached as a `--data-disk`).
+    pub data_disk_url: String,
+    /// Provision script text; staged into the artifacts share and, when
+    /// `run_provision` is set, dispatched over the control socket.
+    pub provision_script: Option<String>,
+    /// Whether to dispatch the provision script (set under `--auto-freeze`).
+    pub run_provision: bool,
+    pub ready_timeout_secs: u64,
+}
+
+/// Outcome of a bootstrap builder run.
+#[derive(Debug, Clone)]
+pub struct BootstrapBuilderRun {
+    /// Exit code of the provision dispatch, if one ran.
+    pub provision_exit_code: Option<i32>,
+    /// Whether boot (and any provision dispatch) succeeded.
+    pub succeeded: bool,
+    /// Captured provision stdout/stderr (for diagnostics on failure).
+    pub provision_output: Option<String>,
+}
+
+/// Permissive policy for the disposable builder VM: provisioning writes `/etc`,
+/// installs packages, and runs arbitrary shell, so it keeps root and declares
+/// the `yolo` command level (mirrors the image-build builder policy).
+const BOOTSTRAP_BUILDER_POLICY: &str = r#"[policy]
+network_enabled = true
+max_runtime_secs = 10800
+max_output_bytes = 4194304
+workspace_path = "/workspace"
+drop_privileges = false
+
+[policy.command]
+default = "yolo"
+max = "yolo"
+"#;
 
 #[derive(Debug, Clone)]
 pub struct PetriBackend {
@@ -99,6 +156,13 @@ impl HostBackend for PetriBackend {
         } else {
             self.stub.teardown(instance_id)
         }
+    }
+
+    fn run_bootstrap_builder(
+        &self,
+        params: BootstrapBuilderParams,
+    ) -> Result<BootstrapBuilderRun> {
+        self.macos.run_bootstrap_builder(params)
     }
 }
 
@@ -623,6 +687,180 @@ impl HostBackend for MacosBackend {
             }
         }
         self.remove_state(instance_id)
+    }
+
+    fn run_bootstrap_builder(
+        &self,
+        params: BootstrapBuilderParams,
+    ) -> Result<BootstrapBuilderRun> {
+        if !cfg!(target_os = "macos") {
+            return Err(backend_error(
+                "bootstrap builder requires macOS Virtualization.framework".to_string(),
+            ));
+        }
+
+        let id = &params.instance_id;
+        let instance_dir = self.instance_dir(id);
+        let config_dir = self.config_dir(id);
+        let workspace = instance_dir.join("workspace");
+        let artifacts_dir = instance_dir.join("artifacts");
+        for dir in [&config_dir, &workspace, &artifacts_dir] {
+            fs::create_dir_all(dir).map_err(|source| PetriError::Io {
+                path: dir.clone(),
+                source,
+            })?;
+        }
+
+        // Permissive builder policy mounted read-only over virtiofs.
+        let policy_path = config_dir.join("policy.toml");
+        fs::write(&policy_path, BOOTSTRAP_BUILDER_POLICY).map_err(|source| PetriError::Io {
+            path: policy_path.clone(),
+            source,
+        })?;
+        harden_policy_permissions(&policy_path)?;
+
+        // Stage petri-guest and the provision script into the artifacts share.
+        let guest_binary = resolve_guest_binary(&self.guest_binary)?;
+        if guest_binary.is_file() {
+            let _ = fs::copy(&guest_binary, artifacts_dir.join("petri-guest"));
+        }
+        if let Some(script) = &params.provision_script {
+            let script_path = artifacts_dir.join("provision.sh");
+            fs::write(&script_path, script).map_err(|source| PetriError::Io {
+                path: script_path,
+                source,
+            })?;
+        }
+
+        let control_socket = self.control_socket_path(id);
+        let _ = fs::remove_file(&control_socket);
+        let console_log = self.guest_console_path(id);
+        let efi_store = instance_dir.join("efi-variable-store");
+        let helper_stdout_path = self.helper_stdout_path(id);
+        let helper_stderr_path = self.helper_stderr_path(id);
+        let helper_stdout =
+            fs::File::create(&helper_stdout_path).map_err(|source| PetriError::Io {
+                path: helper_stdout_path.clone(),
+                source,
+            })?;
+        let helper_stderr =
+            fs::File::create(&helper_stderr_path).map_err(|source| PetriError::Io {
+                path: helper_stderr_path.clone(),
+                source,
+            })?;
+        let helper_binary = resolve_helper_binary(&self.helper_binary)?;
+
+        // Drive petri-vz directly (no ImageBundle): nocloud EFI boot disk + the
+        // scratch over NBD as a read-write data disk + the artifacts share.
+        let mut command = Command::new(&helper_binary);
+        command
+            .arg("--instance-id")
+            .arg(id.as_str())
+            .arg("--control-socket")
+            .arg(&control_socket)
+            .arg("--boot-mode")
+            .arg("efi")
+            .arg("--disk")
+            .arg(&params.nocloud_disk)
+            .arg("--efi-variable-store")
+            .arg(&efi_store)
+            .arg("--data-disk")
+            .arg(&params.data_disk_url)
+            .arg("--workspace")
+            .arg(&workspace)
+            .arg("--config-dir")
+            .arg(&config_dir)
+            .arg("--artifacts-dir")
+            .arg(&artifacts_dir)
+            .arg("--enable-network")
+            .arg("--dispatch-port")
+            .arg(DEFAULT_DISPATCH_PORT.to_string())
+            .arg("--guest-ready-timeout-secs")
+            .arg(params.ready_timeout_secs.to_string())
+            .arg("--console-log")
+            .arg(&console_log)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(helper_stdout))
+            .stderr(Stdio::from(helper_stderr));
+        #[cfg(unix)]
+        command.process_group(0);
+
+        let mut child = command.spawn().map_err(|source| PetriError::Io {
+            path: helper_binary.clone(),
+            source,
+        })?;
+
+        let ready = wait_for_helper_ready(
+            &control_socket,
+            Duration::from_secs(params.ready_timeout_secs),
+            &mut child,
+            &HelperReadyProgress {
+                helper_stderr_path: &helper_stderr_path,
+                guest_console_path: &console_log,
+                bootstrap_log_path: &console_log,
+            },
+        );
+        if let Err(err) = ready {
+            let _ = send_helper_request::<HelperResponse>(&control_socket, &HelperRequest::Teardown);
+            let _ = terminate_process(child.id());
+            let _ = child.wait();
+            return Err(err);
+        }
+
+        // Dispatch the provision script (auto-freeze path). Its writes land on
+        // the NBD data disk; the caller seals the scratch after the VM stops.
+        let mut provision_exit_code = None;
+        let mut provision_output = None;
+        let mut succeeded = true;
+        if params.run_provision
+            && let Some(script) = &params.provision_script
+        {
+            let request = DispatchRequest::bash_command(
+                "bootstrap-provision",
+                "bash",
+                vec!["-lc".to_string(), script.clone()],
+                PathBuf::from("/workspace"),
+                std::collections::BTreeMap::new(),
+                None,
+                Some(crate::dispatch::RequestLimits {
+                    timeout_ms: Some(params.ready_timeout_secs.saturating_mul(1000)),
+                    max_output_bytes: Some(4 * 1024 * 1024),
+                }),
+            );
+            match send_helper_request::<HelperResponse>(
+                &control_socket,
+                &HelperRequest::Dispatch { request },
+            )
+            .and_then(HelperResponse::into_dispatch_result)
+            {
+                Ok(result) => {
+                    provision_exit_code = result.exit_code.flatten();
+                    succeeded = result.status == crate::dispatch::Status::Success
+                        && provision_exit_code == Some(0);
+                    provision_output = Some(format!(
+                        "stdout:\n{}\nstderr:\n{}",
+                        result.stdout.unwrap_or_default(),
+                        result.stderr.unwrap_or_default()
+                    ));
+                }
+                Err(err) => {
+                    succeeded = false;
+                    provision_output = Some(err.to_string());
+                }
+            }
+        }
+
+        // Stop the guest (quiescing scratch writes), then tear down the helper.
+        let _ = send_helper_request::<HelperResponse>(&control_socket, &HelperRequest::Stop);
+        let _ = send_helper_request::<HelperResponse>(&control_socket, &HelperRequest::Teardown);
+        let _ = terminate_process(child.id());
+        let _ = child.wait();
+
+        Ok(BootstrapBuilderRun {
+            provision_exit_code,
+            succeeded,
+            provision_output,
+        })
     }
 }
 
