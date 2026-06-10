@@ -1504,6 +1504,21 @@ fn run_nocloud_provision_and_seal(
         let _ = fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755));
     }
 
+    // Copy petri-guest into the artifacts share so provision scripts can install
+    // it into the target rootfs. Best-effort: skip silently if not found.
+    let guest_bin: PathBuf = std::env::var_os("PETRI_GUEST_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("petri-guest"));
+    if guest_bin.is_file() {
+        let dst = artifacts_dir.join("petri-guest");
+        let _ = fs::copy(&guest_bin, &dst);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o755));
+        }
+    }
+
     let helper = crate::backend::resolve_petri_vz()?;
     let nocloud_disk = fs::canonicalize(&nocloud_disk).unwrap_or(nocloud_disk);
 
