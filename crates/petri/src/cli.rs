@@ -15,11 +15,71 @@ pub enum Command {
     Create(CreateCommand),
     Dispatch(DispatchCommand),
     ImageBuild(ImageBuildCommand),
+    Image(ImageCommand),
     SandboxList(SandboxListCommand),
     SandboxConnect(InstanceCommand),
     SandboxKill(SandboxKillCommand),
+    SandboxBootstrap(SandboxBootstrapCommand),
     Stop(InstanceCommand),
     Teardown(InstanceCommand),
+}
+
+/// `petri sandbox create --bootstrap <name>:scratch --disk <nocloud> …`: boot a
+/// disposable builder VM with the image scratch attached as an NBD data disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxBootstrapCommand {
+    pub id: InstanceId,
+    pub image: String,
+    pub disk: PathBuf,
+    pub provision: Option<PathBuf>,
+    pub auto_freeze: bool,
+    pub tag: Option<String>,
+}
+
+/// A `petri image <subcommand>` operating on the named-image registry (distinct
+/// from the legacy `petri image build` bundle pipeline).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageCommand {
+    Create {
+        name: String,
+        base: Option<String>,
+        size_gib: Option<u64>,
+        /// When set, run the bootstrap loop against this nocloud EFI image and
+        /// seal the result as a frozen base layer rather than creating a bare
+        /// scratch. Mutually exclusive with `--base`.
+        from_nocloud: Option<PathBuf>,
+        /// Frozen-layer tag produced by `--from-nocloud` (default: "base").
+        tag: Option<String>,
+        /// Provision script to stage into the artifacts share for
+        /// `--from-nocloud`; defaults to the built-in trixie provisioner.
+        provision: Option<PathBuf>,
+    },
+    List,
+    Inspect {
+        reference: String,
+    },
+    Freeze {
+        reference: String,
+        tag: String,
+        provision: Option<PathBuf>,
+        force: bool,
+    },
+    Stop {
+        reference: String,
+    },
+    Delete {
+        reference: String,
+        force: bool,
+    },
+    ShowProvision {
+        reference: String,
+    },
+    Rebuild {
+        reference: String,
+        base: String,
+        tag: String,
+        disk: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,9 +187,11 @@ pub fn run_with_stdin(
             serde_json::to_string(&result).map_err(|err| PetriError::Cli(err.to_string()))
         }
         Command::ImageBuild(command) => run_image_build(command, backend),
+        Command::Image(command) => run_image_command(command, backend),
         Command::SandboxList(command) => run_sandbox_list(command, backend),
         Command::SandboxConnect(command) => run_sandbox_connect(command, backend),
         Command::SandboxKill(command) => run_sandbox_kill(command, backend),
+        Command::SandboxBootstrap(command) => run_sandbox_bootstrap(command, backend),
         Command::Stop(command) => {
             backend.stop(&command.instance_id)?;
             Ok(format!("stopped instance {}", command.instance_id))
@@ -171,12 +233,240 @@ fn parse_image(mut args: impl Iterator<Item = String>) -> Result<Command> {
 
     match subcommand.as_str() {
         "build" => parse_image_build(args),
+        "create" => parse_image_create(args),
+        "list" => parse_image_list(args),
+        "inspect" => parse_image_inspect(args),
+        "freeze" => parse_image_freeze(args),
+        "stop" => parse_image_stop(args),
+        "delete" => parse_image_delete(args),
+        "show-provision" => parse_image_show_provision(args),
+        "rebuild" => parse_image_rebuild(args),
         "--help" | "-h" | "help" => Err(PetriError::Cli(image_usage())),
         _ => Err(PetriError::Cli(format!(
             "unknown image command '{subcommand}'\n{}",
             image_usage()
         ))),
     }
+}
+
+fn parse_image_create(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let mut name = None;
+    let mut base = None;
+    let mut size_gib = None;
+    let mut from_nocloud = None;
+    let mut tag = None;
+    let mut provision = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--base" => base = Some(next_arg(&mut args, "--base")?),
+            "--size" => size_gib = Some(parse_u64(next_arg(&mut args, "--size")?, "--size")?),
+            "--from-nocloud" => {
+                from_nocloud = Some(PathBuf::from(next_arg(&mut args, "--from-nocloud")?))
+            }
+            "--tag" => tag = Some(next_arg(&mut args, "--tag")?),
+            "--provision" => {
+                provision = Some(PathBuf::from(next_arg(&mut args, "--provision")?))
+            }
+            "--help" | "-h" => return Err(PetriError::Cli(image_create_usage())),
+            _ if arg.starts_with('-') => {
+                return Err(PetriError::Cli(format!(
+                    "unknown image create argument '{arg}'"
+                )));
+            }
+            _ => {
+                if name.replace(arg.clone()).is_some() {
+                    return Err(PetriError::Cli(format!(
+                        "unexpected image create argument '{arg}'"
+                    )));
+                }
+            }
+        }
+    }
+
+    let name = name.ok_or(PetriError::MissingArgument { flag: "<name>" })?;
+    if from_nocloud.is_some() && base.is_some() {
+        return Err(PetriError::Cli(
+            "--from-nocloud and --base are mutually exclusive".to_string(),
+        ));
+    }
+    Ok(Command::Image(ImageCommand::Create {
+        name,
+        base,
+        size_gib,
+        from_nocloud,
+        tag,
+        provision,
+    }))
+}
+
+fn parse_image_list(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    if let Some(arg) = args.next() {
+        if matches!(arg.as_str(), "--help" | "-h") {
+            return Err(PetriError::Cli(
+                "usage: petri image list".to_string(),
+            ));
+        }
+        return Err(PetriError::Cli(format!(
+            "unexpected image list argument '{arg}'"
+        )));
+    }
+    Ok(Command::Image(ImageCommand::List))
+}
+
+fn parse_image_inspect(args: impl Iterator<Item = String>) -> Result<Command> {
+    let reference = single_image_ref(args, "inspect")?;
+    Ok(Command::Image(ImageCommand::Inspect { reference }))
+}
+
+fn parse_image_freeze(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let mut reference = None;
+    let mut tag = None;
+    let mut provision = None;
+    let mut force = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--tag" => tag = Some(next_arg(&mut args, "--tag")?),
+            "--provision" => provision = Some(PathBuf::from(next_arg(&mut args, "--provision")?)),
+            "--force" => force = true,
+            "--help" | "-h" => {
+                return Err(PetriError::Cli(image_freeze_usage()));
+            }
+            _ if arg.starts_with('-') => {
+                return Err(PetriError::Cli(format!(
+                    "unknown image freeze argument '{arg}'"
+                )));
+            }
+            _ => {
+                if reference.replace(arg.clone()).is_some() {
+                    return Err(PetriError::Cli(format!(
+                        "unexpected image freeze argument '{arg}'"
+                    )));
+                }
+            }
+        }
+    }
+
+    let reference = reference.ok_or(PetriError::MissingArgument {
+        flag: "<name>:scratch",
+    })?;
+    let tag = tag.ok_or(PetriError::MissingArgument { flag: "--tag" })?;
+    Ok(Command::Image(ImageCommand::Freeze {
+        reference,
+        tag,
+        provision,
+        force,
+    }))
+}
+
+fn parse_image_stop(args: impl Iterator<Item = String>) -> Result<Command> {
+    let reference = single_image_ref(args, "stop")?;
+    Ok(Command::Image(ImageCommand::Stop { reference }))
+}
+
+fn parse_image_show_provision(args: impl Iterator<Item = String>) -> Result<Command> {
+    let reference = single_image_ref(args, "show-provision")?;
+    Ok(Command::Image(ImageCommand::ShowProvision { reference }))
+}
+
+fn parse_image_rebuild(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let mut reference = None;
+    let mut base = None;
+    let mut tag = None;
+    let mut disk = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--base" => base = Some(next_arg(&mut args, "--base")?),
+            "--tag" => tag = Some(next_arg(&mut args, "--tag")?),
+            "--disk" => disk = Some(PathBuf::from(next_arg(&mut args, "--disk")?)),
+            "--help" | "-h" => return Err(PetriError::Cli(image_rebuild_usage())),
+            _ if arg.starts_with('-') => {
+                return Err(PetriError::Cli(format!(
+                    "unknown image rebuild argument '{arg}'"
+                )));
+            }
+            _ => {
+                if reference.replace(arg.clone()).is_some() {
+                    return Err(PetriError::Cli(format!(
+                        "unexpected image rebuild argument '{arg}'"
+                    )));
+                }
+            }
+        }
+    }
+    let reference = reference.ok_or(PetriError::MissingArgument {
+        flag: "<name>:<tag>",
+    })?;
+    let base = base.ok_or(PetriError::MissingArgument { flag: "--base" })?;
+    let tag = tag.ok_or(PetriError::MissingArgument { flag: "--tag" })?;
+    let disk = disk.ok_or(PetriError::MissingArgument { flag: "--disk" })?;
+    Ok(Command::Image(ImageCommand::Rebuild {
+        reference,
+        base,
+        tag,
+        disk,
+    }))
+}
+
+fn parse_image_delete(args: impl Iterator<Item = String>) -> Result<Command> {
+    let mut reference = None;
+    let mut force = false;
+    for arg in args {
+        match arg.as_str() {
+            "--force" => force = true,
+            "--help" | "-h" => {
+                return Err(PetriError::Cli(
+                    "usage: petri image delete <name>:<tag> [--force]".to_string(),
+                ));
+            }
+            _ if arg.starts_with('-') => {
+                return Err(PetriError::Cli(format!(
+                    "unknown image delete argument '{arg}'"
+                )));
+            }
+            _ => {
+                if reference.replace(arg.clone()).is_some() {
+                    return Err(PetriError::Cli(format!(
+                        "unexpected image delete argument '{arg}'"
+                    )));
+                }
+            }
+        }
+    }
+    let reference = reference.ok_or(PetriError::MissingArgument {
+        flag: "<name>:<tag>",
+    })?;
+    Ok(Command::Image(ImageCommand::Delete { reference, force }))
+}
+
+/// Parse a subcommand that takes exactly one positional `<name>:<tag>` argument.
+fn single_image_ref(args: impl Iterator<Item = String>, subcommand: &str) -> Result<String> {
+    let mut reference = None;
+    for arg in args {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                return Err(PetriError::Cli(format!(
+                    "usage: petri image {subcommand} <name>:<tag>"
+                )));
+            }
+            _ if arg.starts_with('-') => {
+                return Err(PetriError::Cli(format!(
+                    "unknown image {subcommand} argument '{arg}'"
+                )));
+            }
+            _ => {
+                if reference.replace(arg.clone()).is_some() {
+                    return Err(PetriError::Cli(format!(
+                        "unexpected image {subcommand} argument '{arg}'"
+                    )));
+                }
+            }
+        }
+    }
+    reference.ok_or(PetriError::MissingArgument {
+        flag: "<name>:<tag>",
+    })
 }
 
 fn parse_sandbox(mut args: impl Iterator<Item = String>) -> Result<Command> {
@@ -245,6 +535,12 @@ fn parse_sandbox_create(mut args: impl Iterator<Item = String>) -> Result<Comman
     let mut workspace = None;
     let mut policy = None;
     let mut metadata = BTreeMap::new();
+    let mut bootstrap = None;
+    let mut disk = None;
+    let mut data_disk = None;
+    let mut provision = None;
+    let mut auto_freeze = false;
+    let mut tag = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -257,6 +553,12 @@ fn parse_sandbox_create(mut args: impl Iterator<Item = String>) -> Result<Comman
                 next_arg(&mut args, "--metadata")?,
                 "--metadata",
             )?),
+            "--bootstrap" => bootstrap = Some(next_arg(&mut args, "--bootstrap")?),
+            "--disk" => disk = Some(PathBuf::from(next_arg(&mut args, "--disk")?)),
+            "--data-disk" => data_disk = Some(next_arg(&mut args, "--data-disk")?),
+            "--provision" => provision = Some(PathBuf::from(next_arg(&mut args, "--provision")?)),
+            "--auto-freeze" => auto_freeze = true,
+            "--tag" => tag = Some(next_arg(&mut args, "--tag")?),
             "--help" | "-h" => return Err(PetriError::Cli(sandbox_create_usage())),
             _ if arg.starts_with('-') => {
                 return Err(PetriError::Cli(format!(
@@ -277,6 +579,36 @@ fn parse_sandbox_create(mut args: impl Iterator<Item = String>) -> Result<Comman
         Some(id) => id,
         None => InstanceId::new(format!("petri-{}", unique_build_id()?))?,
     };
+
+    // The bootstrap builder is a self-contained path (no ImageBundle/workspace):
+    // boot a disposable EFI VM, attach the scratch over NBD, optionally provision
+    // and seal.
+    if let Some(image) = bootstrap {
+        if auto_freeze && provision.is_none() {
+            return Err(PetriError::Cli("--auto-freeze requires --provision".to_string()));
+        }
+        if auto_freeze && tag.is_none() {
+            return Err(PetriError::Cli("--auto-freeze requires --tag".to_string()));
+        }
+        let disk = disk.ok_or(PetriError::MissingArgument { flag: "--disk" })?;
+        return Ok(Command::SandboxBootstrap(SandboxBootstrapCommand {
+            id,
+            image,
+            disk,
+            provision,
+            auto_freeze,
+            tag,
+        }));
+    }
+
+    // Long-lived NBD data-disk attach needs a persistent daemon to host the
+    // server beyond this one-shot CLI invocation — out of scope for now.
+    if data_disk.is_some() {
+        return Err(PetriError::Cli(
+            "long-lived NBD data disk attach requires a persistent daemon (not yet implemented); use --bootstrap --auto-freeze for image builds".to_string(),
+        ));
+    }
+
     let workspace = workspace.ok_or(PetriError::MissingArgument {
         flag: "--workspace",
     })?;
@@ -835,6 +1167,550 @@ fn run_sandbox_kill(command: SandboxKillCommand, backend: &impl HostBackend) -> 
     Ok(format!("killed {} sandbox(s)", instance_ids.len()))
 }
 
+/// Orchestrate a bootstrap builder: serve the scratch over NBD, drive a
+/// disposable EFI builder VM (via the backend), then — under `--auto-freeze` —
+/// seal the live scratch in-process. The `NbdHandle` is held for the whole
+/// sequence so the VM can reach the server and the seal sees the live index.
+fn run_sandbox_bootstrap(
+    command: SandboxBootstrapCommand,
+    backend: &impl HostBackend,
+) -> Result<String> {
+    use crate::image;
+    let images_root = image::images_root();
+    let (name, scratch_tag) = image::parse_image_ref(&command.image)?;
+    if scratch_tag != image::SCRATCH_TAG {
+        return Err(PetriError::invalid_argument(format!(
+            "--bootstrap operates on the scratch overlay; expected '{name}:scratch', got '{}'",
+            command.image
+        )));
+    }
+
+    let provision_script = match &command.provision {
+        Some(path) => Some(fs::read_to_string(path).map_err(|source| PetriError::Io {
+            path: path.clone(),
+            source,
+        })?),
+        None => None,
+    };
+
+    // Start the in-process NBD server exporting the scratch; the handle keeps it
+    // alive until dropped at the end of this function.
+    let handle = image::serve_scratch(&images_root, &name)?;
+    let url = handle.url().to_string();
+    let sandbox_id = command.id.as_str().to_string();
+    if let Some(port) = image::nbd_port_from_url(&url) {
+        image::mark_serving(&images_root, &name, port, &sandbox_id)?;
+    }
+
+    let nocloud_disk = fs::canonicalize(&command.disk).unwrap_or_else(|_| command.disk.clone());
+    let params = crate::backend::BootstrapBuilderParams {
+        instance_id: command.id.clone(),
+        nocloud_disk,
+        data_disk_url: url,
+        provision_script: provision_script.clone(),
+        run_provision: command.auto_freeze,
+        ready_timeout_secs: 1800,
+    };
+
+    let run = match backend.run_bootstrap_builder(params) {
+        Ok(run) => run,
+        Err(err) => {
+            let _ = image::clear_serving(&images_root, &name, &sandbox_id);
+            return Err(err);
+        }
+    };
+
+    if command.auto_freeze {
+        if run.succeeded {
+            // record_frozen_layer rolls a fresh scratch (clearing nbd_port), so
+            // no separate clear_serving is needed on success.
+            let tag = command
+                .tag
+                .expect("--auto-freeze requires --tag (validated at parse)");
+            return image::auto_freeze(&images_root, &name, &handle, &tag, provision_script);
+        }
+        let _ = image::clear_serving(&images_root, &name, &sandbox_id);
+        return Err(PetriError::Cli(format!(
+            "provision failed (exit {:?}); {name}:scratch left unfrozen{}",
+            run.provision_exit_code,
+            run.provision_output
+                .map(|out| format!("\n{out}"))
+                .unwrap_or_default()
+        )));
+    }
+
+    let _ = image::clear_serving(&images_root, &name, &sandbox_id);
+    Ok(format!(
+        "bootstrap builder for '{name}:scratch' finished; scratch left unfrozen (use --auto-freeze --tag <tag> to seal)"
+    ))
+}
+
+fn find_nocloud_kernel_version(image: &Path) -> Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const ROOT_OFFSET: u64 = 134_217_728;
+    const SCAN_LEN: usize = 64 * 1024 * 1024;
+    const MARKER: &[u8] = b"vmlinuz-";
+
+    let mut f = fs::File::open(image).map_err(|source| PetriError::Io {
+        path: image.to_path_buf(),
+        source,
+    })?;
+    f.seek(SeekFrom::Start(ROOT_OFFSET)).map_err(|source| PetriError::Io {
+        path: image.to_path_buf(),
+        source,
+    })?;
+    let mut data = vec![0u8; SCAN_LEN];
+    let n = f.read(&mut data).map_err(|source| PetriError::Io {
+        path: image.to_path_buf(),
+        source,
+    })?;
+    data.truncate(n);
+
+    let mut offset = 0;
+    while offset + MARKER.len() <= data.len() {
+        match data[offset..].windows(MARKER.len()).position(|w| w == MARKER) {
+            None => break,
+            Some(rel) => {
+                let start = offset + rel + MARKER.len();
+                let ver_bytes: Vec<u8> = data[start..]
+                    .iter()
+                    .copied()
+                    .take_while(|&b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'+')
+                    .collect();
+                let ver = String::from_utf8_lossy(&ver_bytes).to_string();
+                if ver.contains('.') && ver.len() >= 5 {
+                    return Ok(ver);
+                }
+                offset += rel + 1;
+            }
+        }
+    }
+
+    Err(PetriError::Cli(format!(
+        "vmlinuz version not found in {} (searched {} MiB at root partition)",
+        image.display(),
+        SCAN_LEN >> 20
+    )))
+}
+
+fn parse_hdiutil_attach_output(stdout: &str) -> Option<(String, String)> {
+    let mut base_disk: Option<String> = None;
+    let mut esp_dev: Option<String> = None;
+
+    for line in stdout.lines() {
+        let mut cols = line.split_whitespace();
+        let dev = match cols.next() {
+            Some(d) if d.starts_with("/dev/disk") => d,
+            _ => continue,
+        };
+        let suffix = &dev["/dev/disk".len()..];
+        if base_disk.is_none() && !suffix.contains('s') {
+            base_disk = Some(dev.to_string());
+            continue;
+        }
+        let content = cols.next().unwrap_or("");
+        if esp_dev.is_none()
+            && (content.eq_ignore_ascii_case("efi")
+                || content.to_ascii_uppercase().starts_with("C12A7328"))
+        {
+            esp_dev = Some(dev.to_string());
+        }
+    }
+
+    match (base_disk, esp_dev) {
+        (Some(b), Some(e)) => Some((b, e)),
+        _ => None,
+    }
+}
+
+fn patch_grub_cfg(nocloud_src: &Path, mount_point: &str) -> Result<()> {
+    let grub_path = PathBuf::from(mount_point).join("EFI/debian/grub.cfg");
+
+    let cfg = fs::read_to_string(&grub_path).map_err(|source| PetriError::Io {
+        path: grub_path.clone(),
+        source,
+    })?;
+    let uuid = cfg
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            if parts.next() == Some("search.fs_uuid") {
+                parts.next().map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            PetriError::Cli(format!(
+                "search.fs_uuid not found in {}",
+                grub_path.display()
+            ))
+        })?;
+
+    let kver = find_nocloud_kernel_version(nocloud_src)?;
+
+    let new_cfg = format!(
+        "search.fs_uuid {uuid} root\n\
+         set prefix=($root)/boot/grub\n\
+         insmod part_gpt\n\
+         insmod ext2\n\
+         insmod linux\n\
+         linux ($root)/boot/vmlinuz-{kver} root=UUID={uuid} rw console=hvc0 \
+         systemd.firstboot=0 \
+         systemd.mount-extra=petri-artifacts:/mnt/petri-artifacts:virtiofs \
+         systemd.run=/mnt/petri-artifacts/provision.sh \
+         systemd.run_success_action=poweroff \
+         systemd.run_failure_action=poweroff\n\
+         initrd ($root)/boot/initrd.img-{kver}\n\
+         boot\n"
+    );
+
+    fs::write(&grub_path, new_cfg.as_bytes()).map_err(|source| PetriError::Io {
+        path: grub_path.clone(),
+        source,
+    })?;
+
+    Ok(())
+}
+
+fn patch_nocloud_esp_mounted(nocloud_src: &Path, esp_dev: &str) -> Result<()> {
+    let status = ProcessCommand::new("diskutil")
+        .args(["mount", esp_dev])
+        .status()
+        .map_err(|source| PetriError::Io { path: PathBuf::from("diskutil"), source })?;
+    if !status.success() {
+        return Err(PetriError::Cli(format!("diskutil mount {esp_dev} failed")));
+    }
+
+    let info = ProcessCommand::new("diskutil")
+        .args(["info", esp_dev])
+        .output()
+        .map_err(|source| PetriError::Io { path: PathBuf::from("diskutil"), source })?;
+    let info_text = String::from_utf8_lossy(&info.stdout).to_string();
+    let mount_point = info_text
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("Mount Point:")
+                .map(|v| v.trim().to_string())
+        })
+        .filter(|mp| !mp.is_empty())
+        .ok_or_else(|| {
+            PetriError::Cli(format!(
+                "Mount Point not found in diskutil info:\n{info_text}"
+            ))
+        })?;
+
+    let result = patch_grub_cfg(nocloud_src, &mount_point);
+
+    let _ = ProcessCommand::new("diskutil")
+        .args(["unmount", esp_dev])
+        .output();
+
+    result
+}
+
+fn patch_nocloud_esp(nocloud_src: &Path, patched_out: &Path) -> Result<()> {
+    let status = ProcessCommand::new("cp")
+        .arg("-c")
+        .arg(nocloud_src)
+        .arg(patched_out)
+        .status()
+        .map_err(|source| PetriError::Io { path: PathBuf::from("cp"), source })?;
+    if !status.success() {
+        return Err(PetriError::Cli(format!(
+            "cp -c {} -> {} failed: {:?}",
+            nocloud_src.display(),
+            patched_out.display(),
+            status.code()
+        )));
+    }
+
+    let out = ProcessCommand::new("hdiutil")
+        .args(["attach", "-imagekey", "diskimage-class=CRawDiskImage", "-nomount"])
+        .arg(patched_out)
+        .output()
+        .map_err(|source| PetriError::Io { path: PathBuf::from("hdiutil"), source })?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        return Err(PetriError::Cli(format!("hdiutil attach failed: {msg}")));
+    }
+    let attach_stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let (base_disk, esp_dev) =
+        parse_hdiutil_attach_output(&attach_stdout).ok_or_else(|| {
+            PetriError::Cli(format!(
+                "could not parse hdiutil attach output:\n{attach_stdout}"
+            ))
+        })?;
+
+    let result = patch_nocloud_esp_mounted(nocloud_src, &esp_dev);
+
+    let _ = ProcessCommand::new("hdiutil")
+        .args(["detach", "-force", &base_disk])
+        .output();
+
+    result
+}
+
+const DEFAULT_PROVISION_SCRIPT: &str =
+    include_str!("../../petri-nbd/examples/provision.sh");
+
+/// `petri image create --from-nocloud <disk>`: drive petri-vz directly (no
+/// MacosBackend). Stages provision.sh into a temp artifacts dir, boots the
+/// nocloud EFI VM with `--data-disk` (NBD scratch) and `--artifacts-dir`,
+/// waits for petri-vz to exit via `--exit-on-guest-stop`, then seals.
+fn run_image_create_from_nocloud(
+    images_root: &Path,
+    name: &str,
+    nocloud_disk: PathBuf,
+    tag: &str,
+    provision_path: Option<&Path>,
+    size_gib: Option<u64>,
+) -> Result<String> {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    use crate::image;
+
+    image::validate_freeze_tag(tag)?;
+
+    // 1. Create image entry + blank scratch.
+    image::create(images_root, name, None, size_gib)?;
+
+    // 2. Read provision script.
+    let provision_script = match provision_path {
+        Some(path) => fs::read_to_string(path).map_err(|source| PetriError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?,
+        None => DEFAULT_PROVISION_SCRIPT.to_string(),
+    };
+
+    // 3. Serve scratch over in-process NBD.
+    let handle = image::serve_scratch(images_root, name)?;
+    let url = handle.url().to_string();
+    let sandbox_id = format!("petri-create-{}", unique_build_id()?);
+    if let Some(port) = image::nbd_port_from_url(&url) {
+        image::mark_serving(images_root, name, port, &sandbox_id)?;
+    }
+
+    let instance_id = format!("petri-create-{}", unique_build_id()?);
+    let instance_dir = crate::backend::instances_dir().join(&instance_id);
+    let artifacts_dir = instance_dir.join("artifacts");
+    let workspace_dir = instance_dir.join("workspace");
+    let config_dir = instance_dir.join("config");
+    let console_log = instance_dir.join("guest-console.log");
+    let helper_stderr = instance_dir.join("petri-vz.stderr.log");
+    let helper_stdout = instance_dir.join("petri-vz.stdout.log");
+    let efi_store = instance_dir.join("efi-variable-store");
+    let control_sock = instance_dir.join("petri-vz.sock");
+
+    for dir in [&artifacts_dir, &workspace_dir, &config_dir] {
+        fs::create_dir_all(dir).map_err(|source| PetriError::Io { path: dir.clone(), source })?;
+    }
+
+    // 4. Stage provision.sh into the artifacts virtiofs share.
+    let script_path = artifacts_dir.join("provision.sh");
+    fs::write(&script_path, &provision_script).map_err(|source| PetriError::Io {
+        path: script_path.clone(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755));
+    }
+
+    // 5. Resolve petri-vz binary (honours PETRI_VZ_BIN).
+    let helper = crate::backend::resolve_petri_vz()?;
+    let nocloud_disk = fs::canonicalize(&nocloud_disk).unwrap_or(nocloud_disk);
+
+    // 4b. Clone nocloud image and patch its ESP grub.cfg for headless provision.
+    let patched_disk = instance_dir.join("boot.raw");
+    patch_nocloud_esp(&nocloud_disk, &patched_disk)?;
+
+    let stdout_file = fs::File::create(&helper_stdout).map_err(|source| PetriError::Io {
+        path: helper_stdout.clone(), source,
+    })?;
+    let stderr_file = fs::File::create(&helper_stderr).map_err(|source| PetriError::Io {
+        path: helper_stderr.clone(), source,
+    })?;
+
+    // 6. Spawn petri-vz directly — same pattern as nbd_provision_smoke.rs.
+    let mut child = ProcessCommand::new(&helper)
+        .arg("--instance-id").arg(&instance_id)
+        .arg("--control-socket").arg(&control_sock)
+        .arg("--boot-mode").arg("efi")
+        .arg("--disk").arg(&patched_disk)
+        .arg("--efi-variable-store").arg(&efi_store)
+        .arg("--data-disk").arg(&url)
+        .arg("--artifacts-dir").arg(&artifacts_dir)
+        .arg("--workspace").arg(&workspace_dir)
+        .arg("--config-dir").arg(&config_dir)
+        .arg("--console-log").arg(&console_log)
+        .arg("--enable-network")
+        .arg("--exit-on-guest-stop")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .map_err(|source| PetriError::Io { path: helper.clone(), source })?;
+
+    // 7. Wait for petri-vz to exit (guest self-poweroff) or timeout.
+    let timeout_secs = 3600u64;
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let exit_status = loop {
+        match child.try_wait().map_err(|source| PetriError::Io { path: helper.clone(), source })? {
+            Some(status) => break status,
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = image::clear_serving(images_root, name, &sandbox_id);
+                    return Err(PetriError::Cli(format!(
+                        "image create timed out after {timeout_secs}s (console: {})",
+                        console_log.display()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    };
+
+    let _ = fs::remove_file(&patched_disk);
+
+    // 8. Seal or report failure.
+    if exit_status.success() {
+        image::auto_freeze(images_root, name, &handle, tag, Some(provision_script))
+    } else {
+        let _ = image::clear_serving(images_root, name, &sandbox_id);
+        Err(PetriError::Cli(format!(
+            "bootstrap builder for '{name}' exited with failure (console: {})",
+            console_log.display()
+        )))
+    }
+}
+
+fn run_image_command(command: ImageCommand, backend: &impl HostBackend) -> Result<String> {
+    let images_root = crate::image::images_root();
+    match command {
+        ImageCommand::Create {
+            name,
+            base,
+            size_gib,
+            from_nocloud,
+            tag,
+            provision,
+        } => {
+            if let Some(nocloud_disk) = from_nocloud {
+                run_image_create_from_nocloud(
+                    &images_root,
+                    &name,
+                    nocloud_disk,
+                    tag.as_deref().unwrap_or("base"),
+                    provision.as_deref(),
+                    size_gib,
+                )
+            } else {
+                let base = base
+                    .as_deref()
+                    .map(crate::image::parse_image_ref)
+                    .transpose()?;
+                let base_ref = base.as_ref().map(|(n, t)| (n.as_str(), t.as_str()));
+                crate::image::create(&images_root, &name, base_ref, size_gib)
+            }
+        }
+        ImageCommand::List => crate::image::list(&images_root),
+        ImageCommand::Inspect { reference } => {
+            let (name, tag) = crate::image::parse_image_ref(&reference)?;
+            crate::image::inspect(&images_root, &name, &tag)
+        }
+        ImageCommand::Freeze {
+            reference,
+            tag,
+            provision,
+            force,
+        } => {
+            let (name, scratch_tag) = crate::image::parse_image_ref(&reference)?;
+            if scratch_tag != crate::image::SCRATCH_TAG {
+                return Err(PetriError::invalid_argument(format!(
+                    "freeze operates on the scratch overlay; expected '{name}:scratch', got '{reference}'"
+                )));
+            }
+            crate::image::freeze(&images_root, &name, &tag, provision.as_deref(), force)
+        }
+        ImageCommand::Stop { reference } => {
+            let (name, scratch_tag) = crate::image::parse_image_ref(&reference)?;
+            if scratch_tag != crate::image::SCRATCH_TAG {
+                return Err(PetriError::invalid_argument(format!(
+                    "stop operates on the scratch overlay; expected '{name}:scratch', got '{reference}'"
+                )));
+            }
+            crate::image::stop(&images_root, &name)
+        }
+        ImageCommand::Delete { reference, force } => {
+            let (name, tag) = crate::image::parse_image_ref(&reference)?;
+            crate::image::delete(&images_root, &name, &tag, force)
+        }
+        ImageCommand::ShowProvision { reference } => {
+            let (name, tag) = crate::image::parse_image_ref(&reference)?;
+            crate::image::show_provision(&images_root, &name, &tag)
+        }
+        ImageCommand::Rebuild {
+            reference,
+            base,
+            tag,
+            disk,
+        } => {
+            let (name, src_tag) = crate::image::parse_image_ref(&reference)?;
+            run_image_rebuild(&images_root, &name, &src_tag, &base, &tag, disk, backend)
+        }
+    }
+}
+
+/// `petri image rebuild <name>:<tag> --base <name>:<tag> --tag <new> --disk
+/// <nocloud>`: re-provision a frozen layer from its stored script. Composes the
+/// existing pieces — provision lookup, reset-scratch-over-base, and the
+/// bootstrap/auto-freeze builder — rather than duplicating their logic.
+fn run_image_rebuild(
+    images_root: &Path,
+    name: &str,
+    src_tag: &str,
+    base: &str,
+    new_tag: &str,
+    disk: PathBuf,
+    backend: &impl HostBackend,
+) -> Result<String> {
+    use crate::image;
+    image::validate_freeze_tag(new_tag)?;
+    // 1. The source layer must be frozen and carry a provision script.
+    let script = image::provision_for_rebuild(images_root, name, src_tag)?;
+    // 2. Ensure a fresh scratch over the requested base.
+    let (base_name, base_tag) = image::parse_image_ref(base)?;
+    image::reset_scratch_over_base(images_root, name, &base_name, &base_tag)?;
+
+    // 3. Stage the stored script to a temp file and run the bootstrap builder
+    //    with --auto-freeze, which seals the rebuilt scratch as <name>:<new_tag>.
+    let script_path =
+        std::env::temp_dir().join(format!("petri-rebuild-{}-{}.sh", name, unique_build_id()?));
+    fs::write(&script_path, &script).map_err(|source| PetriError::Io {
+        path: script_path.clone(),
+        source,
+    })?;
+
+    let command = SandboxBootstrapCommand {
+        id: InstanceId::new(format!("petri-rebuild-{}", unique_build_id()?))?,
+        image: format!("{name}:{}", crate::image::SCRATCH_TAG),
+        disk,
+        provision: Some(script_path.clone()),
+        auto_freeze: true,
+        tag: Some(new_tag.to_string()),
+    };
+    let result = run_sandbox_bootstrap(command, backend);
+    let _ = fs::remove_file(&script_path);
+    result
+}
+
 fn run_image_build(command: ImageBuildCommand, backend: &impl HostBackend) -> Result<String> {
     if command.prepare_builder {
         return run_prepare_builder(command, backend);
@@ -1334,6 +2210,7 @@ fn write_cloud_init_seed(
         source,
     })
 }
+
 
 fn builder_cloud_init(
     guest_binary_in_vm: &Path,
@@ -2324,7 +3201,7 @@ fn sandbox_list_usage() -> String {
 }
 
 fn sandbox_create_usage() -> String {
-    "usage: petri sandbox create [base] --workspace <path> --policy <path> [--id <id>] [--image <path>] [--backend macos|stub] [--metadata key=value,key2=value2]".to_string()
+    "usage: petri sandbox create [base] --workspace <path> --policy <path> [--id <id>] [--image <path>] [--backend macos|stub] [--metadata key=value,key2=value2]\n       petri sandbox create --bootstrap <name>:scratch --disk <nocloud> [--provision <path>] [--auto-freeze --tag <tag>]".to_string()
 }
 
 fn sandbox_connect_usage() -> String {
@@ -2349,10 +3226,26 @@ fn dispatch_usage() -> String {
 
 fn image_usage() -> String {
     format!(
-        "usage: petri image <command> [options]\n\ncommands:\n  build  {}\n\n{}",
+        "usage: petri image <command> [options]\n\ncommands:\n  build    {}\n  create   {}\n  list     petri image list\n  inspect  petri image inspect <name>:<tag>\n  freeze   {}\n  stop     petri image stop <name>:scratch\n  delete   petri image delete <name>:<tag> [--force]\n  show-provision  petri image show-provision <name>:<tag>\n  rebuild  {}\n\n{}",
         image_build_usage(),
+        image_create_usage(),
+        image_freeze_usage(),
+        image_rebuild_usage(),
         "Set PETRI_IMAGE_BUILD_SCRIPT to override the bundled builder path."
     )
+}
+
+fn image_create_usage() -> String {
+    "usage: petri image create <name> [--base <name>:<tag>] [--size <gib>]\n       petri image create <name> --from-nocloud <image.raw> [--tag <tag>] [--provision <script>] [--size <gib>]".to_string()
+}
+
+fn image_freeze_usage() -> String {
+    "usage: petri image freeze <name>:scratch --tag <tag> [--provision <path>] [--force]".to_string()
+}
+
+fn image_rebuild_usage() -> String {
+    "usage: petri image rebuild <name>:<tag> --base <name>:<tag> --tag <new-tag> --disk <nocloud>"
+        .to_string()
 }
 
 fn image_build_usage() -> String {
@@ -2529,6 +3422,183 @@ mod tests {
         assert_eq!(command.config.workspace, PathBuf::from("/workspace"));
         assert_eq!(command.config.policy, PathBuf::from("policy.toml"));
         assert!(command.config.image.is_some());
+    }
+
+    #[test]
+    fn parses_image_create_with_base_and_size() {
+        let command = parse(args(&[
+            "image", "create", "rootfs", "--base", "other:trixie", "--size", "16",
+        ]))
+        .unwrap();
+        let Command::Image(ImageCommand::Create {
+            name,
+            base,
+            size_gib,
+            from_nocloud,
+            tag,
+            provision,
+        }) = command
+        else {
+            panic!("expected image create command");
+        };
+        assert_eq!(name, "rootfs");
+        assert_eq!(base.as_deref(), Some("other:trixie"));
+        assert_eq!(size_gib, Some(16));
+        assert!(from_nocloud.is_none());
+        assert!(tag.is_none());
+        assert!(provision.is_none());
+    }
+
+    #[test]
+    fn parses_image_create_from_nocloud() {
+        let command = parse(args(&[
+            "image",
+            "create",
+            "base",
+            "--from-nocloud",
+            "/tmp/debian.raw",
+            "--tag",
+            "trixie",
+        ]))
+        .unwrap();
+        let Command::Image(ImageCommand::Create {
+            name,
+            base,
+            size_gib,
+            from_nocloud,
+            tag,
+            provision,
+        }) = command
+        else {
+            panic!("expected image create command");
+        };
+        assert_eq!(name, "base");
+        assert!(base.is_none());
+        assert!(size_gib.is_none());
+        assert_eq!(from_nocloud, Some(PathBuf::from("/tmp/debian.raw")));
+        assert_eq!(tag.as_deref(), Some("trixie"));
+        assert!(provision.is_none());
+    }
+
+    #[test]
+    fn image_create_from_nocloud_and_base_are_exclusive() {
+        let result = parse(args(&[
+            "image",
+            "create",
+            "base",
+            "--from-nocloud",
+            "/tmp/debian.raw",
+            "--base",
+            "other:trixie",
+        ]));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_image_freeze_command() {
+        let command = parse(args(&[
+            "image", "freeze", "rootfs:scratch", "--tag", "v1", "--force",
+        ]))
+        .unwrap();
+        let Command::Image(ImageCommand::Freeze {
+            reference,
+            tag,
+            provision,
+            force,
+        }) = command
+        else {
+            panic!("expected image freeze command");
+        };
+        assert_eq!(reference, "rootfs:scratch");
+        assert_eq!(tag, "v1");
+        assert!(provision.is_none());
+        assert!(force);
+    }
+
+    #[test]
+    fn parses_image_rebuild_command() {
+        let command = parse(args(&[
+            "image", "rebuild", "app:v1", "--base", "app:base", "--tag", "v2", "--disk", "seed.img",
+        ]))
+        .unwrap();
+        let Command::Image(ImageCommand::Rebuild {
+            reference,
+            base,
+            tag,
+            disk,
+        }) = command
+        else {
+            panic!("expected image rebuild command");
+        };
+        assert_eq!(reference, "app:v1");
+        assert_eq!(base, "app:base");
+        assert_eq!(tag, "v2");
+        assert_eq!(disk, PathBuf::from("seed.img"));
+    }
+
+    #[test]
+    fn parses_sandbox_bootstrap_command() {
+        let command = parse(args(&[
+            "sandbox",
+            "create",
+            "--bootstrap",
+            "img:scratch",
+            "--disk",
+            "seed.img",
+            "--provision",
+            "p.sh",
+            "--auto-freeze",
+            "--tag",
+            "v1",
+        ]))
+        .unwrap();
+        let Command::SandboxBootstrap(cmd) = command else {
+            panic!("expected sandbox bootstrap command");
+        };
+        assert_eq!(cmd.image, "img:scratch");
+        assert_eq!(cmd.disk, PathBuf::from("seed.img"));
+        assert_eq!(cmd.provision, Some(PathBuf::from("p.sh")));
+        assert!(cmd.auto_freeze);
+        assert_eq!(cmd.tag.as_deref(), Some("v1"));
+    }
+
+    #[test]
+    fn sandbox_bootstrap_auto_freeze_requires_provision_and_tag() {
+        let err = parse(args(&[
+            "sandbox",
+            "create",
+            "--bootstrap",
+            "img:scratch",
+            "--disk",
+            "s.img",
+            "--auto-freeze",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert_eq!(err, "--auto-freeze requires --provision");
+
+        let err = parse(args(&[
+            "sandbox",
+            "create",
+            "--bootstrap",
+            "img:scratch",
+            "--disk",
+            "s.img",
+            "--auto-freeze",
+            "--provision",
+            "p.sh",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert_eq!(err, "--auto-freeze requires --tag");
+    }
+
+    #[test]
+    fn sandbox_data_disk_attach_is_stubbed() {
+        let err = parse(args(&["sandbox", "create", "--data-disk", "img:scratch"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("persistent daemon"), "{err}");
     }
 
     #[test]

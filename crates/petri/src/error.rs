@@ -80,6 +80,13 @@ impl std::fmt::Display for PetriError {
 }
 
 impl PetriError {
+    /// A freeform invalid-argument failure (e.g. a malformed `<name>:<tag>`
+    /// image reference). Renders the message verbatim, matching the codebase's
+    /// freeform CLI-error style.
+    pub fn invalid_argument(message: impl Into<String>) -> Self {
+        PetriError::Cli(message.into())
+    }
+
     /// Whether a dispatch failure leaves the guest VM presumed-alive, so the
     /// instance can safely return to `Ready` instead of being bricked to
     /// `Failed`. Transport hiccups, lower-level I/O on the control socket, and

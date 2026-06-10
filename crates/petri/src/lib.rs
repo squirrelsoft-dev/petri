@@ -7,6 +7,7 @@ pub mod backend;
 pub mod cli;
 pub mod dispatch;
 pub mod error;
+pub mod image;
 pub mod instance;
 pub mod sdk;
 

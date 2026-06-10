@@ -5,6 +5,7 @@ import Virtualization
 let dispatchPortDefault: UInt32 = 7777
 let workspaceTag = "workspace"
 let configTag = "petri-config"
+let artifactsTag = "petri-artifacts"
 
 func log(_ message: String) {
     fputs("petri-vz: \(message)\n", stderr)
@@ -27,14 +28,17 @@ struct Args {
     var disk: String?
     var nbdDisk: String?
     var auxiliaryDisks: [String] = []
+    var dataDisks: [String] = []
     var efiVariableStore: String?
     var workspace: String?
     var configDir: String?
+    var artifactsDir: String?
     var consoleLog: String?
     var commandLine: String?
     var dispatchPort: UInt32 = dispatchPortDefault
     var guestReadyTimeoutSecs: TimeInterval = 60
     var networkEnabled: Bool = false
+    var exitOnGuestStop: Bool = false
 
     static func parse(_ values: ArraySlice<String>) throws -> Args {
         var args = Args()
@@ -65,16 +69,24 @@ struct Args {
                 args.nbdDisk = try next(arg)
             case "--auxiliary-disk":
                 args.auxiliaryDisks.append(try next(arg))
+            case "--data-disk":
+                // Accepts a local image path or an nbd:// / nbd+unix:// URL; the
+                // attachment kind is detected by prefix in createVirtualMachine().
+                args.dataDisks.append(try next(arg))
             case "--efi-variable-store":
                 args.efiVariableStore = try next(arg)
             case "--workspace":
                 args.workspace = try next(arg)
             case "--config-dir":
                 args.configDir = try next(arg)
+            case "--artifacts-dir":
+                args.artifactsDir = try next(arg)
             case "--console-log":
                 args.consoleLog = try next(arg)
             case "--enable-network":
                 args.networkEnabled = true
+            case "--exit-on-guest-stop":
+                args.exitOnGuestStop = true
             case "--command-line":
                 args.commandLine = try next(arg)
             case "--dispatch-port":
@@ -266,6 +278,8 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
     private var virtualMachine: VZVirtualMachine?
     // Retained because `VZNetworkBlockDeviceStorageDeviceAttachment.delegate` is weak.
     private var nbdDelegate: NBDAttachmentLogger?
+    // Retained for the same reason: one logger per NBD-backed --data-disk.
+    private var dataDiskDelegates: [NBDAttachmentLogger] = []
 
     init(args: Args) {
         self.args = args
@@ -287,15 +301,19 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
                         return
                     }
 
-                    log("VM started; waiting for guest vsock port \(self.args.dispatchPort)")
-                    DispatchQueue.global(qos: .userInitiated).async {
-                        do {
-                            try self.waitForGuestVsock()
-                            log("guest vsock port is ready")
-                            self.setState(.ready)
-                        } catch {
-                            log("guest vsock wait failed: \(error)")
-                            self.fail("\(error)")
+                    if self.args.exitOnGuestStop {
+                        log("VM started; waiting for guest to stop (--exit-on-guest-stop)")
+                    } else {
+                        log("VM started; waiting for guest vsock port \(self.args.dispatchPort)")
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            do {
+                                try self.waitForGuestVsock()
+                                log("guest vsock port is ready")
+                                self.setState(.ready)
+                            } catch {
+                                log("guest vsock wait failed: \(error)")
+                                self.fail("\(error)")
+                            }
                         }
                     }
                 }
@@ -374,6 +392,10 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
 
     func guestDidStop(_ virtualMachine: VZVirtualMachine) {
         setState(.stopped)
+        if args.exitOnGuestStop {
+            log("guest stopped; exiting (--exit-on-guest-stop)")
+            exit(0)
+        }
     }
 
     private func setState(_ value: HelperState) {
@@ -400,6 +422,10 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
 
         configuration.bootLoader = try bootLoader()
 
+        // Disk attachment order (determines guest device names):
+        //   vda:  --disk or --nbd-disk (boot disk, exactly one required)
+        //   vdb+: --auxiliary-disk entries in flag order (read-only image files)
+        //   next: --data-disk entries in flag order (read-write, image file or NBD URL)
         var storageDevices: [VZStorageDeviceConfiguration] = [
             VZVirtioBlockDeviceConfiguration(attachment: try bootDiskAttachment())
         ]
@@ -408,11 +434,41 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
                 VZVirtioBlockDeviceConfiguration(attachment: try diskAttachment(path: auxiliaryDisk, readOnly: true))
             )
         }
+        for dataDisk in args.dataDisks {
+            let attachment: VZStorageDeviceAttachment
+            if dataDisk.hasPrefix("nbd://") || dataDisk.hasPrefix("nbd+unix://") {
+                guard let url = URL(string: dataDisk) else {
+                    throw HelperError("invalid --data-disk NBD URL '\(dataDisk)'")
+                }
+                log("attaching NBD data disk: \(dataDisk)")
+                let delegate = NBDAttachmentLogger()
+                // Retain the delegate — the framework holds it weakly.
+                self.dataDiskDelegates.append(delegate)
+                let nbd = try VZNetworkBlockDeviceStorageDeviceAttachment(
+                    url: url,
+                    timeout: 30,
+                    isForcedReadOnly: false,
+                    synchronizationMode: .full
+                )
+                nbd.delegate = delegate
+                attachment = nbd
+            } else {
+                log("attaching local data disk image: \(dataDisk)")
+                attachment = try diskAttachment(path: dataDisk, readOnly: false)
+            }
+            storageDevices.append(VZVirtioBlockDeviceConfiguration(attachment: attachment))
+        }
         configuration.storageDevices = storageDevices
-        configuration.directorySharingDevices = [
+        var directoryShares = [
             directoryShare(tag: workspaceTag, path: args.workspace!, readOnly: false),
             directoryShare(tag: configTag, path: args.configDir!, readOnly: true),
         ]
+        // Optional read-only artifacts share for the bootstrap builder: carries
+        // the provision script and petri-guest at tag "petri-artifacts".
+        if let artifactsDir = args.artifactsDir, !artifactsDir.isEmpty {
+            directoryShares.append(directoryShare(tag: artifactsTag, path: artifactsDir, readOnly: true))
+        }
+        configuration.directorySharingDevices = directoryShares
         configuration.socketDevices = [VZVirtioSocketDeviceConfiguration()]
         if args.networkEnabled {
             log("policy enables networking; attaching NAT network device")
