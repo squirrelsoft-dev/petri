@@ -1293,6 +1293,16 @@ fn canonical_bundle_file(bundle_dir: &Path, relative: &Path, name: &str) -> Resu
     Ok(canonical)
 }
 
+/// Returns the instances state directory (`~/.petri/instances` by default).
+pub fn instances_dir() -> PathBuf {
+    default_state_dir()
+}
+
+/// Resolves the petri-vz helper binary, honouring `PETRI_VZ_BIN`.
+pub fn resolve_petri_vz() -> Result<PathBuf> {
+    resolve_helper_binary(&default_helper_binary())
+}
+
 fn resolve_helper_binary(configured: &Path) -> Result<PathBuf> {
     if configured.components().count() <= 1 && !configured.is_absolute() {
         let repo_helper = repo_root_fallback()

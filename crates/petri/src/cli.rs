@@ -44,6 +44,15 @@ pub enum ImageCommand {
         name: String,
         base: Option<String>,
         size_gib: Option<u64>,
+        /// When set, run the bootstrap loop against this nocloud EFI image and
+        /// seal the result as a frozen base layer rather than creating a bare
+        /// scratch. Mutually exclusive with `--base`.
+        from_nocloud: Option<PathBuf>,
+        /// Frozen-layer tag produced by `--from-nocloud` (default: "base").
+        tag: Option<String>,
+        /// Provision script to stage into the artifacts share for
+        /// `--from-nocloud`; defaults to the built-in trixie provisioner.
+        provision: Option<PathBuf>,
     },
     List,
     Inspect {
@@ -244,11 +253,21 @@ fn parse_image_create(mut args: impl Iterator<Item = String>) -> Result<Command>
     let mut name = None;
     let mut base = None;
     let mut size_gib = None;
+    let mut from_nocloud = None;
+    let mut tag = None;
+    let mut provision = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--base" => base = Some(next_arg(&mut args, "--base")?),
             "--size" => size_gib = Some(parse_u64(next_arg(&mut args, "--size")?, "--size")?),
+            "--from-nocloud" => {
+                from_nocloud = Some(PathBuf::from(next_arg(&mut args, "--from-nocloud")?))
+            }
+            "--tag" => tag = Some(next_arg(&mut args, "--tag")?),
+            "--provision" => {
+                provision = Some(PathBuf::from(next_arg(&mut args, "--provision")?))
+            }
             "--help" | "-h" => return Err(PetriError::Cli(image_create_usage())),
             _ if arg.starts_with('-') => {
                 return Err(PetriError::Cli(format!(
@@ -266,10 +285,18 @@ fn parse_image_create(mut args: impl Iterator<Item = String>) -> Result<Command>
     }
 
     let name = name.ok_or(PetriError::MissingArgument { flag: "<name>" })?;
+    if from_nocloud.is_some() && base.is_some() {
+        return Err(PetriError::Cli(
+            "--from-nocloud and --base are mutually exclusive".to_string(),
+        ));
+    }
     Ok(Command::Image(ImageCommand::Create {
         name,
         base,
         size_gib,
+        from_nocloud,
+        tag,
+        provision,
     }))
 }
 
@@ -1218,6 +1245,352 @@ fn run_sandbox_bootstrap(
     ))
 }
 
+fn find_nocloud_kernel_version(image: &Path) -> Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const ROOT_OFFSET: u64 = 134_217_728;
+    const SCAN_LEN: usize = 64 * 1024 * 1024;
+    const MARKER: &[u8] = b"vmlinuz-";
+
+    let mut f = fs::File::open(image).map_err(|source| PetriError::Io {
+        path: image.to_path_buf(),
+        source,
+    })?;
+    f.seek(SeekFrom::Start(ROOT_OFFSET)).map_err(|source| PetriError::Io {
+        path: image.to_path_buf(),
+        source,
+    })?;
+    let mut data = vec![0u8; SCAN_LEN];
+    let n = f.read(&mut data).map_err(|source| PetriError::Io {
+        path: image.to_path_buf(),
+        source,
+    })?;
+    data.truncate(n);
+
+    let mut offset = 0;
+    while offset + MARKER.len() <= data.len() {
+        match data[offset..].windows(MARKER.len()).position(|w| w == MARKER) {
+            None => break,
+            Some(rel) => {
+                let start = offset + rel + MARKER.len();
+                let ver_bytes: Vec<u8> = data[start..]
+                    .iter()
+                    .copied()
+                    .take_while(|&b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'+')
+                    .collect();
+                let ver = String::from_utf8_lossy(&ver_bytes).to_string();
+                if ver.contains('.') && ver.len() >= 5 {
+                    return Ok(ver);
+                }
+                offset += rel + 1;
+            }
+        }
+    }
+
+    Err(PetriError::Cli(format!(
+        "vmlinuz version not found in {} (searched {} MiB at root partition)",
+        image.display(),
+        SCAN_LEN >> 20
+    )))
+}
+
+fn parse_hdiutil_attach_output(stdout: &str) -> Option<(String, String)> {
+    let mut base_disk: Option<String> = None;
+    let mut esp_dev: Option<String> = None;
+
+    for line in stdout.lines() {
+        let mut cols = line.split_whitespace();
+        let dev = match cols.next() {
+            Some(d) if d.starts_with("/dev/disk") => d,
+            _ => continue,
+        };
+        let suffix = &dev["/dev/disk".len()..];
+        if base_disk.is_none() && !suffix.contains('s') {
+            base_disk = Some(dev.to_string());
+            continue;
+        }
+        let content = cols.next().unwrap_or("");
+        if esp_dev.is_none()
+            && (content.eq_ignore_ascii_case("efi")
+                || content.to_ascii_uppercase().starts_with("C12A7328"))
+        {
+            esp_dev = Some(dev.to_string());
+        }
+    }
+
+    match (base_disk, esp_dev) {
+        (Some(b), Some(e)) => Some((b, e)),
+        _ => None,
+    }
+}
+
+fn patch_grub_cfg(nocloud_src: &Path, mount_point: &str) -> Result<()> {
+    let grub_path = PathBuf::from(mount_point).join("EFI/debian/grub.cfg");
+
+    let cfg = fs::read_to_string(&grub_path).map_err(|source| PetriError::Io {
+        path: grub_path.clone(),
+        source,
+    })?;
+    let uuid = cfg
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            if parts.next() == Some("search.fs_uuid") {
+                parts.next().map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            PetriError::Cli(format!(
+                "search.fs_uuid not found in {}",
+                grub_path.display()
+            ))
+        })?;
+
+    let kver = find_nocloud_kernel_version(nocloud_src)?;
+
+    let new_cfg = format!(
+        "search.fs_uuid {uuid} root\n\
+         set prefix=($root)/boot/grub\n\
+         insmod part_gpt\n\
+         insmod ext2\n\
+         insmod linux\n\
+         linux ($root)/boot/vmlinuz-{kver} root=UUID={uuid} rw console=hvc0 \
+         systemd.firstboot=0 \
+         systemd.mount-extra=petri-artifacts:/mnt/petri-artifacts:virtiofs \
+         systemd.run=/mnt/petri-artifacts/provision.sh \
+         systemd.run_success_action=poweroff \
+         systemd.run_failure_action=poweroff\n\
+         initrd ($root)/boot/initrd.img-{kver}\n\
+         boot\n"
+    );
+
+    fs::write(&grub_path, new_cfg.as_bytes()).map_err(|source| PetriError::Io {
+        path: grub_path.clone(),
+        source,
+    })?;
+
+    Ok(())
+}
+
+fn patch_nocloud_esp_mounted(nocloud_src: &Path, esp_dev: &str) -> Result<()> {
+    let status = ProcessCommand::new("diskutil")
+        .args(["mount", esp_dev])
+        .status()
+        .map_err(|source| PetriError::Io { path: PathBuf::from("diskutil"), source })?;
+    if !status.success() {
+        return Err(PetriError::Cli(format!("diskutil mount {esp_dev} failed")));
+    }
+
+    let info = ProcessCommand::new("diskutil")
+        .args(["info", esp_dev])
+        .output()
+        .map_err(|source| PetriError::Io { path: PathBuf::from("diskutil"), source })?;
+    let info_text = String::from_utf8_lossy(&info.stdout).to_string();
+    let mount_point = info_text
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("Mount Point:")
+                .map(|v| v.trim().to_string())
+        })
+        .filter(|mp| !mp.is_empty())
+        .ok_or_else(|| {
+            PetriError::Cli(format!(
+                "Mount Point not found in diskutil info:\n{info_text}"
+            ))
+        })?;
+
+    let result = patch_grub_cfg(nocloud_src, &mount_point);
+
+    let _ = ProcessCommand::new("diskutil")
+        .args(["unmount", esp_dev])
+        .output();
+
+    result
+}
+
+fn patch_nocloud_esp(nocloud_src: &Path, patched_out: &Path) -> Result<()> {
+    let status = ProcessCommand::new("cp")
+        .arg("-c")
+        .arg(nocloud_src)
+        .arg(patched_out)
+        .status()
+        .map_err(|source| PetriError::Io { path: PathBuf::from("cp"), source })?;
+    if !status.success() {
+        return Err(PetriError::Cli(format!(
+            "cp -c {} -> {} failed: {:?}",
+            nocloud_src.display(),
+            patched_out.display(),
+            status.code()
+        )));
+    }
+
+    let out = ProcessCommand::new("hdiutil")
+        .args(["attach", "-imagekey", "diskimage-class=CRawDiskImage", "-nomount"])
+        .arg(patched_out)
+        .output()
+        .map_err(|source| PetriError::Io { path: PathBuf::from("hdiutil"), source })?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        return Err(PetriError::Cli(format!("hdiutil attach failed: {msg}")));
+    }
+    let attach_stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let (base_disk, esp_dev) =
+        parse_hdiutil_attach_output(&attach_stdout).ok_or_else(|| {
+            PetriError::Cli(format!(
+                "could not parse hdiutil attach output:\n{attach_stdout}"
+            ))
+        })?;
+
+    let result = patch_nocloud_esp_mounted(nocloud_src, &esp_dev);
+
+    let _ = ProcessCommand::new("hdiutil")
+        .args(["detach", "-force", &base_disk])
+        .output();
+
+    result
+}
+
+const DEFAULT_PROVISION_SCRIPT: &str =
+    include_str!("../../petri-nbd/examples/provision.sh");
+
+/// `petri image create --from-nocloud <disk>`: drive petri-vz directly (no
+/// MacosBackend). Stages provision.sh into a temp artifacts dir, boots the
+/// nocloud EFI VM with `--data-disk` (NBD scratch) and `--artifacts-dir`,
+/// waits for petri-vz to exit via `--exit-on-guest-stop`, then seals.
+fn run_image_create_from_nocloud(
+    images_root: &Path,
+    name: &str,
+    nocloud_disk: PathBuf,
+    tag: &str,
+    provision_path: Option<&Path>,
+    size_gib: Option<u64>,
+) -> Result<String> {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    use crate::image;
+
+    image::validate_freeze_tag(tag)?;
+
+    // 1. Create image entry + blank scratch.
+    image::create(images_root, name, None, size_gib)?;
+
+    // 2. Read provision script.
+    let provision_script = match provision_path {
+        Some(path) => fs::read_to_string(path).map_err(|source| PetriError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?,
+        None => DEFAULT_PROVISION_SCRIPT.to_string(),
+    };
+
+    // 3. Serve scratch over in-process NBD.
+    let handle = image::serve_scratch(images_root, name)?;
+    let url = handle.url().to_string();
+    let sandbox_id = format!("petri-create-{}", unique_build_id()?);
+    if let Some(port) = image::nbd_port_from_url(&url) {
+        image::mark_serving(images_root, name, port, &sandbox_id)?;
+    }
+
+    let instance_id = format!("petri-create-{}", unique_build_id()?);
+    let instance_dir = crate::backend::instances_dir().join(&instance_id);
+    let artifacts_dir = instance_dir.join("artifacts");
+    let workspace_dir = instance_dir.join("workspace");
+    let config_dir = instance_dir.join("config");
+    let console_log = instance_dir.join("guest-console.log");
+    let helper_stderr = instance_dir.join("petri-vz.stderr.log");
+    let helper_stdout = instance_dir.join("petri-vz.stdout.log");
+    let efi_store = instance_dir.join("efi-variable-store");
+    let control_sock = instance_dir.join("petri-vz.sock");
+
+    for dir in [&artifacts_dir, &workspace_dir, &config_dir] {
+        fs::create_dir_all(dir).map_err(|source| PetriError::Io { path: dir.clone(), source })?;
+    }
+
+    // 4. Stage provision.sh into the artifacts virtiofs share.
+    let script_path = artifacts_dir.join("provision.sh");
+    fs::write(&script_path, &provision_script).map_err(|source| PetriError::Io {
+        path: script_path.clone(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755));
+    }
+
+    // 5. Resolve petri-vz binary (honours PETRI_VZ_BIN).
+    let helper = crate::backend::resolve_petri_vz()?;
+    let nocloud_disk = fs::canonicalize(&nocloud_disk).unwrap_or(nocloud_disk);
+
+    // 4b. Clone nocloud image and patch its ESP grub.cfg for headless provision.
+    let patched_disk = instance_dir.join("boot.raw");
+    patch_nocloud_esp(&nocloud_disk, &patched_disk)?;
+
+    let stdout_file = fs::File::create(&helper_stdout).map_err(|source| PetriError::Io {
+        path: helper_stdout.clone(), source,
+    })?;
+    let stderr_file = fs::File::create(&helper_stderr).map_err(|source| PetriError::Io {
+        path: helper_stderr.clone(), source,
+    })?;
+
+    // 6. Spawn petri-vz directly — same pattern as nbd_provision_smoke.rs.
+    let mut child = ProcessCommand::new(&helper)
+        .arg("--instance-id").arg(&instance_id)
+        .arg("--control-socket").arg(&control_sock)
+        .arg("--boot-mode").arg("efi")
+        .arg("--disk").arg(&patched_disk)
+        .arg("--efi-variable-store").arg(&efi_store)
+        .arg("--data-disk").arg(&url)
+        .arg("--artifacts-dir").arg(&artifacts_dir)
+        .arg("--workspace").arg(&workspace_dir)
+        .arg("--config-dir").arg(&config_dir)
+        .arg("--console-log").arg(&console_log)
+        .arg("--enable-network")
+        .arg("--exit-on-guest-stop")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .map_err(|source| PetriError::Io { path: helper.clone(), source })?;
+
+    // 7. Wait for petri-vz to exit (guest self-poweroff) or timeout.
+    let timeout_secs = 3600u64;
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let exit_status = loop {
+        match child.try_wait().map_err(|source| PetriError::Io { path: helper.clone(), source })? {
+            Some(status) => break status,
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = image::clear_serving(images_root, name, &sandbox_id);
+                    return Err(PetriError::Cli(format!(
+                        "image create timed out after {timeout_secs}s (console: {})",
+                        console_log.display()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+    };
+
+    let _ = fs::remove_file(&patched_disk);
+
+    // 8. Seal or report failure.
+    if exit_status.success() {
+        image::auto_freeze(images_root, name, &handle, tag, Some(provision_script))
+    } else {
+        let _ = image::clear_serving(images_root, name, &sandbox_id);
+        Err(PetriError::Cli(format!(
+            "bootstrap builder for '{name}' exited with failure (console: {})",
+            console_log.display()
+        )))
+    }
+}
+
 fn run_image_command(command: ImageCommand, backend: &impl HostBackend) -> Result<String> {
     let images_root = crate::image::images_root();
     match command {
@@ -1225,13 +1598,27 @@ fn run_image_command(command: ImageCommand, backend: &impl HostBackend) -> Resul
             name,
             base,
             size_gib,
+            from_nocloud,
+            tag,
+            provision,
         } => {
-            let base = base
-                .as_deref()
-                .map(crate::image::parse_image_ref)
-                .transpose()?;
-            let base_ref = base.as_ref().map(|(n, t)| (n.as_str(), t.as_str()));
-            crate::image::create(&images_root, &name, base_ref, size_gib)
+            if let Some(nocloud_disk) = from_nocloud {
+                run_image_create_from_nocloud(
+                    &images_root,
+                    &name,
+                    nocloud_disk,
+                    tag.as_deref().unwrap_or("base"),
+                    provision.as_deref(),
+                    size_gib,
+                )
+            } else {
+                let base = base
+                    .as_deref()
+                    .map(crate::image::parse_image_ref)
+                    .transpose()?;
+                let base_ref = base.as_ref().map(|(n, t)| (n.as_str(), t.as_str()));
+                crate::image::create(&images_root, &name, base_ref, size_gib)
+            }
         }
         ImageCommand::List => crate::image::list(&images_root),
         ImageCommand::Inspect { reference } => {
@@ -1823,6 +2210,7 @@ fn write_cloud_init_seed(
         source,
     })
 }
+
 
 fn builder_cloud_init(
     guest_binary_in_vm: &Path,
@@ -2848,7 +3236,7 @@ fn image_usage() -> String {
 }
 
 fn image_create_usage() -> String {
-    "usage: petri image create <name> [--base <name>:<tag>] [--size <gib>]".to_string()
+    "usage: petri image create <name> [--base <name>:<tag>] [--size <gib>]\n       petri image create <name> --from-nocloud <image.raw> [--tag <tag>] [--provision <script>] [--size <gib>]".to_string()
 }
 
 fn image_freeze_usage() -> String {
@@ -3046,6 +3434,9 @@ mod tests {
             name,
             base,
             size_gib,
+            from_nocloud,
+            tag,
+            provision,
         }) = command
         else {
             panic!("expected image create command");
@@ -3053,6 +3444,54 @@ mod tests {
         assert_eq!(name, "rootfs");
         assert_eq!(base.as_deref(), Some("other:trixie"));
         assert_eq!(size_gib, Some(16));
+        assert!(from_nocloud.is_none());
+        assert!(tag.is_none());
+        assert!(provision.is_none());
+    }
+
+    #[test]
+    fn parses_image_create_from_nocloud() {
+        let command = parse(args(&[
+            "image",
+            "create",
+            "base",
+            "--from-nocloud",
+            "/tmp/debian.raw",
+            "--tag",
+            "trixie",
+        ]))
+        .unwrap();
+        let Command::Image(ImageCommand::Create {
+            name,
+            base,
+            size_gib,
+            from_nocloud,
+            tag,
+            provision,
+        }) = command
+        else {
+            panic!("expected image create command");
+        };
+        assert_eq!(name, "base");
+        assert!(base.is_none());
+        assert!(size_gib.is_none());
+        assert_eq!(from_nocloud, Some(PathBuf::from("/tmp/debian.raw")));
+        assert_eq!(tag.as_deref(), Some("trixie"));
+        assert!(provision.is_none());
+    }
+
+    #[test]
+    fn image_create_from_nocloud_and_base_are_exclusive() {
+        let result = parse(args(&[
+            "image",
+            "create",
+            "base",
+            "--from-nocloud",
+            "/tmp/debian.raw",
+            "--base",
+            "other:trixie",
+        ]));
+        assert!(result.is_err());
     }
 
     #[test]

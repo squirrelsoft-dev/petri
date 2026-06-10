@@ -1,5 +1,5 @@
 # PROJECT STATE
-_Last updated: 2026-06-09 by /close (#15 spore-core integration contract complete)_
+_Last updated: 2026-06-10 (petri image create --from-nocloud implemented; needs e2e verification)_
 
 ## Current State
 Petri is an early-stage microVM sandbox for running untrusted agent
@@ -155,6 +155,21 @@ boot hang if it recurs; optionally guard #14 in macOS CI) and breadth of backend
 toward the multi-platform north star (Linux Firecracker #16, then Windows
 Hyper-V #18).
 
+`petri image create --from-nocloud <image.raw>` is now implemented
+(branch `petri-image-management`). The command boots a nocloud EFI VM
+with a blank NBD scratch as the data disk (`--exit-on-guest-stop` mode),
+waits for petri-vz to exit after the guest self-powers-off, then seals
+the scratch as a named frozen base layer. The built-in provision script
+(`crates/petri-nbd/examples/provision.sh`, embedded in the binary) runs
+mmdebstrap and can be overridden with `--provision <script>`. The frozen
+layer tag defaults to "base" and is overridable with `--tag`. The
+`exit_on_guest_stop` mode was added to `BootstrapBuilderParams` in
+`crates/petri/src/backend.rs`; the existing `sandbox bootstrap
+--auto-freeze` control-socket path is unchanged. All 90 unit tests pass.
+The next step is running `petri image create --from-nocloud` against the
+prepared builder image end-to-end to confirm the sealed layer boots as a
+sandbox base image via `petri sandbox create --base <name>:base`.
+
 ## Known Deviations
 1. #31 was resolved more strongly than its `documentation` label implied:
    instead of documenting the shell-allowlist footgun, we built a command
@@ -229,6 +244,17 @@ clients shipped (#26), and the spore-core integration contract published (#15).
 Consumption proper (the `PetriSandboxProvider`) now happens in the spore-core
 repo. The remaining levers here are reliability and backend breadth — pick the
 next based on whether spore-core integration surfaces a reliability blocker first.
+0. **Verify `petri image create --from-nocloud` end-to-end** (immediate next,
+   branch `petri-image-management`). The CLI command is implemented; run it against
+   the prepared builder image to confirm the sealed layer boots as a sandbox base:
+   `petri image create --from-nocloud target/petri-builder-cache/debian-13-nocloud-arm64.raw base`
+   then `petri sandbox create --base base:base`. If the nocloud image needs its ESP
+   patched with `systemd.run=` + virtiofs mount cmdline before provision.sh runs,
+   reuse or extend `configure_builder_efi_console` to produce a cached patched copy.
+1. **`petri image rebuild`** — re-provision an existing frozen layer from its stored
+   script. Now that `--from-nocloud` / `exit_on_guest_stop` mode exists in
+   `BootstrapBuilderParams`, `run_image_rebuild` can be wired to use it instead of
+   the control-socket dispatch path. This makes rebuild consistent with create.
 1. #16 — implement the Linux Firecracker/KVM backend. Highest-leverage next step
    toward the "run on your own hardware" north star: today only the macOS/Apple
    Virtualization backend exists, which blocks self-hosted-server use. The

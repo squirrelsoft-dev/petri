@@ -38,6 +38,7 @@ struct Args {
     var dispatchPort: UInt32 = dispatchPortDefault
     var guestReadyTimeoutSecs: TimeInterval = 60
     var networkEnabled: Bool = false
+    var exitOnGuestStop: Bool = false
 
     static func parse(_ values: ArraySlice<String>) throws -> Args {
         var args = Args()
@@ -84,6 +85,8 @@ struct Args {
                 args.consoleLog = try next(arg)
             case "--enable-network":
                 args.networkEnabled = true
+            case "--exit-on-guest-stop":
+                args.exitOnGuestStop = true
             case "--command-line":
                 args.commandLine = try next(arg)
             case "--dispatch-port":
@@ -298,15 +301,19 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
                         return
                     }
 
-                    log("VM started; waiting for guest vsock port \(self.args.dispatchPort)")
-                    DispatchQueue.global(qos: .userInitiated).async {
-                        do {
-                            try self.waitForGuestVsock()
-                            log("guest vsock port is ready")
-                            self.setState(.ready)
-                        } catch {
-                            log("guest vsock wait failed: \(error)")
-                            self.fail("\(error)")
+                    if self.args.exitOnGuestStop {
+                        log("VM started; waiting for guest to stop (--exit-on-guest-stop)")
+                    } else {
+                        log("VM started; waiting for guest vsock port \(self.args.dispatchPort)")
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            do {
+                                try self.waitForGuestVsock()
+                                log("guest vsock port is ready")
+                                self.setState(.ready)
+                            } catch {
+                                log("guest vsock wait failed: \(error)")
+                                self.fail("\(error)")
+                            }
                         }
                     }
                 }
@@ -385,6 +392,10 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
 
     func guestDidStop(_ virtualMachine: VZVirtualMachine) {
         setState(.stopped)
+        if args.exitOnGuestStop {
+            log("guest stopped; exiting (--exit-on-guest-stop)")
+            exit(0)
+        }
     }
 
     private func setState(_ value: HelperState) {
