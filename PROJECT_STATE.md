@@ -1,5 +1,5 @@
 # PROJECT STATE
-_Last updated: 2026-06-10 (petri image create --from-nocloud implemented; needs e2e verification)_
+_Last updated: 2026-06-10 by /close_
 
 ## Current State
 Petri is an early-stage microVM sandbox for running untrusted agent
@@ -151,24 +151,28 @@ contracted, implemented, client-accessible, and the integration boundary is
 specified. Consumption proper — implementing the `PetriSandboxProvider` against
 this contract — now proceeds in the **spore-core repo** (out of scope here). The
 levers remaining in *this* repo are reliability (re-diagnose the `sandbox create`
-boot hang if it recurs; optionally guard #14 in macOS CI) and breadth of backends
-toward the multi-platform north star (Linux Firecracker #16, then Windows
-Hyper-V #18).
+boot hang if it recurs; optionally guard #14 in macOS CI), image management
+follow-up (`petri image rebuild`), and breadth of backends toward the multi-platform
+north star (Linux Firecracker #16, then Windows Hyper-V #18). Image creation
+(`petri image create --from-nocloud`, #20/#22) is now fully delivered and e2e
+verified.
 
-`petri image create --from-nocloud <image.raw>` is now implemented
-(branch `petri-image-management`). The command boots a nocloud EFI VM
-with a blank NBD scratch as the data disk (`--exit-on-guest-stop` mode),
-waits for petri-vz to exit after the guest self-powers-off, then seals
-the scratch as a named frozen base layer. The built-in provision script
+`petri image create --from-nocloud <image.raw>` is now fully implemented
+and verified end-to-end (#20/#22, merged `petri-image-management`,
+`6d20e7b`). The command boots a nocloud EFI VM with a blank NBD scratch
+as the data disk (`--exit-on-guest-stop` mode), waits for petri-vz to
+exit after the guest self-powers-off, then seals the scratch as a named
+frozen base layer. ESP patching with `systemd.run=` + virtiofs mount
+cmdline is applied before boot. The built-in provision script
 (`crates/petri-nbd/examples/provision.sh`, embedded in the binary) runs
 mmdebstrap and can be overridden with `--provision <script>`. The frozen
-layer tag defaults to "base" and is overridable with `--tag`. The
-`exit_on_guest_stop` mode was added to `BootstrapBuilderParams` in
-`crates/petri/src/backend.rs`; the existing `sandbox bootstrap
---auto-freeze` control-socket path is unchanged. All 90 unit tests pass.
-The next step is running `petri image create --from-nocloud` against the
-prepared builder image end-to-end to confirm the sealed layer boots as a
-sandbox base image via `petri sandbox create --base <name>:base`.
+layer tag defaults to "base" and is overridable with `--tag`. Verified:
+the sealed layer boots correctly as a sandbox base via
+`petri sandbox create --base base:base`. The petri-nbd block storage
+foundation (#22) underpinning this — all five milestones (local block
+stack, in-tree NBD export, AVF boot smoke test, scratch→immutable seal,
+layer store + GC + boot benchmark) plus self-describing footer metadata
+— is complete.
 
 ## Known Deviations
 1. #31 was resolved more strongly than its `documentation` label implied:
@@ -238,38 +242,26 @@ sandbox base image via `petri sandbox create --base <name>:base`.
    criterion is satisfied in principle but the actual wiring is #15.
 
 ## Next Actions
-Breadth + contract phase is complete: protocol contract (#24) enforced, SDK/CLI
-shape (#27/#29) on top, dispatch locked by a real-VM e2e test (#14), first-party
-clients shipped (#26), and the spore-core integration contract published (#15).
-Consumption proper (the `PetriSandboxProvider`) now happens in the spore-core
-repo. The remaining levers here are reliability and backend breadth — pick the
-next based on whether spore-core integration surfaces a reliability blocker first.
-0. **Verify `petri image create --from-nocloud` end-to-end** (immediate next,
-   branch `petri-image-management`). The CLI command is implemented; run it against
-   the prepared builder image to confirm the sealed layer boots as a sandbox base:
-   `petri image create --from-nocloud target/petri-builder-cache/debian-13-nocloud-arm64.raw base`
-   then `petri sandbox create --base base:base`. If the nocloud image needs its ESP
-   patched with `systemd.run=` + virtiofs mount cmdline before provision.sh runs,
-   reuse or extend `configure_builder_efi_console` to produce a cached patched copy.
+Breadth + contract phase is complete and image management is now fully delivered
+(#20 macOS base image builder + #22 petri-nbd block storage, both closed). The
+remaining levers are reliability and backend breadth — pick the next based on
+whether spore-core integration surfaces a reliability blocker first.
 1. **`petri image rebuild`** — re-provision an existing frozen layer from its stored
    script. Now that `--from-nocloud` / `exit_on_guest_stop` mode exists in
    `BootstrapBuilderParams`, `run_image_rebuild` can be wired to use it instead of
    the control-socket dispatch path. This makes rebuild consistent with create.
-1. #16 — implement the Linux Firecracker/KVM backend. Highest-leverage next step
+2. #16 — implement the Linux Firecracker/KVM backend. Highest-leverage next step
    toward the "run on your own hardware" north star: today only the macOS/Apple
    Virtualization backend exists, which blocks self-hosted-server use. The
    protocol/SDK/policy contracts are all backend-agnostic now, so this is a
    well-scoped second backend behind a settled boundary.
-2. Re-diagnose the `sandbox create` hang if it recurs. Historical links
+3. Re-diagnose the `sandbox create` hang if it recurs. Historical links
    (#32/#33) are all fixed, so it can no longer be attributed to them; needs a
    fresh root-cause pass (likely in the Swift helper boot/ready path). Promote to
    #1 if spore-core integration hits it in practice.
-3. Consider wiring #14's e2e test into a macOS CI lane (build + codesign
+4. Consider wiring #14's e2e test into a macOS CI lane (build + codesign
    `petri-vz`, build the base image, run `--ignored`) so the dispatch path is
    guarded automatically rather than only on demand.
-4. Follow-ups spun off #26 when there's demand: implement the reserved
-   `files`/`git`/`pty` client operations, and publish the clients to
-   npm/PyPI/the Go module proxy (they install from path today).
 5. #28 — per-instance capability tokens for command authorization. The contract
    (#15) and protocol already reserve `capability_denied`/`AuthorizationError`;
    this fills in the enforcement behind that reserved surface.
