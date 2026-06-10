@@ -285,11 +285,6 @@ fn parse_image_create(mut args: impl Iterator<Item = String>) -> Result<Command>
     }
 
     let name = name.ok_or(PetriError::MissingArgument { flag: "<name>" })?;
-    if from_nocloud.is_some() && base.is_some() {
-        return Err(PetriError::Cli(
-            "--from-nocloud and --base are mutually exclusive".to_string(),
-        ));
-    }
     Ok(Command::Image(ImageCommand::Create {
         name,
         base,
@@ -1460,41 +1455,30 @@ const DEFAULT_PROVISION_SCRIPT: &str =
 /// MacosBackend). Stages provision.sh into a temp artifacts dir, boots the
 /// nocloud EFI VM with `--data-disk` (NBD scratch) and `--artifacts-dir`,
 /// waits for petri-vz to exit via `--exit-on-guest-stop`, then seals.
-fn run_image_create_from_nocloud(
+/// Shared boot-and-seal path for both `image create --from-nocloud` and
+/// `image rebuild`: serves the named image's scratch over in-process NBD,
+/// patches the nocloud EFI boot disk to inject `systemd.run=provision.sh`,
+/// waits for petri-vz to exit via `--exit-on-guest-stop`, then seals the
+/// scratch as a frozen layer tagged `tag`.
+fn run_nocloud_provision_and_seal(
     images_root: &Path,
     name: &str,
+    provision_script: String,
     nocloud_disk: PathBuf,
     tag: &str,
-    provision_path: Option<&Path>,
-    size_gib: Option<u64>,
 ) -> Result<String> {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
     use crate::image;
 
-    image::validate_freeze_tag(tag)?;
-
-    // 1. Create image entry + blank scratch.
-    image::create(images_root, name, None, size_gib)?;
-
-    // 2. Read provision script.
-    let provision_script = match provision_path {
-        Some(path) => fs::read_to_string(path).map_err(|source| PetriError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?,
-        None => DEFAULT_PROVISION_SCRIPT.to_string(),
-    };
-
-    // 3. Serve scratch over in-process NBD.
     let handle = image::serve_scratch(images_root, name)?;
     let url = handle.url().to_string();
-    let sandbox_id = format!("petri-create-{}", unique_build_id()?);
+    let sandbox_id = format!("petri-build-{}", unique_build_id()?);
     if let Some(port) = image::nbd_port_from_url(&url) {
         image::mark_serving(images_root, name, port, &sandbox_id)?;
     }
 
-    let instance_id = format!("petri-create-{}", unique_build_id()?);
+    let instance_id = format!("petri-build-{}", unique_build_id()?);
     let instance_dir = crate::backend::instances_dir().join(&instance_id);
     let artifacts_dir = instance_dir.join("artifacts");
     let workspace_dir = instance_dir.join("workspace");
@@ -1509,7 +1493,6 @@ fn run_image_create_from_nocloud(
         fs::create_dir_all(dir).map_err(|source| PetriError::Io { path: dir.clone(), source })?;
     }
 
-    // 4. Stage provision.sh into the artifacts virtiofs share.
     let script_path = artifacts_dir.join("provision.sh");
     fs::write(&script_path, &provision_script).map_err(|source| PetriError::Io {
         path: script_path.clone(),
@@ -1521,11 +1504,9 @@ fn run_image_create_from_nocloud(
         let _ = fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755));
     }
 
-    // 5. Resolve petri-vz binary (honours PETRI_VZ_BIN).
     let helper = crate::backend::resolve_petri_vz()?;
     let nocloud_disk = fs::canonicalize(&nocloud_disk).unwrap_or(nocloud_disk);
 
-    // 4b. Clone nocloud image and patch its ESP grub.cfg for headless provision.
     let patched_disk = instance_dir.join("boot.raw");
     patch_nocloud_esp(&nocloud_disk, &patched_disk)?;
 
@@ -1536,7 +1517,6 @@ fn run_image_create_from_nocloud(
         path: helper_stderr.clone(), source,
     })?;
 
-    // 6. Spawn petri-vz directly — same pattern as nbd_provision_smoke.rs.
     let mut child = ProcessCommand::new(&helper)
         .arg("--instance-id").arg(&instance_id)
         .arg("--control-socket").arg(&control_sock)
@@ -1556,7 +1536,6 @@ fn run_image_create_from_nocloud(
         .spawn()
         .map_err(|source| PetriError::Io { path: helper.clone(), source })?;
 
-    // 7. Wait for petri-vz to exit (guest self-poweroff) or timeout.
     let timeout_secs = 3600u64;
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let exit_status = loop {
@@ -1568,7 +1547,7 @@ fn run_image_create_from_nocloud(
                     let _ = child.wait();
                     let _ = image::clear_serving(images_root, name, &sandbox_id);
                     return Err(PetriError::Cli(format!(
-                        "image create timed out after {timeout_secs}s (console: {})",
+                        "bootstrap builder for '{name}' timed out after {timeout_secs}s (console: {})",
                         console_log.display()
                     )));
                 }
@@ -1579,7 +1558,6 @@ fn run_image_create_from_nocloud(
 
     let _ = fs::remove_file(&patched_disk);
 
-    // 8. Seal or report failure.
     if exit_status.success() {
         image::auto_freeze(images_root, name, &handle, tag, Some(provision_script))
     } else {
@@ -1589,6 +1567,33 @@ fn run_image_create_from_nocloud(
             console_log.display()
         )))
     }
+}
+
+fn run_image_create_from_nocloud(
+    images_root: &Path,
+    name: &str,
+    nocloud_disk: PathBuf,
+    tag: &str,
+    provision_path: Option<&Path>,
+    size_gib: Option<u64>,
+    base: Option<&str>,
+) -> Result<String> {
+    use crate::image;
+
+    image::validate_freeze_tag(tag)?;
+    let base_ref = base.map(crate::image::parse_image_ref).transpose()?;
+    let base_tuple = base_ref.as_ref().map(|(n, t)| (n.as_str(), t.as_str()));
+    image::create(images_root, name, base_tuple, size_gib)?;
+
+    let provision_script = match provision_path {
+        Some(path) => fs::read_to_string(path).map_err(|source| PetriError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?,
+        None => DEFAULT_PROVISION_SCRIPT.to_string(),
+    };
+
+    run_nocloud_provision_and_seal(images_root, name, provision_script, nocloud_disk, tag)
 }
 
 fn run_image_command(command: ImageCommand, backend: &impl HostBackend) -> Result<String> {
@@ -1610,6 +1615,7 @@ fn run_image_command(command: ImageCommand, backend: &impl HostBackend) -> Resul
                     tag.as_deref().unwrap_or("base"),
                     provision.as_deref(),
                     size_gib,
+                    base.as_deref(),
                 )
             } else {
                 let base = base
@@ -1669,9 +1675,8 @@ fn run_image_command(command: ImageCommand, backend: &impl HostBackend) -> Resul
 }
 
 /// `petri image rebuild <name>:<tag> --base <name>:<tag> --tag <new> --disk
-/// <nocloud>`: re-provision a frozen layer from its stored script. Composes the
-/// existing pieces — provision lookup, reset-scratch-over-base, and the
-/// bootstrap/auto-freeze builder — rather than duplicating their logic.
+/// <nocloud>`: re-provision a frozen layer from its stored script using the
+/// same exit-on-guest-stop path as `image create --from-nocloud`.
 fn run_image_rebuild(
     images_root: &Path,
     name: &str,
@@ -1679,36 +1684,14 @@ fn run_image_rebuild(
     base: &str,
     new_tag: &str,
     disk: PathBuf,
-    backend: &impl HostBackend,
+    _backend: &impl HostBackend,
 ) -> Result<String> {
     use crate::image;
     image::validate_freeze_tag(new_tag)?;
-    // 1. The source layer must be frozen and carry a provision script.
     let script = image::provision_for_rebuild(images_root, name, src_tag)?;
-    // 2. Ensure a fresh scratch over the requested base.
     let (base_name, base_tag) = image::parse_image_ref(base)?;
     image::reset_scratch_over_base(images_root, name, &base_name, &base_tag)?;
-
-    // 3. Stage the stored script to a temp file and run the bootstrap builder
-    //    with --auto-freeze, which seals the rebuilt scratch as <name>:<new_tag>.
-    let script_path =
-        std::env::temp_dir().join(format!("petri-rebuild-{}-{}.sh", name, unique_build_id()?));
-    fs::write(&script_path, &script).map_err(|source| PetriError::Io {
-        path: script_path.clone(),
-        source,
-    })?;
-
-    let command = SandboxBootstrapCommand {
-        id: InstanceId::new(format!("petri-rebuild-{}", unique_build_id()?))?,
-        image: format!("{name}:{}", crate::image::SCRATCH_TAG),
-        disk,
-        provision: Some(script_path.clone()),
-        auto_freeze: true,
-        tag: Some(new_tag.to_string()),
-    };
-    let result = run_sandbox_bootstrap(command, backend);
-    let _ = fs::remove_file(&script_path);
-    result
+    run_nocloud_provision_and_seal(images_root, name, script, disk, new_tag)
 }
 
 fn run_image_build(command: ImageBuildCommand, backend: &impl HostBackend) -> Result<String> {
@@ -3236,7 +3219,7 @@ fn image_usage() -> String {
 }
 
 fn image_create_usage() -> String {
-    "usage: petri image create <name> [--base <name>:<tag>] [--size <gib>]\n       petri image create <name> --from-nocloud <image.raw> [--tag <tag>] [--provision <script>] [--size <gib>]".to_string()
+    "usage: petri image create <name> [--base <name>:<tag>] [--size <gib>]\n       petri image create <name> --from-nocloud <image.raw> [--tag <tag>] [--provision <script>] [--size <gib>]\n       petri image create <name> --base <name>:<tag> --from-nocloud <image.raw> [--tag <tag>] [--provision <script>]".to_string()
 }
 
 fn image_freeze_usage() -> String {
@@ -3481,17 +3464,21 @@ mod tests {
     }
 
     #[test]
-    fn image_create_from_nocloud_and_base_are_exclusive() {
-        let result = parse(args(&[
+    fn image_create_from_nocloud_with_base_parses() {
+        let cmd = parse(args(&[
             "image",
             "create",
-            "base",
+            "node",
+            "--base",
+            "base:trixie",
             "--from-nocloud",
             "/tmp/debian.raw",
-            "--base",
-            "other:trixie",
+            "--provision",
+            "/tmp/install-node.sh",
+            "--tag",
+            "trixie",
         ]));
-        assert!(result.is_err());
+        assert!(cmd.is_ok());
     }
 
     #[test]
