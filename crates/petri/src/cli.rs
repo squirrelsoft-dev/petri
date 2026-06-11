@@ -21,9 +21,22 @@ pub enum Command {
     SandboxKill(SandboxKillCommand),
     SandboxBootstrap(SandboxBootstrapCommand),
     SandboxCreateFromBase(SandboxCreateFromBaseCommand),
+    Policy(PolicyCommand),
     Internal(InternalCommand),
     Stop(InstanceCommand),
     Teardown(InstanceCommand),
+}
+
+/// A `petri policy <subcommand>` operating on the named policy-template
+/// registry (built-in defaults plus user templates under `~/.petri/policies`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyCommand {
+    List,
+    Show { name: String },
+    Path { name: String },
+    Create { name: String, from: Option<String>, force: bool },
+    Edit { name: String },
+    Remove { name: String },
 }
 
 /// `petri sandbox create <id> --base <name>:<tag> …`: boot a sandbox from a
@@ -199,7 +212,11 @@ pub fn run_with_stdin(
     stdin: Option<String>,
 ) -> Result<String> {
     match parse(args)? {
-        Command::Create(command) => {
+        Command::Create(mut command) => {
+            command.config.policy = crate::policy::resolve_reference(
+                &crate::policy::policies_root(),
+                &command.config.policy,
+            )?;
             let handle = backend.create(command.config)?;
             match command.output {
                 CreateOutput::LegacyMessage => Ok(format!(
@@ -223,7 +240,14 @@ pub fn run_with_stdin(
         Command::SandboxConnect(command) => run_sandbox_connect(command, backend),
         Command::SandboxKill(command) => run_sandbox_kill(command, backend),
         Command::SandboxBootstrap(command) => run_sandbox_bootstrap(command, backend),
-        Command::SandboxCreateFromBase(command) => run_sandbox_create_from_base(command, backend),
+        Command::SandboxCreateFromBase(mut command) => {
+            command.policy = crate::policy::resolve_reference(
+                &crate::policy::policies_root(),
+                &command.policy,
+            )?;
+            run_sandbox_create_from_base(command, backend)
+        }
+        Command::Policy(command) => run_policy_command(command),
         Command::Internal(InternalCommand::ServeNbd {
             image,
             port_file,
@@ -253,6 +277,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
         "dispatch" => parse_dispatch(args),
         "image" => parse_image(args),
         "sandbox" => parse_sandbox(args),
+        "policy" => parse_policy(args),
         "internal" => parse_internal(args),
         "stop" => parse_instance_command(args, CommandKind::Stop),
         "teardown" => parse_instance_command(args, CommandKind::Teardown),
@@ -285,6 +310,95 @@ fn parse_image(mut args: impl Iterator<Item = String>) -> Result<Command> {
             image_usage()
         ))),
     }
+}
+
+fn parse_policy(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let Some(subcommand) = args.next() else {
+        return Err(PetriError::Cli(policy_usage()));
+    };
+
+    match subcommand.as_str() {
+        "list" => {
+            if let Some(arg) = args.next() {
+                if arg == "--help" || arg == "-h" {
+                    return Err(PetriError::Cli(policy_usage()));
+                }
+                return Err(PetriError::Cli(format!(
+                    "unexpected policy list argument '{arg}'"
+                )));
+            }
+            Ok(Command::Policy(PolicyCommand::List))
+        }
+        "show" => Ok(Command::Policy(PolicyCommand::Show {
+            name: policy_name_arg(args, "show")?,
+        })),
+        "path" => Ok(Command::Policy(PolicyCommand::Path {
+            name: policy_name_arg(args, "path")?,
+        })),
+        "edit" => Ok(Command::Policy(PolicyCommand::Edit {
+            name: policy_name_arg(args, "edit")?,
+        })),
+        "remove" | "rm" => Ok(Command::Policy(PolicyCommand::Remove {
+            name: policy_name_arg(args, "remove")?,
+        })),
+        "create" => parse_policy_create(args),
+        "--help" | "-h" | "help" => Err(PetriError::Cli(policy_usage())),
+        _ => Err(PetriError::Cli(format!(
+            "unknown policy command '{subcommand}'\n{}",
+            policy_usage()
+        ))),
+    }
+}
+
+/// Parse a policy subcommand that takes exactly one positional `<name>`.
+fn policy_name_arg(args: impl Iterator<Item = String>, sub: &str) -> Result<String> {
+    let mut name = None;
+    for arg in args {
+        match arg.as_str() {
+            "--help" | "-h" => return Err(PetriError::Cli(policy_usage())),
+            _ if arg.starts_with('-') => {
+                return Err(PetriError::Cli(format!(
+                    "unknown policy {sub} argument '{arg}'"
+                )));
+            }
+            _ => {
+                if name.replace(arg.clone()).is_some() {
+                    return Err(PetriError::Cli(format!(
+                        "unexpected policy {sub} argument '{arg}'"
+                    )));
+                }
+            }
+        }
+    }
+    name.ok_or_else(|| PetriError::Cli(format!("policy {sub} requires a <name>\n{}", policy_usage())))
+}
+
+fn parse_policy_create(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let mut name = None;
+    let mut from = None;
+    let mut force = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--from" => from = Some(next_arg(&mut args, "--from")?),
+            "--force" => force = true,
+            "--help" | "-h" => return Err(PetriError::Cli(policy_usage())),
+            _ if arg.starts_with('-') => {
+                return Err(PetriError::Cli(format!(
+                    "unknown policy create argument '{arg}'"
+                )));
+            }
+            _ => {
+                if name.replace(arg.clone()).is_some() {
+                    return Err(PetriError::Cli(format!(
+                        "unexpected policy create argument '{arg}'"
+                    )));
+                }
+            }
+        }
+    }
+    let name = name
+        .ok_or_else(|| PetriError::Cli(format!("policy create requires a <name>\n{}", policy_usage())))?;
+    Ok(Command::Policy(PolicyCommand::Create { name, from, force }))
 }
 
 fn parse_image_create(mut args: impl Iterator<Item = String>) -> Result<Command> {
@@ -1989,6 +2103,20 @@ fn run_image_create_from_nocloud(
     run_nocloud_provision_and_seal(images_root, name, provision_script, nocloud_disk, tag)
 }
 
+fn run_policy_command(command: PolicyCommand) -> Result<String> {
+    let root = crate::policy::policies_root();
+    match command {
+        PolicyCommand::List => crate::policy::list(&root),
+        PolicyCommand::Show { name } => crate::policy::show(&root, &name),
+        PolicyCommand::Path { name } => crate::policy::path(&root, &name),
+        PolicyCommand::Create { name, from, force } => {
+            crate::policy::create(&root, &name, from.as_deref(), force)
+        }
+        PolicyCommand::Edit { name } => crate::policy::edit(&root, &name),
+        PolicyCommand::Remove { name } => crate::policy::remove(&root, &name),
+    }
+}
+
 fn run_image_command(command: ImageCommand, backend: &impl HostBackend) -> Result<String> {
     let images_root = crate::image::images_root();
     match command {
@@ -3535,6 +3663,7 @@ pub fn usage() -> String {
         "commands:",
         "  sandbox  create, list, exec, connect to, and kill sandboxes",
         "  image    build and inspect Petri VM images",
+        "  policy   manage reusable policy templates",
         "",
         "compatibility aliases:",
         "  create    alias for sandbox create with explicit --id",
@@ -3546,8 +3675,28 @@ pub fn usage() -> String {
         &create_usage(),
         &dispatch_usage(),
         &image_usage(),
+        &policy_usage(),
         &stop_usage(),
         &teardown_usage(),
+    ]
+    .join("\n")
+}
+
+fn policy_usage() -> String {
+    [
+        "usage: petri policy <command> [options]",
+        "",
+        "commands:",
+        "  list    list built-in and user policy templates",
+        "  show    print a template's TOML (petri policy show <name>)",
+        "  path    print a template's resolved file path (petri policy path <name>)",
+        "  create  create a user template (petri policy create <name> [--from <template>] [--force])",
+        "  edit    edit a template in $EDITOR, forking a built-in if needed (petri policy edit <name>)",
+        "  remove  remove a user template (petri policy remove <name>)",
+        "",
+        "built-in templates: locked-down, developer, yolo, fetch.",
+        "templates resolve by name wherever --policy is accepted,",
+        "e.g. 'petri sandbox create trixie --workspace . --policy developer'.",
     ]
     .join("\n")
 }
@@ -3577,7 +3726,7 @@ fn sandbox_list_usage() -> String {
 }
 
 fn sandbox_create_usage() -> String {
-    "usage: petri sandbox create [base] --workspace <path> --policy <path> [--id <id>] [--image <path>] [--backend macos|stub] [--metadata key=value,key2=value2]\n       petri sandbox create <name> --base <image>:<tag> --workspace <path> --policy <path> [--metadata key=value,...]\n       petri sandbox create --bootstrap <name>:scratch --disk <nocloud> [--provision <path>] [--auto-freeze --tag <tag>]".to_string()
+    "usage: petri sandbox create [base] --workspace <path> --policy <path|template> [--id <id>] [--image <path>] [--backend macos|stub] [--metadata key=value,key2=value2]\n       petri sandbox create <name> --base <image>:<tag> --workspace <path> --policy <path|template> [--metadata key=value,...]\n       petri sandbox create --bootstrap <name>:scratch --disk <nocloud> [--provision <path>] [--auto-freeze --tag <tag>]\n       --policy accepts a file path or a template name (see 'petri policy list')".to_string()
 }
 
 fn sandbox_connect_usage() -> String {
@@ -3593,7 +3742,7 @@ fn sandbox_kill_usage() -> String {
 }
 
 fn create_usage() -> String {
-    "usage: petri create --id <id> --workspace <path> --policy <path> [--image <path>] [--backend macos|stub]".to_string()
+    "usage: petri create --id <id> --workspace <path> --policy <path|template> [--image <path>] [--backend macos|stub]".to_string()
 }
 
 fn dispatch_usage() -> String {

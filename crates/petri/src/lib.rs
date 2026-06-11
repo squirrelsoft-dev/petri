@@ -9,6 +9,7 @@ pub mod dispatch;
 pub mod error;
 pub mod image;
 pub mod instance;
+pub mod policy;
 pub mod sdk;
 
 pub use backend::{HostBackend, MacosBackend, PetriBackend, StubBackend};

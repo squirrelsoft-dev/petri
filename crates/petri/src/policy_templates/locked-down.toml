@@ -1,0 +1,14 @@
+# locked-down: the maximally safe posture.
+# No network device is attached and the command axis is pinned at read_only
+# with no escalation room (default == max), so only non-mutating inspection
+# commands can ever run. Use for untrusted analysis of a workspace.
+[policy]
+network_enabled = false
+max_runtime_secs = 60
+max_output_bytes = 1_048_576
+workspace_path = "/workspace"
+
+[policy.command]
+default = "read_only"
+max = "read_only"
+read_only = ["ls", "cat", "rg", "find", "head", "tail", "wc", "stat", "file"]

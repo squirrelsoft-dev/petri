@@ -1,0 +1,12 @@
+# yolo: unrestricted. Full outbound egress and arbitrary command execution
+# (including shells). There is no safety margin here — use only for trusted or
+# throwaway sandboxes. Workloads still run unprivileged (drop_privileges).
+[policy]
+network_enabled = true
+max_runtime_secs = 3600
+max_output_bytes = 16_777_216
+workspace_path = "/workspace"
+
+[policy.command]
+default = "yolo"
+max = "yolo"

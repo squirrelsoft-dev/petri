@@ -8,6 +8,35 @@ Authority is expressed as ordered **capability axes**, each with a boot-default 
 
 > **Implementation status.** The `command` axis is implemented. The `network` axis is the target shape per ADR 0002 and lands in a follow-up; today network is the single immutable `network_enabled` boolean gate (no runtime escalation). The `[policy.network]` block and the network half of `set_mode` are documented here ahead of that work.
 
+## Policy Templates
+
+Rather than hand-writing a TOML file each time, reusable policies can be managed as named **templates** with the `petri policy` subcommands. Built-in templates ship with the binary; user templates live as `<name>.toml` files under `~/.petri/policies/` (overridable via `PETRI_POLICIES_DIR`). A user template whose name matches a built-in *shadows* it.
+
+| Built-in | Posture |
+|---|---|
+| `locked-down` | No network; `command` pinned at `read_only` (no escalation). Untrusted inspection. |
+| `developer` | No network; boots `read_only`, escalates to `edit` with common build tools. |
+| `yolo` | Full egress and `command = yolo` (arbitrary shells). Trusted/throwaway only. |
+| `fetch` | Network on; `read_only` → curated fetch tools (`git`, `curl`, `wget`); tight caps. |
+
+```
+petri policy list                              # built-ins + user templates, with posture
+petri policy show developer                    # print a template's TOML (pipeable)
+petri policy path developer                    # print its resolved on-disk path
+petri policy create my-ci --from developer     # new user template (defaults to --from locked-down)
+petri policy edit my-ci                         # open in $EDITOR; forks a built-in copy-on-write
+petri policy remove my-ci                       # delete a user template
+```
+
+Built-in templates are never edited or deleted in place: `petri policy edit <builtin>` forks a user copy first, and `petri policy remove <builtin>` only ever removes a user override (restoring the built-in). Templates are validated against this schema on create/edit, so the registry never holds a policy that would fail at boot.
+
+Anywhere `--policy` is accepted, you may pass a **template name** in place of a file path. An existing file always wins; otherwise a bare name resolves through the registry (user override first, then built-in):
+
+```
+petri sandbox create trixie --workspace . --policy developer     # by template name
+petri sandbox create trixie --workspace . --policy ./custom.toml  # by file path
+```
+
 ## Schema
 
 ```toml

@@ -1,0 +1,15 @@
+# fetch: dependency-fetch posture.
+# Network is on (full egress today; the network axis lands per ADR 0002) and the
+# command axis escalates from read_only to a curated set of fetch tools. Caps
+# are tight so a fetch step can't run away. No arbitrary shell.
+[policy]
+network_enabled = true
+max_runtime_secs = 120
+max_output_bytes = 1_048_576
+workspace_path = "/workspace"
+
+[policy.command]
+default = "read_only"
+max = "edit"
+read_only = ["ls", "cat", "rg", "find"]
+edit = ["git", "curl", "wget"]

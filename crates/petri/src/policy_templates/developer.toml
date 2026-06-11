@@ -1,0 +1,15 @@
+# developer: the everyday build/test posture.
+# Boots in read_only for safe inspection and can escalate (via set_mode) up to
+# edit, which adds common build and file-mutation tools. yolo is unreachable —
+# no level here runs an arbitrary shell. No outbound network.
+[policy]
+network_enabled = false
+max_runtime_secs = 600
+max_output_bytes = 4_194_304
+workspace_path = "/workspace"
+
+[policy.command]
+default = "read_only"
+max = "edit"
+read_only = ["ls", "cat", "rg", "find", "head", "tail", "wc", "stat", "file", "tree"]
+edit = ["cargo", "rustc", "git", "make", "sed", "tee", "mkdir", "cp", "mv", "touch"]
