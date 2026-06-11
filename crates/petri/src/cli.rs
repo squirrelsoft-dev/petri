@@ -20,8 +20,36 @@ pub enum Command {
     SandboxConnect(InstanceCommand),
     SandboxKill(SandboxKillCommand),
     SandboxBootstrap(SandboxBootstrapCommand),
+    SandboxCreateFromBase(SandboxCreateFromBaseCommand),
+    Internal(InternalCommand),
     Stop(InstanceCommand),
     Teardown(InstanceCommand),
+}
+
+/// `petri sandbox create <id> --base <name>:<tag> …`: boot a sandbox from a
+/// frozen layer. Orchestrated at run time (ensure per-sandbox scratch, spawn
+/// the detached NBD daemon, then boot via Linux direct boot).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxCreateFromBaseCommand {
+    pub id: InstanceId,
+    pub base: String,
+    pub workspace: PathBuf,
+    pub policy: PathBuf,
+    pub metadata: BTreeMap<String, String>,
+}
+
+/// Hidden `petri internal …` subcommands used by petri to drive its own
+/// out-of-process helpers (not part of the public CLI surface).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InternalCommand {
+    /// Persistent NBD service for a sandbox's layered disk. Spawned detached by
+    /// `sandbox create` so the export outlives the create command; holds an
+    /// advisory `flock` (single-writer) and serves until terminated.
+    ServeNbd {
+        image: String,
+        port_file: PathBuf,
+        lock_file: PathBuf,
+    },
 }
 
 /// `petri sandbox create --bootstrap <name>:scratch --disk <nocloud> …`: boot a
@@ -125,6 +153,9 @@ pub enum OutputFormat {
 pub struct SandboxKillCommand {
     pub all: bool,
     pub instance_ids: Vec<InstanceId>,
+    /// Also delete each sandbox's per-sandbox scratch image (for `--base`
+    /// sandboxes), discarding its structure entirely.
+    pub purge: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +223,12 @@ pub fn run_with_stdin(
         Command::SandboxConnect(command) => run_sandbox_connect(command, backend),
         Command::SandboxKill(command) => run_sandbox_kill(command, backend),
         Command::SandboxBootstrap(command) => run_sandbox_bootstrap(command, backend),
+        Command::SandboxCreateFromBase(command) => run_sandbox_create_from_base(command, backend),
+        Command::Internal(InternalCommand::ServeNbd {
+            image,
+            port_file,
+            lock_file,
+        }) => run_internal_serve_nbd(&image, &port_file, &lock_file),
         Command::Stop(command) => {
             backend.stop(&command.instance_id)?;
             Ok(format!("stopped instance {}", command.instance_id))
@@ -216,6 +253,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
         "dispatch" => parse_dispatch(args),
         "image" => parse_image(args),
         "sandbox" => parse_sandbox(args),
+        "internal" => parse_internal(args),
         "stop" => parse_instance_command(args, CommandKind::Stop),
         "teardown" => parse_instance_command(args, CommandKind::Teardown),
         "--help" | "-h" | "help" => Err(PetriError::Cli(usage())),
@@ -483,6 +521,41 @@ fn parse_sandbox(mut args: impl Iterator<Item = String>) -> Result<Command> {
     }
 }
 
+fn parse_internal(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let Some(subcommand) = args.next() else {
+        return Err(PetriError::Cli("usage: petri internal serve-nbd …".to_string()));
+    };
+    match subcommand.as_str() {
+        "serve-nbd" => parse_internal_serve_nbd(args),
+        _ => Err(PetriError::Cli(format!(
+            "unknown internal command '{subcommand}'"
+        ))),
+    }
+}
+
+fn parse_internal_serve_nbd(mut args: impl Iterator<Item = String>) -> Result<Command> {
+    let mut image = None;
+    let mut port_file = None;
+    let mut lock_file = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--image" => image = Some(next_arg(&mut args, "--image")?),
+            "--port-file" => port_file = Some(PathBuf::from(next_arg(&mut args, "--port-file")?)),
+            "--lock-file" => lock_file = Some(PathBuf::from(next_arg(&mut args, "--lock-file")?)),
+            other => {
+                return Err(PetriError::Cli(format!(
+                    "unexpected serve-nbd argument '{other}'"
+                )));
+            }
+        }
+    }
+    Ok(Command::Internal(InternalCommand::ServeNbd {
+        image: image.ok_or(PetriError::MissingArgument { flag: "--image" })?,
+        port_file: port_file.ok_or(PetriError::MissingArgument { flag: "--port-file" })?,
+        lock_file: lock_file.ok_or(PetriError::MissingArgument { flag: "--lock-file" })?,
+    }))
+}
+
 fn parse_sandbox_list(mut args: impl Iterator<Item = String>) -> Result<Command> {
     let mut command = SandboxListCommand {
         state: None,
@@ -531,6 +604,7 @@ fn parse_sandbox_create(mut args: impl Iterator<Item = String>) -> Result<Comman
     let mut policy = None;
     let mut metadata = BTreeMap::new();
     let mut bootstrap = None;
+    let mut base = None;
     let mut disk = None;
     let mut data_disk = None;
     let mut provision = None;
@@ -549,6 +623,7 @@ fn parse_sandbox_create(mut args: impl Iterator<Item = String>) -> Result<Comman
                 "--metadata",
             )?),
             "--bootstrap" => bootstrap = Some(next_arg(&mut args, "--bootstrap")?),
+            "--base" => base = Some(next_arg(&mut args, "--base")?),
             "--disk" => disk = Some(PathBuf::from(next_arg(&mut args, "--disk")?)),
             "--data-disk" => data_disk = Some(next_arg(&mut args, "--data-disk")?),
             "--provision" => provision = Some(PathBuf::from(next_arg(&mut args, "--provision")?)),
@@ -568,6 +643,38 @@ fn parse_sandbox_create(mut args: impl Iterator<Item = String>) -> Result<Comman
                 }
             }
         }
+    }
+
+    // Boot a sandbox from a frozen layer: per-sandbox scratch over the base,
+    // served by a detached NBD daemon, booted via Linux direct boot. The
+    // positional name is the sandbox id (it names the persistent scratch);
+    // `--id` overrides it.
+    if let Some(base) = base {
+        if image.is_some() {
+            return Err(PetriError::Cli(
+                "--base and --image are mutually exclusive".to_string(),
+            ));
+        }
+        let id = match (id, template) {
+            (Some(id), _) => id,
+            (None, Some(name)) => InstanceId::new(name)?,
+            (None, None) => {
+                return Err(PetriError::Cli(
+                    "sandbox create --base requires a sandbox name (e.g. 'petri sandbox create my-sbx --base debian:trixie')".to_string(),
+                ));
+            }
+        };
+        let workspace = workspace.ok_or(PetriError::MissingArgument {
+            flag: "--workspace",
+        })?;
+        let policy = policy.ok_or(PetriError::MissingArgument { flag: "--policy" })?;
+        return Ok(Command::SandboxCreateFromBase(SandboxCreateFromBaseCommand {
+            id,
+            base,
+            workspace,
+            policy,
+            metadata,
+        }));
     }
 
     let id = match id {
@@ -725,11 +832,13 @@ fn parse_sandbox_exec(args: impl Iterator<Item = String>) -> Result<Command> {
 
 fn parse_sandbox_kill(args: impl Iterator<Item = String>) -> Result<Command> {
     let mut all = false;
+    let mut purge = false;
     let mut instance_ids = Vec::new();
 
     for arg in args {
         match arg.as_str() {
             "--all" => all = true,
+            "--purge" => purge = true,
             "--help" | "-h" => return Err(PetriError::Cli(sandbox_kill_usage())),
             _ if arg.starts_with('-') => {
                 return Err(PetriError::Cli(format!(
@@ -749,6 +858,7 @@ fn parse_sandbox_kill(args: impl Iterator<Item = String>) -> Result<Command> {
     Ok(Command::SandboxKill(SandboxKillCommand {
         all,
         instance_ids,
+        purge,
     }))
 }
 
@@ -1155,11 +1265,38 @@ fn run_sandbox_kill(command: SandboxKillCommand, backend: &impl HostBackend) -> 
         command.instance_ids
     };
 
+    let images_root = crate::image::images_root();
     for instance_id in &instance_ids {
+        // Stop the VM first so it quiesces before its disk server goes away,
+        // then tear down the per-sandbox NBD daemon (for `--base` sandboxes).
         backend.teardown(instance_id)?;
+        teardown_sandbox_nbd(&images_root, instance_id.as_str(), command.purge);
     }
 
     Ok(format!("killed {} sandbox(s)", instance_ids.len()))
+}
+
+/// Tear down the detached NBD daemon backing a `--base` sandbox: SIGTERM the
+/// recorded PID (releasing its flock), clear serving bookkeeping, and — under
+/// `purge` — delete the per-sandbox scratch image entirely. Best-effort and a
+/// no-op for bundle-based sandboxes (no daemon, no per-sandbox image).
+fn teardown_sandbox_nbd(images_root: &Path, sandbox: &str, purge: bool) {
+    let paths = crate::image::ImagePaths::new(images_root, sandbox);
+    if !paths.exists() {
+        return;
+    }
+    let pid_file = paths.dir.join("nbd.pid");
+    if let Ok(pid_str) = fs::read_to_string(&pid_file)
+        && let Ok(pid) = pid_str.trim().parse::<u32>()
+    {
+        let _ = kill_pid(pid);
+    }
+    let _ = fs::remove_file(&pid_file);
+    let _ = fs::remove_file(paths.dir.join("nbd.port"));
+    let _ = crate::image::clear_serving(images_root, sandbox, sandbox);
+    if purge {
+        let _ = fs::remove_dir_all(&paths.dir);
+    }
 }
 
 /// Orchestrate a bootstrap builder: serve the scratch over NBD, drive a
@@ -1222,7 +1359,16 @@ fn run_sandbox_bootstrap(
             let tag = command
                 .tag
                 .expect("--auto-freeze requires --tag (validated at parse)");
-            return image::auto_freeze(&images_root, &name, &handle, &tag, provision_script);
+            return image::auto_freeze(
+                &images_root,
+                &name,
+                &handle,
+                &tag,
+                image::LayerProvenance {
+                    provision_script,
+                    boot: None,
+                },
+            );
         }
         let _ = image::clear_serving(&images_root, &name, &sandbox_id);
         return Err(PetriError::Cli(format!(
@@ -1574,7 +1720,26 @@ fn run_nocloud_provision_and_seal(
     let _ = fs::remove_file(&patched_disk);
 
     if exit_status.success() {
-        image::auto_freeze(images_root, name, &handle, tag, Some(provision_script))
+        // provision.sh copies the guest kernel/initrd into the writable
+        // workspace share; if present, seal them with the layer so it can boot
+        // as a sandbox via Linux direct boot.
+        let kernel = workspace_dir.join("vmlinuz");
+        let initrd = workspace_dir.join("initrd");
+        let boot = (kernel.is_file() && initrd.is_file()).then(|| image::BootFiles {
+            kernel,
+            initrd,
+            cmdline: SANDBOX_KERNEL_CMDLINE.to_string(),
+        });
+        image::auto_freeze(
+            images_root,
+            name,
+            &handle,
+            tag,
+            image::LayerProvenance {
+                provision_script: Some(provision_script),
+                boot,
+            },
+        )
     } else {
         let _ = image::clear_serving(images_root, name, &sandbox_id);
         Err(PetriError::Cli(format!(
@@ -1582,6 +1747,219 @@ fn run_nocloud_provision_and_seal(
             console_log.display()
         )))
     }
+}
+
+/// Kernel command line for booting a frozen layer as a sandbox. The rootfs is a
+/// bare ext4 served as the virtio-block boot disk (`vda`), with the console on
+/// the virtio console (`hvc0`).
+const SANDBOX_KERNEL_CMDLINE: &str = "root=/dev/vda rw console=hvc0";
+
+/// `petri internal serve-nbd`: serve a sandbox's layered disk over NBD until
+/// terminated. Holds a non-blocking advisory `flock` (single-writer guard) for
+/// the process lifetime, publishes the NBD URL to `port_file`, then parks. Runs
+/// as a detached child of `sandbox create` so the export outlives that command;
+/// `sandbox kill` SIGTERMs it, which drops the handle + lock. Unix-only (the
+/// microVM backends are Unix hosts).
+#[cfg(unix)]
+fn run_internal_serve_nbd(image: &str, port_file: &Path, lock_file: &Path) -> Result<String> {
+    use std::os::unix::io::AsRawFd;
+
+    // 1. Single-writer guard. Non-blocking: a held lock means this sandbox is
+    //    already running, so report that rather than blocking.
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_file)
+        .map_err(|source| PetriError::Io {
+            path: lock_file.to_path_buf(),
+            source,
+        })?;
+    // SAFETY: `lock` owns a valid open fd for the call; LOCK_NB makes flock
+    // return immediately with EWOULDBLOCK if another holder exists.
+    let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(PetriError::Cli(format!(
+            "sandbox '{image}' is already running (NBD service lock held)"
+        )));
+    }
+
+    // 2. Serve the layered disk (frozen base read-only + this sandbox's scratch
+    //    read-write). The handle keeps the in-process server alive.
+    let images_root = crate::image::images_root();
+    let handle = crate::image::serve_scratch(&images_root, image)?;
+    let url = handle.url().to_string();
+
+    // 3. Publish the URL atomically (write-then-rename) so the parent can detect
+    //    readiness and read the port.
+    let tmp = port_file.with_extension("tmp");
+    fs::write(&tmp, &url).map_err(|source| PetriError::Io {
+        path: tmp.clone(),
+        source,
+    })?;
+    fs::rename(&tmp, port_file).map_err(|source| PetriError::Io {
+        path: port_file.to_path_buf(),
+        source,
+    })?;
+
+    // 4. Park until terminated. `handle` and `lock` stay owned by this frame, so
+    //    process exit (SIGTERM from `sandbox kill`) tears down the server and
+    //    releases the advisory lock.
+    let _held = (handle, lock);
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+#[cfg(not(unix))]
+fn run_internal_serve_nbd(_image: &str, _port_file: &Path, _lock_file: &Path) -> Result<String> {
+    Err(PetriError::Cli(
+        "sandbox NBD service requires a Unix host".to_string(),
+    ))
+}
+
+/// `petri sandbox create <id> --base <name>:<tag>`: boot a sandbox from a frozen
+/// layer. Ensures a per-sandbox scratch over the base, spawns the detached NBD
+/// daemon serving it, then boots the VM via Linux direct boot through the normal
+/// backend create path. The scratch is ephemeral (fresh each boot) until the
+/// storage layer gains scratch persistence.
+fn run_sandbox_create_from_base(
+    command: SandboxCreateFromBaseCommand,
+    backend: &impl HostBackend,
+) -> Result<String> {
+    use crate::image;
+    let images_root = image::images_root();
+    let sandbox = command.id.as_str().to_string();
+    let (base_name, base_tag) = image::parse_image_ref(&command.base)?;
+
+    // 1. The base must be a frozen, sandbox-bootable layer (kernel captured).
+    let (kernel, initrd, cmdline) = image::boot_files_for(&images_root, &base_name, &base_tag)?;
+
+    // 2. Ensure this sandbox's scratch sits over the frozen base.
+    let paths = image::ImagePaths::new(&images_root, &sandbox);
+    if paths.exists() {
+        image::reset_scratch_over_base(&images_root, &sandbox, &base_name, &base_tag)?;
+    } else {
+        image::create(&images_root, &sandbox, Some((&base_name, &base_tag)), None)?;
+    }
+
+    // 3. Spawn the detached NBD daemon and wait for its URL.
+    let (nbd_url, daemon_pid) = spawn_nbd_daemon(&sandbox, &paths.dir)?;
+    if let Some(port) = image::nbd_port_from_url(&nbd_url) {
+        let _ = image::mark_serving(&images_root, &sandbox, port, &sandbox);
+    }
+
+    // 4. Boot via the normal backend create path (Linux direct boot).
+    let config = InstanceConfig::new(command.id.clone(), "macos", command.workspace, command.policy)
+        .with_metadata(command.metadata)
+        .with_direct_boot(crate::instance::DirectBoot {
+            nbd_url,
+            kernel,
+            initrd,
+            cmdline,
+        });
+
+    match backend.create(config) {
+        Ok(handle) => Ok(handle.id.to_string()),
+        Err(err) => {
+            // Boot failed: tear the daemon down so the lock/port don't leak.
+            let _ = kill_pid(daemon_pid);
+            let _ = image::clear_serving(&images_root, &sandbox, &sandbox);
+            Err(err)
+        }
+    }
+}
+
+/// Spawn `petri internal serve-nbd` detached, serving `sandbox`'s layered disk.
+/// Returns the published NBD URL and the daemon PID once it is ready. The daemon
+/// outlives this process; `sandbox kill` terminates it via the recorded PID.
+fn spawn_nbd_daemon(sandbox: &str, image_dir: &Path) -> Result<(String, u32)> {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let exe = std::env::current_exe().map_err(|source| PetriError::Io {
+        path: PathBuf::from("<current-exe>"),
+        source,
+    })?;
+    let lock_file = image_dir.join("nbd.lock");
+    let port_file = image_dir.join("nbd.port");
+    let pid_file = image_dir.join("nbd.pid");
+    let log_path = image_dir.join("nbd.log");
+    let _ = fs::remove_file(&port_file);
+
+    let log = fs::File::create(&log_path).map_err(|source| PetriError::Io {
+        path: log_path.clone(),
+        source,
+    })?;
+    let log_err = log.try_clone().map_err(|source| PetriError::Io {
+        path: log_path.clone(),
+        source,
+    })?;
+
+    let mut cmd = ProcessCommand::new(&exe);
+    cmd.arg("internal")
+        .arg("serve-nbd")
+        .arg("--image")
+        .arg(sandbox)
+        .arg("--port-file")
+        .arg(&port_file)
+        .arg("--lock-file")
+        .arg(&lock_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().map_err(|source| PetriError::Io {
+        path: exe.clone(),
+        source,
+    })?;
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| PetriError::Io { path: exe.clone(), source })?
+        {
+            let reason = fs::read_to_string(&log_path).unwrap_or_default();
+            return Err(PetriError::Cli(format!(
+                "NBD service for '{sandbox}' exited early ({status}): {}",
+                reason.trim()
+            )));
+        }
+        if let Ok(url) = fs::read_to_string(&port_file) {
+            let url = url.trim().to_string();
+            if !url.is_empty() {
+                let _ = fs::write(&pid_file, child.id().to_string());
+                return Ok((url, child.id()));
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(PetriError::Cli(format!(
+                "NBD service for '{sandbox}' did not become ready within 20s (log: {})",
+                log_path.display()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Send SIGTERM to `pid` (best-effort daemon shutdown). Unix-only.
+fn kill_pid(pid: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        // SAFETY: kill(2) with a pid and signal number has no memory-safety
+        // preconditions; an invalid pid just returns an error we ignore.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+    Ok(())
 }
 
 fn run_image_create_from_nocloud(
@@ -3199,7 +3577,7 @@ fn sandbox_list_usage() -> String {
 }
 
 fn sandbox_create_usage() -> String {
-    "usage: petri sandbox create [base] --workspace <path> --policy <path> [--id <id>] [--image <path>] [--backend macos|stub] [--metadata key=value,key2=value2]\n       petri sandbox create --bootstrap <name>:scratch --disk <nocloud> [--provision <path>] [--auto-freeze --tag <tag>]".to_string()
+    "usage: petri sandbox create [base] --workspace <path> --policy <path> [--id <id>] [--image <path>] [--backend macos|stub] [--metadata key=value,key2=value2]\n       petri sandbox create <name> --base <image>:<tag> --workspace <path> --policy <path> [--metadata key=value,...]\n       petri sandbox create --bootstrap <name>:scratch --disk <nocloud> [--provision <path>] [--auto-freeze --tag <tag>]".to_string()
 }
 
 fn sandbox_connect_usage() -> String {
@@ -3211,7 +3589,7 @@ fn sandbox_exec_usage() -> String {
 }
 
 fn sandbox_kill_usage() -> String {
-    "usage: petri sandbox kill [--all | <sandbox-id>...]".to_string()
+    "usage: petri sandbox kill [--purge] [--all | <sandbox-id>...]".to_string()
 }
 
 fn create_usage() -> String {
@@ -3420,6 +3798,74 @@ mod tests {
         assert_eq!(command.config.workspace, PathBuf::from("/workspace"));
         assert_eq!(command.config.policy, PathBuf::from("policy.toml"));
         assert!(command.config.image.is_some());
+    }
+
+    #[test]
+    fn parses_sandbox_create_from_base() {
+        let command = parse(args(&[
+            "sandbox",
+            "create",
+            "my-sbx",
+            "--base",
+            "debian:trixie",
+            "--workspace",
+            "/workspace",
+            "--policy",
+            "policy.toml",
+        ]))
+        .unwrap();
+        let Command::SandboxCreateFromBase(cmd) = command else {
+            panic!("expected sandbox create-from-base command");
+        };
+        assert_eq!(cmd.id.as_str(), "my-sbx");
+        assert_eq!(cmd.base, "debian:trixie");
+        assert_eq!(cmd.workspace, PathBuf::from("/workspace"));
+        assert_eq!(cmd.policy, PathBuf::from("policy.toml"));
+    }
+
+    #[test]
+    fn sandbox_create_base_and_image_are_exclusive() {
+        let err = parse(args(&[
+            "sandbox",
+            "create",
+            "--base",
+            "debian:trixie",
+            "--image",
+            "/tmp/bundle",
+            "--workspace",
+            "/workspace",
+            "--policy",
+            "policy.toml",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn parses_internal_serve_nbd() {
+        let command = parse(args(&[
+            "internal",
+            "serve-nbd",
+            "--image",
+            "my-sbx",
+            "--port-file",
+            "/tmp/nbd.port",
+            "--lock-file",
+            "/tmp/nbd.lock",
+        ]))
+        .unwrap();
+        let Command::Internal(InternalCommand::ServeNbd {
+            image,
+            port_file,
+            lock_file,
+        }) = command
+        else {
+            panic!("expected internal serve-nbd command");
+        };
+        assert_eq!(image, "my-sbx");
+        assert_eq!(port_file, PathBuf::from("/tmp/nbd.port"));
+        assert_eq!(lock_file, PathBuf::from("/tmp/nbd.lock"));
     }
 
     #[test]

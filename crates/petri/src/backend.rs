@@ -369,11 +369,6 @@ impl MacosBackend {
     }
 
     fn create_real_vm(&self, config: InstanceConfig) -> Result<InstanceHandle> {
-        let image_bundle = config.image.as_ref().ok_or_else(|| PetriError::InvalidConfig(
-            "macos backend requires --image <image-bundle>; set PETRI_MACOS_BACKEND_FALLBACK=loopback only for local development".to_string(),
-        ))?;
-
-        let image = ImageBundle::load(image_bundle)?;
         let policy = fs::canonicalize(&config.policy).map_err(|source| PetriError::Io {
             path: config.policy.clone(),
             source,
@@ -421,41 +416,76 @@ impl MacosBackend {
             .arg(config.id.as_str())
             .arg("--control-socket")
             .arg(&control_socket)
-            .arg("--boot-mode")
-            .arg(image.manifest.boot_mode.as_str())
-            .arg("--disk")
-            .arg(&image.disk)
             .arg("--workspace")
             .arg(&workspace)
             .arg("--config-dir")
             .arg(&config_dir)
-            .arg("--dispatch-port")
-            .arg(image.manifest.dispatch_port.to_string())
-            .arg("--guest-ready-timeout-secs")
-            .arg(image.manifest.ready_timeout_secs.to_string())
             .arg("--console-log")
             .arg(&guest_console_path)
             .stdin(Stdio::null())
             .stdout(Stdio::from(helper_stdout))
             .stderr(Stdio::from(helper_stderr));
 
-        if let Some(kernel) = &image.kernel {
-            command.arg("--kernel").arg(kernel);
-        }
-        if let Some(initrd) = &image.initrd {
-            command.arg("--initrd").arg(initrd);
-        }
-        if let Some(command_line) = &image.manifest.kernel_command_line {
-            command.arg("--command-line").arg(command_line);
-        }
-        if image.manifest.boot_mode == BootMode::Efi {
+        // Boot plan: either Linux direct boot from a per-sandbox NBD layer
+        // (`sandbox create --base`) or an image bundle. Compute the per-plan
+        // boot args plus the runtime-state fields both paths need.
+        let (ready_timeout_secs, state_image, vm) = if let Some(direct) = &config.direct_boot {
             command
-                .arg("--efi-variable-store")
-                .arg(self.instance_dir(&config.id).join("efi-variable-store"));
-        }
-        for disk in &image.auxiliary_disks {
-            command.arg("--auxiliary-disk").arg(disk);
-        }
+                .arg("--boot-mode")
+                .arg("linux")
+                .arg("--nbd-disk")
+                .arg(&direct.nbd_url)
+                .arg("--kernel")
+                .arg(&direct.kernel)
+                .arg("--initrd")
+                .arg(&direct.initrd)
+                .arg("--command-line")
+                .arg(&direct.cmdline)
+                .arg("--dispatch-port")
+                .arg(DEFAULT_DISPATCH_PORT.to_string())
+                .arg("--guest-ready-timeout-secs")
+                .arg(default_ready_timeout_secs().to_string());
+            (
+                default_ready_timeout_secs(),
+                None,
+                MacosVmSpec::direct(&direct.nbd_url),
+            )
+        } else {
+            let image_bundle = config.image.as_ref().ok_or_else(|| PetriError::InvalidConfig(
+                "macos backend requires --image <image-bundle> or --base <name>:<tag>; set PETRI_MACOS_BACKEND_FALLBACK=loopback only for local development".to_string(),
+            ))?;
+            let image = ImageBundle::load(image_bundle)?;
+            command
+                .arg("--boot-mode")
+                .arg(image.manifest.boot_mode.as_str())
+                .arg("--disk")
+                .arg(&image.disk)
+                .arg("--dispatch-port")
+                .arg(image.manifest.dispatch_port.to_string())
+                .arg("--guest-ready-timeout-secs")
+                .arg(image.manifest.ready_timeout_secs.to_string());
+            if let Some(kernel) = &image.kernel {
+                command.arg("--kernel").arg(kernel);
+            }
+            if let Some(initrd) = &image.initrd {
+                command.arg("--initrd").arg(initrd);
+            }
+            if let Some(command_line) = &image.manifest.kernel_command_line {
+                command.arg("--command-line").arg(command_line);
+            }
+            if image.manifest.boot_mode == BootMode::Efi {
+                command
+                    .arg("--efi-variable-store")
+                    .arg(self.instance_dir(&config.id).join("efi-variable-store"));
+            }
+            for disk in &image.auxiliary_disks {
+                command.arg("--auxiliary-disk").arg(disk);
+            }
+            let ready_timeout = image.manifest.ready_timeout_secs;
+            let vm = MacosVmSpec::from_image(&image.manifest);
+            (ready_timeout, Some(image.bundle_dir), vm)
+        };
+
         if policy_doc.network_enabled {
             command.arg("--enable-network");
         }
@@ -479,16 +509,16 @@ impl MacosBackend {
             workspace,
             host_policy: policy,
             guest_policy,
-            image: Some(image.bundle_dir),
+            image: state_image,
             metadata: config.metadata.clone(),
             transport: GuestTransport::Vsock,
-            vm: MacosVmSpec::from_image(&image.manifest),
+            vm,
         };
         self.write_state(&state)?;
 
         wait_for_helper_ready(
             &control_socket,
-            Duration::from_secs(image.manifest.ready_timeout_secs),
+            Duration::from_secs(ready_timeout_secs),
             &mut child,
             &HelperReadyProgress {
                 helper_stderr_path: &helper_stderr_path,
@@ -981,6 +1011,24 @@ impl MacosVmSpec {
             guest_program: format!(
                 "petri-guest --policy {GUEST_POLICY_PATH} --transport vsock --vsock-port {}",
                 manifest.dispatch_port
+            ),
+        }
+    }
+
+    /// Spec for a Linux direct-boot sandbox whose boot disk is an NBD-served
+    /// layer (`sandbox create --base`); the boot image is the NBD URL.
+    fn direct(nbd_url: &str) -> Self {
+        Self {
+            framework: "Virtualization.framework".to_string(),
+            boot_image: Some(PathBuf::from(nbd_url)),
+            workspace_mount_tag: WORKSPACE_TAG.to_string(),
+            guest_workspace_path: GUEST_WORKSPACE_PATH.to_string(),
+            config_mount_tag: CONFIG_TAG.to_string(),
+            guest_policy_path: GUEST_POLICY_PATH.to_string(),
+            dispatch_transport: "vsock".to_string(),
+            dispatch_port: DEFAULT_DISPATCH_PORT,
+            guest_program: format!(
+                "petri-guest --policy {GUEST_POLICY_PATH} --transport vsock --vsock-port {DEFAULT_DISPATCH_PORT}"
             ),
         }
     }

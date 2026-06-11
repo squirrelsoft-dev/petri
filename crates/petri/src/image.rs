@@ -75,6 +75,34 @@ pub struct LayerMeta {
     /// Full text of the provision script used to build this layer, if any.
     #[serde(default)]
     pub provision_script: Option<String>,
+    /// Path (relative to the image dir) of the extracted kernel, if this layer
+    /// is sandbox-bootable via Linux direct boot.
+    #[serde(default)]
+    pub kernel: Option<String>,
+    /// Path (relative to the image dir) of the extracted initrd, if any.
+    #[serde(default)]
+    pub initrd: Option<String>,
+    /// Kernel command line for Linux direct boot, if any.
+    #[serde(default)]
+    pub cmdline: Option<String>,
+}
+
+/// Host paths to a freshly built kernel/initrd plus the kernel command line,
+/// captured during an image build and copied next to the sealed layer so the
+/// frozen layer becomes bootable as a sandbox (Linux direct boot).
+#[derive(Debug, Clone)]
+pub struct BootFiles {
+    pub kernel: PathBuf,
+    pub initrd: PathBuf,
+    pub cmdline: String,
+}
+
+/// Build provenance recorded with a sealed layer: the provision script that
+/// produced it and the boot artifacts (kernel/initrd) extracted from it.
+#[derive(Debug, Clone, Default)]
+pub struct LayerProvenance {
+    pub provision_script: Option<String>,
+    pub boot: Option<BootFiles>,
 }
 
 impl ImageMeta {
@@ -173,6 +201,12 @@ impl ImagePaths {
     /// `.staging/` underneath it.
     pub fn layers_root(&self) -> PathBuf {
         self.dir.join("layers")
+    }
+
+    /// Directory holding a frozen layer's extracted kernel/initrd, keyed by the
+    /// layer's content-id hex (`layers/boot/<hex>/`).
+    pub fn boot_dir(&self, layer_hex: &str) -> PathBuf {
+        self.dir.join("layers").join("boot").join(layer_hex)
     }
 
     pub fn exists(&self) -> bool {
@@ -471,6 +505,12 @@ pub fn inspect(images_root: &Path, name: &str, tag: &str) -> Result<String> {
             .layer_by_tag(tag)
             .ok_or_else(|| PetriError::Cli(format!("image \"{name}\" has no tag '{tag}'")))?;
         let provision = layer.provision_script.as_deref().unwrap_or("(none)");
+        let bootable = match (&layer.kernel, &layer.cmdline) {
+            (Some(kernel), Some(cmdline)) => {
+                format!("yes (kernel: {kernel}, cmdline: {cmdline})")
+            }
+            _ => "no (no stored kernel; rebuild to make sandbox-bootable)".to_string(),
+        };
         Ok(format!(
             "image:      {name}\n\
              tag:        {tag}\n\
@@ -479,6 +519,7 @@ pub fn inspect(images_root: &Path, name: &str, tag: &str) -> Result<String> {
              parent:     {}\n\
              created_at: {}\n\
              size:       {} ({} bytes)\n\
+             bootable:   {bootable}\n\
              provision_script:\n{provision}",
             layer.id,
             meta.parent_label(layer.parent_id.as_deref()),
@@ -702,6 +743,34 @@ pub fn provision_for_rebuild(images_root: &Path, name: &str, tag: &str) -> Resul
     })
 }
 
+/// Resolve a frozen layer's boot files for Linux direct boot: absolute host
+/// paths to its kernel and initrd plus the kernel command line. Errors if the
+/// layer is missing or was sealed without a stored kernel (older images, or
+/// images built without the kernel-capture step) — such a layer cannot be
+/// booted as a sandbox and must be rebuilt.
+pub fn boot_files_for(
+    images_root: &Path,
+    name: &str,
+    tag: &str,
+) -> Result<(PathBuf, PathBuf, String)> {
+    let paths = ImagePaths::new(images_root, name);
+    let meta = load_meta(&paths)?;
+    let layer = meta.layer_by_tag(tag).ok_or_else(|| {
+        PetriError::Cli(format!("\"{name}:{tag}\" is not a frozen layer"))
+    })?;
+    match (&layer.kernel, &layer.initrd, &layer.cmdline) {
+        (Some(kernel), Some(initrd), Some(cmdline)) => Ok((
+            paths.dir.join(kernel),
+            paths.dir.join(initrd),
+            cmdline.clone(),
+        )),
+        _ => Err(PetriError::Cli(format!(
+            "\"{name}:{tag}\" has no stored kernel/initrd and cannot boot as a sandbox; \
+             rebuild it (e.g. 'petri image rebuild') with a petri that captures the kernel"
+        ))),
+    }
+}
+
 /// Ensure `<name>` has a scratch overlay sitting on the frozen `<base>:<tag>`
 /// layer, creating one if absent. Errors if a scratch already exists over a
 /// *different* parent (the caller must delete it first) — this is the rebuild
@@ -841,7 +910,7 @@ pub fn auto_freeze(
     name: &str,
     handle: &NbdHandle,
     tag: &str,
-    provision_script: Option<String>,
+    provenance: LayerProvenance,
 ) -> Result<String> {
     validate_freeze_tag(tag)?;
     let paths = ImagePaths::new(images_root, name);
@@ -875,15 +944,7 @@ pub fn auto_freeze(
             path: paths.layers_root(),
             source,
         })?;
-    record_frozen_layer(
-        images_root,
-        name,
-        &id,
-        size_bytes,
-        geometry,
-        provision_script,
-        tag,
-    )
+    record_frozen_layer(images_root, name, &id, size_bytes, geometry, tag, provenance)
 }
 
 /// Append a freshly sealed layer to `meta.json` and roll a new empty scratch on
@@ -894,22 +955,58 @@ pub fn record_frozen_layer(
     sealed_id: &LayerId,
     size_bytes: u64,
     geometry: Geometry,
-    provision_script: Option<String>,
     tag: &str,
+    provenance: LayerProvenance,
 ) -> Result<String> {
+    let LayerProvenance {
+        provision_script,
+        boot,
+    } = provenance;
     let paths = ImagePaths::new(images_root, name);
     let mut meta = load_meta(&paths)?;
     let parent_id = meta.scratch.as_ref().and_then(|s| s.parent_id.clone());
+    let hex = sealed_id.to_hex();
+
+    // Copy the extracted kernel/initrd next to the layer, keyed by content id,
+    // and record their image-relative paths so the frozen layer is bootable.
+    let (kernel, initrd, cmdline) = match boot {
+        Some(boot) => {
+            let dir = paths.boot_dir(&hex);
+            fs::create_dir_all(&dir).map_err(|source| PetriError::Io {
+                path: dir.clone(),
+                source,
+            })?;
+            let kernel_dst = dir.join("vmlinuz");
+            let initrd_dst = dir.join("initrd");
+            fs::copy(&boot.kernel, &kernel_dst).map_err(|source| PetriError::Io {
+                path: boot.kernel.clone(),
+                source,
+            })?;
+            fs::copy(&boot.initrd, &initrd_dst).map_err(|source| PetriError::Io {
+                path: boot.initrd.clone(),
+                source,
+            })?;
+            (
+                Some(format!("layers/boot/{hex}/vmlinuz")),
+                Some(format!("layers/boot/{hex}/initrd")),
+                Some(boot.cmdline),
+            )
+        }
+        None => (None, None, None),
+    };
 
     // Overwrite any same-tag entry (freeze --force / rebuild reuse).
     meta.layers.retain(|layer| layer.tag != tag);
     meta.layers.push(LayerMeta {
-        id: sealed_id.to_hex(),
+        id: hex,
         tag: tag.to_string(),
         parent_id,
         size_bytes,
         created_at: rfc3339_now(),
         provision_script,
+        kernel,
+        initrd,
+        cmdline,
     });
 
     // Roll a fresh scratch on top of the layer we just sealed.
@@ -1186,6 +1283,9 @@ mod tests {
             size_bytes: 0,
             created_at: rfc3339_now(),
             provision_script: None,
+            kernel: None,
+            initrd: None,
+            cmdline: None,
         });
         if let Some(scratch) = meta.scratch.as_mut() {
             scratch.nbd_port = Some(4321);
@@ -1293,6 +1393,9 @@ mod tests {
             size_bytes: 0,
             created_at: rfc3339_now(),
             provision_script: None,
+            kernel: None,
+            initrd: None,
+            cmdline: None,
         });
         meta.layers.push(LayerMeta {
             id: "c".repeat(64),
@@ -1301,6 +1404,9 @@ mod tests {
             size_bytes: 0,
             created_at: rfc3339_now(),
             provision_script: None,
+            kernel: None,
+            initrd: None,
+            cmdline: None,
         });
         // Scratch should not block deleting `base` here.
         meta.scratch.as_mut().unwrap().parent_id = Some("c".repeat(64));
@@ -1331,6 +1437,9 @@ mod tests {
             size_bytes: 0,
             created_at: rfc3339_now(),
             provision_script: None,
+            kernel: None,
+            initrd: None,
+            cmdline: None,
         });
         meta.scratch.as_mut().unwrap().parent_id = Some("d".repeat(64));
         save_meta(&paths, &meta).unwrap();
@@ -1360,6 +1469,9 @@ mod tests {
             size_bytes: 0,
             created_at: rfc3339_now(),
             provision_script: Some("#!/bin/sh\necho hi\n".to_string()),
+            kernel: None,
+            initrd: None,
+            cmdline: None,
         });
         meta.layers.push(LayerMeta {
             id: "f".repeat(64),
@@ -1368,6 +1480,9 @@ mod tests {
             size_bytes: 0,
             created_at: rfc3339_now(),
             provision_script: None,
+            kernel: None,
+            initrd: None,
+            cmdline: None,
         });
         save_meta(&paths, &meta).unwrap();
 
@@ -1418,7 +1533,7 @@ mod tests {
         let size = fs::metadata(&staging).map(|m| m.len()).unwrap();
         drop(sealed);
         let id = store.adopt_sealed(&staging).unwrap();
-        record_frozen_layer(root, name, &id, size, geom, None, tag).unwrap();
+        record_frozen_layer(root, name, &id, size, geom, tag, LayerProvenance::default()).unwrap();
         id
     }
 
@@ -1477,7 +1592,18 @@ mod tests {
         // The served URL carries a real loopback port.
         assert!(nbd_port_from_url(handle.url()).is_some(), "{}", handle.url());
 
-        let out = auto_freeze(&root, "blank", &handle, "snap", Some("#!/bin/sh\n".into())).unwrap();
+        let out =
+            auto_freeze(
+                &root,
+                "blank",
+                &handle,
+                "snap",
+                LayerProvenance {
+                    provision_script: Some("#!/bin/sh\n".into()),
+                    boot: None,
+                },
+            )
+            .unwrap();
         assert!(out.contains("frozen 'blank:snap'"), "{out}");
         assert!(out.contains("new scratch created"), "{out}");
         drop(handle);
@@ -1501,6 +1627,9 @@ mod tests {
             size_bytes: 0,
             created_at: rfc3339_now(),
             provision_script: Some("echo hi".to_string()),
+            kernel: None,
+            initrd: None,
+            cmdline: None,
         });
         meta.layers.push(LayerMeta {
             id: "b".repeat(64),
@@ -1509,6 +1638,9 @@ mod tests {
             size_bytes: 0,
             created_at: rfc3339_now(),
             provision_script: None,
+            kernel: None,
+            initrd: None,
+            cmdline: None,
         });
         save_meta(&paths, &meta).unwrap();
 

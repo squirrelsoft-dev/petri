@@ -85,4 +85,18 @@ UNIT
     chroot /mnt systemctl enable workspace.mount run-petri.mount petri-guest.service
 fi
 
+# Extract the kernel/initrd so the host can store them with the sealed layer and
+# boot it as a sandbox via Linux direct boot (the host can't read ext4). The
+# workspace virtiofs share (tag "workspace") is mounted read-write by petri-vz.
+KVER=$(basename /mnt/boot/vmlinuz-* | sed 's/^vmlinuz-//')
+if [ -f "/mnt/boot/vmlinuz-$KVER" ] && [ -f "/mnt/boot/initrd.img-$KVER" ]; then
+    mkdir -p /mnt-out
+    if mount -t virtiofs workspace /mnt-out; then
+        cp "/mnt/boot/vmlinuz-$KVER" /mnt-out/vmlinuz
+        cp "/mnt/boot/initrd.img-$KVER" /mnt-out/initrd
+        printf '%s\n' "$KVER" > /mnt-out/kernel-version
+        umount /mnt-out
+    fi
+fi
+
 umount /mnt

@@ -112,6 +112,20 @@ pub struct InstanceConfig {
     /// Free-form key/value metadata persisted with the instance so it can be
     /// surfaced and filtered by `sandbox list --metadata`.
     pub metadata: BTreeMap<String, String>,
+    /// When set, boot directly from an NBD-served layer (Linux direct boot)
+    /// instead of an image bundle. Used by `sandbox create --base`, where the
+    /// disk is a per-sandbox scratch served by a detached NBD daemon.
+    pub direct_boot: Option<DirectBoot>,
+}
+
+/// Linux direct-boot parameters for a sandbox booting from a petri layer: the
+/// NBD boot-disk URL plus the kernel/initrd/cmdline extracted from the layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectBoot {
+    pub nbd_url: String,
+    pub kernel: PathBuf,
+    pub initrd: PathBuf,
+    pub cmdline: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -135,11 +149,17 @@ impl InstanceConfig {
             workspace: workspace.into(),
             policy: policy.into(),
             metadata: BTreeMap::new(),
+            direct_boot: None,
         }
     }
 
     pub fn with_image(mut self, image: impl Into<PathBuf>) -> Self {
         self.image = Some(image.into());
+        self
+    }
+
+    pub fn with_direct_boot(mut self, direct_boot: DirectBoot) -> Self {
+        self.direct_boot = Some(direct_boot);
         self
     }
 
