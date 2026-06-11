@@ -25,7 +25,7 @@ Petri is part of the spore ecosystem:
 | Project | Role |
 |---|---|
 | **[spore-core](../spore-core)** | The agentic harness runtime — the loop, tools, sandbox, memory, and the improvement flywheel. |
-| **[spore](../spore)** | A micro-agent framework — single-responsibility agents built from a runtime plus a declarative skill file. |
+| **[spore](../spore)** | A composable micro-agent framework — single-responsibility agents built from a runtime plus a declarative skill file. |
 | **[cordyceps](../cordyceps)** | A single autonomous, self-improving agent you deploy and control remotely. |
 | **Petri** *(this project)* | The isolated execution environment agents run their tools inside. |
 | **mycelium** *(future)* | Teams of agents working together. |
@@ -143,10 +143,15 @@ works. The earlier low-level commands remain as compatibility aliases during
 migration: `petri create`, `petri dispatch`, `petri stop`, `petri teardown`, and
 `petri image build`. Run `petri --help` for the full surface.
 
+For a task-oriented walkthrough — which command to use for which job, how the
+`sandbox` / `image` / `policy` families and the aliases fit together, and
+copy-pasteable recipes — see the [CLI Guide](docs/cli-guide.md).
+
 For programmatic use, the same lifecycle and command surface is exposed as an
-E2B-style `Sandbox` SDK. See the [Sandbox SDK API](docs/sdk-api.md) for the
-language-agnostic contract (Rust, TypeScript, Python, Go) and
-[Protocol Schema](docs/protocol-schema.md) for the underlying wire contract.
+E2B-style `Sandbox` SDK. The [SDK Guide](docs/sdk-guide.md) is the how-to for
+driving sandboxes from Rust, TypeScript, Python, and Go; the
+[Sandbox SDK API](docs/sdk-api.md) is the language-agnostic contract, and the
+[Protocol Schema](docs/protocol-schema.md) the underlying wire contract.
 For embedding Petri as a tool-execution backend (e.g. in spore-core), see the
 [spore-core Integration Contract](docs/spore-core-integration.md).
 
