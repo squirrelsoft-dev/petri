@@ -489,10 +489,7 @@ mod tests {
     use super::*;
 
     fn temp_root(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "petri-policy-{label}-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("petri-policy-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -522,7 +519,10 @@ mod tests {
         create(&root, "my-ci", None, false).unwrap();
         assert!(user_path(&root, "my-ci").is_file());
         // Seeded content matches the locked-down built-in.
-        assert_eq!(show(&root, "my-ci").unwrap(), show(&root, "locked-down").unwrap());
+        assert_eq!(
+            show(&root, "my-ci").unwrap(),
+            show(&root, "locked-down").unwrap()
+        );
     }
 
     #[test]

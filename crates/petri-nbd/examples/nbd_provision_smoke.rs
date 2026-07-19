@@ -25,8 +25,14 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
-    let raw = PathBuf::from(args.next().ok_or("usage: nbd_provision_smoke <nocloud.raw> <artifacts-dir> [secs]")?);
-    let artifacts = PathBuf::from(args.next().ok_or("usage: nbd_provision_smoke <nocloud.raw> <artifacts-dir> [secs]")?);
+    let raw = PathBuf::from(
+        args.next()
+            .ok_or("usage: nbd_provision_smoke <nocloud.raw> <artifacts-dir> [secs]")?,
+    );
+    let artifacts = PathBuf::from(
+        args.next()
+            .ok_or("usage: nbd_provision_smoke <nocloud.raw> <artifacts-dir> [secs]")?,
+    );
     let timeout_secs: u64 = args.next().map(|s| s.parse().unwrap_or(900)).unwrap_or(900);
 
     if !raw.exists() {
@@ -63,7 +69,10 @@ fn run() -> Result<(), String> {
 
     println!("nocloud boot disk : {}", raw.display());
     println!("artifacts dir     : {}", artifacts.display());
-    println!("nbd scratch       : {url}  (blank {} GiB)", SCRATCH_BYTES >> 30);
+    println!(
+        "nbd scratch       : {url}  (blank {} GiB)",
+        SCRATCH_BYTES >> 30
+    );
     println!("helper log        : {}", helper_log.display());
     println!("console log       : {}", console_log.display());
     println!("\nbooting EFI VM (timeout {}s) ...\n", timeout_secs);
@@ -71,19 +80,29 @@ fn run() -> Result<(), String> {
     let log_file = fs::File::create(&helper_log).map_err(|e| e.to_string())?;
     let mut child = Command::new(&helper)
         .args(["--instance-id", "provision-smoke"])
-        .arg("--control-socket").arg(&control_sock)
+        .arg("--control-socket")
+        .arg(&control_sock)
         .args(["--boot-mode", "efi"])
-        .arg("--disk").arg(&raw)
-        .arg("--efi-variable-store").arg(&efivars)
-        .arg("--data-disk").arg(&url)
-        .arg("--artifacts-dir").arg(&artifacts)
+        .arg("--disk")
+        .arg(&raw)
+        .arg("--efi-variable-store")
+        .arg(&efivars)
+        .arg("--data-disk")
+        .arg(&url)
+        .arg("--artifacts-dir")
+        .arg(&artifacts)
         .arg("--enable-network")
         .arg("--exit-on-guest-stop")
-        .arg("--workspace").arg(work.join("workspace"))
-        .arg("--config-dir").arg(work.join("config"))
-        .arg("--console-log").arg(&console_log)
+        .arg("--workspace")
+        .arg(work.join("workspace"))
+        .arg("--config-dir")
+        .arg(work.join("config"))
+        .arg("--console-log")
+        .arg(&console_log)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(log_file.try_clone().map_err(|e| e.to_string())?))
+        .stdout(Stdio::from(
+            log_file.try_clone().map_err(|e| e.to_string())?,
+        ))
         .stderr(Stdio::from(log_file))
         .spawn()
         .map_err(|e| format!("failed to spawn petri-vz: {e}"))?;

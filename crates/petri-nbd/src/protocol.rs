@@ -138,7 +138,13 @@ pub fn read_request(r: &mut impl Read) -> io::Result<Request> {
     let handle = read_u64(r)?;
     let offset = read_u64(r)?;
     let length = read_u32(r)?;
-    Ok(Request { flags, cmd, handle, offset, length })
+    Ok(Request {
+        flags,
+        cmd,
+        handle,
+        offset,
+        length,
+    })
 }
 
 /// Write a simple-reply header. For reads, the payload follows immediately.

@@ -18,7 +18,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use petri_nbd::{BindMode, Geometry, ImmutableLayer, LayeredDisk, NbdServer, ScratchLayer, ServeOpts};
+use petri_nbd::{
+    BindMode, Geometry, ImmutableLayer, LayeredDisk, NbdServer, ScratchLayer, ServeOpts,
+};
 
 const BLOCK_SIZE: u32 = 64 * 1024;
 const BOOT_MARKER: &str = "login:";
@@ -33,7 +35,10 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
-    let bundle = PathBuf::from(args.next().unwrap_or_else(|| "target/petri-images/base".into()));
+    let bundle = PathBuf::from(
+        args.next()
+            .unwrap_or_else(|| "target/petri-images/base".into()),
+    );
     let iters: usize = args.next().map(|s| s.parse().unwrap_or(2)).unwrap_or(2);
 
     let helper = PathBuf::from("crates/petri-vz/.build/debug/petri-vz");
@@ -49,7 +54,11 @@ fn run() -> Result<(), String> {
     let cmdline = extract_cmdline(&manifest)?;
     let base_len = fs::metadata(&disk).map_err(|e| e.to_string())?.len();
 
-    println!("base image : {} ({:.2} GiB)", disk.display(), base_len as f64 / (1u64 << 30) as f64);
+    println!(
+        "base image : {} ({:.2} GiB)",
+        disk.display(),
+        base_len as f64 / (1u64 << 30) as f64
+    );
     println!("iterations : {iters}\nmarker     : {BOOT_MARKER:?}\n");
 
     let mut raw = Vec::new();
@@ -57,11 +66,17 @@ fn run() -> Result<(), String> {
     for i in 0..iters {
         println!("--- iteration {} / {iters} ---", i + 1);
         let r = bench_raw(&helper, &kernel, &initrd, &disk, &cmdline, i)?;
-        println!("  raw : setup {:>6.0} ms   boot {:>6.2} s", r.setup_ms, r.boot_s);
+        println!(
+            "  raw : setup {:>6.0} ms   boot {:>6.2} s",
+            r.setup_ms, r.boot_s
+        );
         raw.push(r);
 
         let n = bench_nbd(&helper, &kernel, &initrd, &disk, &cmdline, base_len, i)?;
-        println!("  nbd : setup {:>6.0} ms   boot {:>6.2} s", n.setup_ms, n.boot_s);
+        println!(
+            "  nbd : setup {:>6.0} ms   boot {:>6.2} s",
+            n.setup_ms, n.boot_s
+        );
         nbd.push(n);
     }
 
@@ -75,7 +90,11 @@ fn run() -> Result<(), String> {
     println!("  raw (APFS)  {raw_setup:>6.0} ms     {raw_boot:>6.2} s");
     println!("  nbd layered {nbd_setup:>6.0} ms     {nbd_boot:>6.2} s");
     let overhead = nbd_boot - raw_boot;
-    let pct = if raw_boot > 0.0 { overhead / raw_boot * 100.0 } else { 0.0 };
+    let pct = if raw_boot > 0.0 {
+        overhead / raw_boot * 100.0
+    } else {
+        0.0
+    };
     println!("\n  NBD boot overhead vs raw: {overhead:+.2} s ({pct:+.1}%)");
     Ok(())
 }
@@ -109,7 +128,14 @@ fn bench_raw(
     }
     let setup_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-    let boot_s = boot_to_marker(helper, kernel, initrd, cmdline, &work, &["--disk", copy.to_str().unwrap()])?;
+    let boot_s = boot_to_marker(
+        helper,
+        kernel,
+        initrd,
+        cmdline,
+        &work,
+        &["--disk", copy.to_str().unwrap()],
+    )?;
     let _ = fs::remove_dir_all(&work);
     Ok(Measure { setup_ms, boot_s })
 }
@@ -128,17 +154,29 @@ fn bench_nbd(
     let t = Instant::now();
     let geometry = Geometry::new(base_len, BLOCK_SIZE).map_err(|e| e.to_string())?;
     let base = ImmutableLayer::open_raw_base(disk, geometry).map_err(|e| e.to_string())?;
-    let scratch = ScratchLayer::create(&work.join("scratch.data"), geometry).map_err(|e| e.to_string())?;
+    let scratch =
+        ScratchLayer::create(&work.join("scratch.data"), geometry).map_err(|e| e.to_string())?;
     let layered = LayeredDisk::new(vec![base], scratch).map_err(|e| e.to_string())?;
     let server = NbdServer::serve(
         layered,
-        ServeOpts { bind: BindMode::LoopbackTcp(0), export_name: "petri".into(), read_only: false },
+        ServeOpts {
+            bind: BindMode::LoopbackTcp(0),
+            export_name: "petri".into(),
+            read_only: false,
+        },
     )
     .map_err(|e| e.to_string())?;
     let url = server.url().to_string();
     let setup_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-    let boot_s = boot_to_marker(helper, kernel, initrd, cmdline, &work, &["--nbd-disk", &url])?;
+    let boot_s = boot_to_marker(
+        helper,
+        kernel,
+        initrd,
+        cmdline,
+        &work,
+        &["--nbd-disk", &url],
+    )?;
     let _ = server.shutdown();
     let _ = fs::remove_dir_all(&work);
     Ok(Measure { setup_ms, boot_s })
@@ -204,13 +242,19 @@ fn make_work(tag: &str) -> Result<PathBuf, String> {
 
 fn avg(it: impl Iterator<Item = f64>) -> f64 {
     let v: Vec<f64> = it.collect();
-    if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 }
+    if v.is_empty() {
+        0.0
+    } else {
+        v.iter().sum::<f64>() / v.len() as f64
+    }
 }
 
 fn extract_cmdline(manifest: &Path) -> Result<String, String> {
     let text = fs::read_to_string(manifest).map_err(|e| e.to_string())?;
     let key = "\"kernel_command_line\"";
-    let start = text.find(key).ok_or("manifest has no kernel_command_line")?;
+    let start = text
+        .find(key)
+        .ok_or("manifest has no kernel_command_line")?;
     let after = &text[start + key.len()..];
     let q1 = after.find('"').ok_or("malformed kernel_command_line")?;
     let rest = &after[q1 + 1..];

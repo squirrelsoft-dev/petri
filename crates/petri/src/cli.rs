@@ -32,11 +32,23 @@ pub enum Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyCommand {
     List,
-    Show { name: String },
-    Path { name: String },
-    Create { name: String, from: Option<String>, force: bool },
-    Edit { name: String },
-    Remove { name: String },
+    Show {
+        name: String,
+    },
+    Path {
+        name: String,
+    },
+    Create {
+        name: String,
+        from: Option<String>,
+        force: bool,
+    },
+    Edit {
+        name: String,
+    },
+    Remove {
+        name: String,
+    },
 }
 
 /// `petri sandbox create <id> --base <name>:<tag> …`: boot a sandbox from a
@@ -241,10 +253,8 @@ pub fn run_with_stdin(
         Command::SandboxKill(command) => run_sandbox_kill(command, backend),
         Command::SandboxBootstrap(command) => run_sandbox_bootstrap(command, backend),
         Command::SandboxCreateFromBase(mut command) => {
-            command.policy = crate::policy::resolve_reference(
-                &crate::policy::policies_root(),
-                &command.policy,
-            )?;
+            command.policy =
+                crate::policy::resolve_reference(&crate::policy::policies_root(), &command.policy)?;
             run_sandbox_create_from_base(command, backend)
         }
         Command::Policy(command) => run_policy_command(command),
@@ -370,7 +380,12 @@ fn policy_name_arg(args: impl Iterator<Item = String>, sub: &str) -> Result<Stri
             }
         }
     }
-    name.ok_or_else(|| PetriError::Cli(format!("policy {sub} requires a <name>\n{}", policy_usage())))
+    name.ok_or_else(|| {
+        PetriError::Cli(format!(
+            "policy {sub} requires a <name>\n{}",
+            policy_usage()
+        ))
+    })
 }
 
 fn parse_policy_create(mut args: impl Iterator<Item = String>) -> Result<Command> {
@@ -396,8 +411,12 @@ fn parse_policy_create(mut args: impl Iterator<Item = String>) -> Result<Command
             }
         }
     }
-    let name = name
-        .ok_or_else(|| PetriError::Cli(format!("policy create requires a <name>\n{}", policy_usage())))?;
+    let name = name.ok_or_else(|| {
+        PetriError::Cli(format!(
+            "policy create requires a <name>\n{}",
+            policy_usage()
+        ))
+    })?;
     Ok(Command::Policy(PolicyCommand::Create { name, from, force }))
 }
 
@@ -417,9 +436,7 @@ fn parse_image_create(mut args: impl Iterator<Item = String>) -> Result<Command>
                 from_nocloud = Some(PathBuf::from(next_arg(&mut args, "--from-nocloud")?))
             }
             "--tag" => tag = Some(next_arg(&mut args, "--tag")?),
-            "--provision" => {
-                provision = Some(PathBuf::from(next_arg(&mut args, "--provision")?))
-            }
+            "--provision" => provision = Some(PathBuf::from(next_arg(&mut args, "--provision")?)),
             "--help" | "-h" => return Err(PetriError::Cli(image_create_usage())),
             _ if arg.starts_with('-') => {
                 return Err(PetriError::Cli(format!(
@@ -450,9 +467,7 @@ fn parse_image_create(mut args: impl Iterator<Item = String>) -> Result<Command>
 fn parse_image_list(mut args: impl Iterator<Item = String>) -> Result<Command> {
     if let Some(arg) = args.next() {
         if matches!(arg.as_str(), "--help" | "-h") {
-            return Err(PetriError::Cli(
-                "usage: petri image list".to_string(),
-            ));
+            return Err(PetriError::Cli("usage: petri image list".to_string()));
         }
         return Err(PetriError::Cli(format!(
             "unexpected image list argument '{arg}'"
@@ -637,7 +652,9 @@ fn parse_sandbox(mut args: impl Iterator<Item = String>) -> Result<Command> {
 
 fn parse_internal(mut args: impl Iterator<Item = String>) -> Result<Command> {
     let Some(subcommand) = args.next() else {
-        return Err(PetriError::Cli("usage: petri internal serve-nbd …".to_string()));
+        return Err(PetriError::Cli(
+            "usage: petri internal serve-nbd …".to_string(),
+        ));
     };
     match subcommand.as_str() {
         "serve-nbd" => parse_internal_serve_nbd(args),
@@ -665,8 +682,12 @@ fn parse_internal_serve_nbd(mut args: impl Iterator<Item = String>) -> Result<Co
     }
     Ok(Command::Internal(InternalCommand::ServeNbd {
         image: image.ok_or(PetriError::MissingArgument { flag: "--image" })?,
-        port_file: port_file.ok_or(PetriError::MissingArgument { flag: "--port-file" })?,
-        lock_file: lock_file.ok_or(PetriError::MissingArgument { flag: "--lock-file" })?,
+        port_file: port_file.ok_or(PetriError::MissingArgument {
+            flag: "--port-file",
+        })?,
+        lock_file: lock_file.ok_or(PetriError::MissingArgument {
+            flag: "--lock-file",
+        })?,
     }))
 }
 
@@ -782,13 +803,15 @@ fn parse_sandbox_create(mut args: impl Iterator<Item = String>) -> Result<Comman
             flag: "--workspace",
         })?;
         let policy = policy.ok_or(PetriError::MissingArgument { flag: "--policy" })?;
-        return Ok(Command::SandboxCreateFromBase(SandboxCreateFromBaseCommand {
-            id,
-            base,
-            workspace,
-            policy,
-            metadata,
-        }));
+        return Ok(Command::SandboxCreateFromBase(
+            SandboxCreateFromBaseCommand {
+                id,
+                base,
+                workspace,
+                policy,
+                metadata,
+            },
+        ));
     }
 
     let id = match id {
@@ -801,7 +824,9 @@ fn parse_sandbox_create(mut args: impl Iterator<Item = String>) -> Result<Comman
     // and seal.
     if let Some(image) = bootstrap {
         if auto_freeze && provision.is_none() {
-            return Err(PetriError::Cli("--auto-freeze requires --provision".to_string()));
+            return Err(PetriError::Cli(
+                "--auto-freeze requires --provision".to_string(),
+            ));
         }
         if auto_freeze && tag.is_none() {
             return Err(PetriError::Cli("--auto-freeze requires --tag".to_string()));
@@ -1511,10 +1536,11 @@ fn find_nocloud_kernel_version(image: &Path) -> Result<String> {
         path: image.to_path_buf(),
         source,
     })?;
-    f.seek(SeekFrom::Start(ROOT_OFFSET)).map_err(|source| PetriError::Io {
-        path: image.to_path_buf(),
-        source,
-    })?;
+    f.seek(SeekFrom::Start(ROOT_OFFSET))
+        .map_err(|source| PetriError::Io {
+            path: image.to_path_buf(),
+            source,
+        })?;
     let mut data = vec![0u8; SCAN_LEN];
     let n = f.read(&mut data).map_err(|source| PetriError::Io {
         path: image.to_path_buf(),
@@ -1524,14 +1550,19 @@ fn find_nocloud_kernel_version(image: &Path) -> Result<String> {
 
     let mut offset = 0;
     while offset + MARKER.len() <= data.len() {
-        match data[offset..].windows(MARKER.len()).position(|w| w == MARKER) {
+        match data[offset..]
+            .windows(MARKER.len())
+            .position(|w| w == MARKER)
+        {
             None => break,
             Some(rel) => {
                 let start = offset + rel + MARKER.len();
                 let ver_bytes: Vec<u8> = data[start..]
                     .iter()
                     .copied()
-                    .take_while(|&b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'+')
+                    .take_while(|&b| {
+                        b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'+'
+                    })
                     .collect();
                 let ver = String::from_utf8_lossy(&ver_bytes).to_string();
                 if ver.contains('.') && ver.len() >= 5 {
@@ -1633,7 +1664,10 @@ fn patch_nocloud_esp_mounted(nocloud_src: &Path, esp_dev: &str) -> Result<()> {
     let status = ProcessCommand::new("diskutil")
         .args(["mount", esp_dev])
         .status()
-        .map_err(|source| PetriError::Io { path: PathBuf::from("diskutil"), source })?;
+        .map_err(|source| PetriError::Io {
+            path: PathBuf::from("diskutil"),
+            source,
+        })?;
     if !status.success() {
         return Err(PetriError::Cli(format!("diskutil mount {esp_dev} failed")));
     }
@@ -1641,7 +1675,10 @@ fn patch_nocloud_esp_mounted(nocloud_src: &Path, esp_dev: &str) -> Result<()> {
     let info = ProcessCommand::new("diskutil")
         .args(["info", esp_dev])
         .output()
-        .map_err(|source| PetriError::Io { path: PathBuf::from("diskutil"), source })?;
+        .map_err(|source| PetriError::Io {
+            path: PathBuf::from("diskutil"),
+            source,
+        })?;
     let info_text = String::from_utf8_lossy(&info.stdout).to_string();
     let mount_point = info_text
         .lines()
@@ -1672,7 +1709,10 @@ fn patch_nocloud_esp(nocloud_src: &Path, patched_out: &Path) -> Result<()> {
         .arg(nocloud_src)
         .arg(patched_out)
         .status()
-        .map_err(|source| PetriError::Io { path: PathBuf::from("cp"), source })?;
+        .map_err(|source| PetriError::Io {
+            path: PathBuf::from("cp"),
+            source,
+        })?;
     if !status.success() {
         return Err(PetriError::Cli(format!(
             "cp -c {} -> {} failed: {:?}",
@@ -1683,21 +1723,28 @@ fn patch_nocloud_esp(nocloud_src: &Path, patched_out: &Path) -> Result<()> {
     }
 
     let out = ProcessCommand::new("hdiutil")
-        .args(["attach", "-imagekey", "diskimage-class=CRawDiskImage", "-nomount"])
+        .args([
+            "attach",
+            "-imagekey",
+            "diskimage-class=CRawDiskImage",
+            "-nomount",
+        ])
         .arg(patched_out)
         .output()
-        .map_err(|source| PetriError::Io { path: PathBuf::from("hdiutil"), source })?;
+        .map_err(|source| PetriError::Io {
+            path: PathBuf::from("hdiutil"),
+            source,
+        })?;
     if !out.status.success() {
         let msg = String::from_utf8_lossy(&out.stderr);
         return Err(PetriError::Cli(format!("hdiutil attach failed: {msg}")));
     }
     let attach_stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let (base_disk, esp_dev) =
-        parse_hdiutil_attach_output(&attach_stdout).ok_or_else(|| {
-            PetriError::Cli(format!(
-                "could not parse hdiutil attach output:\n{attach_stdout}"
-            ))
-        })?;
+    let (base_disk, esp_dev) = parse_hdiutil_attach_output(&attach_stdout).ok_or_else(|| {
+        PetriError::Cli(format!(
+            "could not parse hdiutil attach output:\n{attach_stdout}"
+        ))
+    })?;
 
     let result = patch_nocloud_esp_mounted(nocloud_src, &esp_dev);
 
@@ -1708,8 +1755,7 @@ fn patch_nocloud_esp(nocloud_src: &Path, patched_out: &Path) -> Result<()> {
     result
 }
 
-const DEFAULT_PROVISION_SCRIPT: &str =
-    include_str!("../../petri-nbd/examples/provision.sh");
+const DEFAULT_PROVISION_SCRIPT: &str = include_str!("../../petri-nbd/examples/provision.sh");
 
 /// `petri image create --from-nocloud <disk>`: drive petri-vz directly (no
 /// MacosBackend). Stages provision.sh into a temp artifacts dir, boots the
@@ -1727,9 +1773,9 @@ fn run_nocloud_provision_and_seal(
     nocloud_disk: PathBuf,
     tag: &str,
 ) -> Result<String> {
+    use crate::image;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
-    use crate::image;
 
     let handle = image::serve_scratch(images_root, name)?;
     let url = handle.url().to_string();
@@ -1747,10 +1793,15 @@ fn run_nocloud_provision_and_seal(
     let helper_stderr = instance_dir.join("petri-vz.stderr.log");
     let helper_stdout = instance_dir.join("petri-vz.stdout.log");
     let efi_store = instance_dir.join("efi-variable-store");
-    let control_sock = instance_dir.join("petri-vz.sock");
+    // Short temp-dir path — the 104-byte sun_path limit, see
+    // `backend::short_control_socket_path`.
+    let control_sock = crate::backend::short_control_socket_path(&instance_id);
 
     for dir in [&artifacts_dir, &workspace_dir, &config_dir] {
-        fs::create_dir_all(dir).map_err(|source| PetriError::Io { path: dir.clone(), source })?;
+        fs::create_dir_all(dir).map_err(|source| PetriError::Io {
+            path: dir.clone(),
+            source,
+        })?;
     }
 
     let script_path = artifacts_dir.join("provision.sh");
@@ -1786,35 +1837,53 @@ fn run_nocloud_provision_and_seal(
     patch_nocloud_esp(&nocloud_disk, &patched_disk)?;
 
     let stdout_file = fs::File::create(&helper_stdout).map_err(|source| PetriError::Io {
-        path: helper_stdout.clone(), source,
+        path: helper_stdout.clone(),
+        source,
     })?;
     let stderr_file = fs::File::create(&helper_stderr).map_err(|source| PetriError::Io {
-        path: helper_stderr.clone(), source,
+        path: helper_stderr.clone(),
+        source,
     })?;
 
     let mut child = ProcessCommand::new(&helper)
-        .arg("--instance-id").arg(&instance_id)
-        .arg("--control-socket").arg(&control_sock)
-        .arg("--boot-mode").arg("efi")
-        .arg("--disk").arg(&patched_disk)
-        .arg("--efi-variable-store").arg(&efi_store)
-        .arg("--data-disk").arg(&url)
-        .arg("--artifacts-dir").arg(&artifacts_dir)
-        .arg("--workspace").arg(&workspace_dir)
-        .arg("--config-dir").arg(&config_dir)
-        .arg("--console-log").arg(&console_log)
+        .arg("--instance-id")
+        .arg(&instance_id)
+        .arg("--control-socket")
+        .arg(&control_sock)
+        .arg("--boot-mode")
+        .arg("efi")
+        .arg("--disk")
+        .arg(&patched_disk)
+        .arg("--efi-variable-store")
+        .arg(&efi_store)
+        .arg("--data-disk")
+        .arg(&url)
+        .arg("--artifacts-dir")
+        .arg(&artifacts_dir)
+        .arg("--workspace")
+        .arg(&workspace_dir)
+        .arg("--config-dir")
+        .arg(&config_dir)
+        .arg("--console-log")
+        .arg(&console_log)
         .arg("--enable-network")
         .arg("--exit-on-guest-stop")
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
         .spawn()
-        .map_err(|source| PetriError::Io { path: helper.clone(), source })?;
+        .map_err(|source| PetriError::Io {
+            path: helper.clone(),
+            source,
+        })?;
 
     let timeout_secs = 3600u64;
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let exit_status = loop {
-        match child.try_wait().map_err(|source| PetriError::Io { path: helper.clone(), source })? {
+        match child.try_wait().map_err(|source| PetriError::Io {
+            path: helper.clone(),
+            source,
+        })? {
             Some(status) => break status,
             None => {
                 if Instant::now() >= deadline {
@@ -1964,14 +2033,19 @@ fn run_sandbox_create_from_base(
     }
 
     // 4. Boot via the normal backend create path (Linux direct boot).
-    let config = InstanceConfig::new(command.id.clone(), "macos", command.workspace, command.policy)
-        .with_metadata(command.metadata)
-        .with_direct_boot(crate::instance::DirectBoot {
-            nbd_url,
-            kernel,
-            initrd,
-            cmdline,
-        });
+    let config = InstanceConfig::new(
+        command.id.clone(),
+        "macos",
+        command.workspace,
+        command.policy,
+    )
+    .with_metadata(command.metadata)
+    .with_direct_boot(crate::instance::DirectBoot {
+        nbd_url,
+        kernel,
+        initrd,
+        cmdline,
+    });
 
     match backend.create(config) {
         Ok(handle) => Ok(handle.id.to_string()),
@@ -2034,10 +2108,10 @@ fn spawn_nbd_daemon(sandbox: &str, image_dir: &Path) -> Result<(String, u32)> {
 
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|source| PetriError::Io { path: exe.clone(), source })?
-        {
+        if let Some(status) = child.try_wait().map_err(|source| PetriError::Io {
+            path: exe.clone(),
+            source,
+        })? {
             let reason = fs::read_to_string(&log_path).unwrap_or_default();
             return Err(PetriError::Cli(format!(
                 "NBD service for '{sandbox}' exited early ({status}): {}",
@@ -2714,7 +2788,6 @@ fn write_cloud_init_seed(
         source,
     })
 }
-
 
 fn builder_cloud_init(
     guest_binary_in_vm: &Path,
@@ -3765,7 +3838,8 @@ fn image_create_usage() -> String {
 }
 
 fn image_freeze_usage() -> String {
-    "usage: petri image freeze <name>:scratch --tag <tag> [--provision <path>] [--force]".to_string()
+    "usage: petri image freeze <name>:scratch --tag <tag> [--provision <path>] [--force]"
+        .to_string()
 }
 
 fn image_rebuild_usage() -> String {
@@ -4020,7 +4094,13 @@ mod tests {
     #[test]
     fn parses_image_create_with_base_and_size() {
         let command = parse(args(&[
-            "image", "create", "rootfs", "--base", "other:trixie", "--size", "16",
+            "image",
+            "create",
+            "rootfs",
+            "--base",
+            "other:trixie",
+            "--size",
+            "16",
         ]))
         .unwrap();
         let Command::Image(ImageCommand::Create {
@@ -4094,7 +4174,12 @@ mod tests {
     #[test]
     fn parses_image_freeze_command() {
         let command = parse(args(&[
-            "image", "freeze", "rootfs:scratch", "--tag", "v1", "--force",
+            "image",
+            "freeze",
+            "rootfs:scratch",
+            "--tag",
+            "v1",
+            "--force",
         ]))
         .unwrap();
         let Command::Image(ImageCommand::Freeze {

@@ -19,7 +19,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use petri_nbd::{BindMode, Geometry, ImmutableLayer, LayeredDisk, NbdServer, ScratchLayer, ServeOpts};
+use petri_nbd::{
+    BindMode, Geometry, ImmutableLayer, LayeredDisk, NbdServer, ScratchLayer, ServeOpts,
+};
 
 const BLOCK_SIZE: u32 = 64 * 1024;
 
@@ -32,7 +34,10 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
-    let bundle = PathBuf::from(args.next().unwrap_or_else(|| "target/petri-images/base".into()));
+    let bundle = PathBuf::from(
+        args.next()
+            .unwrap_or_else(|| "target/petri-images/base".into()),
+    );
     let boot_secs: u64 = args.next().map(|s| s.parse().unwrap_or(45)).unwrap_or(45);
 
     let helper = PathBuf::from("crates/petri-vz/.build/debug/petri-vz");
@@ -76,13 +81,21 @@ fn run() -> Result<(), String> {
     let scratch = ScratchLayer::create(&scratch_path, geometry).map_err(|e| e.to_string())?;
     let layered = LayeredDisk::new(vec![base_layer], scratch).map_err(|e| e.to_string())?;
 
-    println!("base image     : {} ({:.2} GiB)", disk.display(), base_len as f64 / (1u64 << 30) as f64);
+    println!(
+        "base image     : {} ({:.2} GiB)",
+        disk.display(),
+        base_len as f64 / (1u64 << 30) as f64
+    );
     println!("scratch overlay: {}", scratch_path.display());
 
     // --- Start the NBD server ---
     let server = NbdServer::serve(
         layered,
-        ServeOpts { bind: BindMode::LoopbackTcp(0), export_name: "petri".into(), read_only: false },
+        ServeOpts {
+            bind: BindMode::LoopbackTcp(0),
+            export_name: "petri".into(),
+            read_only: false,
+        },
     )
     .map_err(|e| e.to_string())?;
     let nbd_url = server.url().to_string();
@@ -105,12 +118,18 @@ fn run() -> Result<(), String> {
         .args(["--config-dir", work.join("config").to_str().unwrap()])
         .args(["--console-log", console_log.to_str().unwrap()])
         .args(["--command-line", &cmdline])
-        .stdout(Stdio::from(log_file.try_clone().map_err(|e| e.to_string())?))
+        .stdout(Stdio::from(
+            log_file.try_clone().map_err(|e| e.to_string())?,
+        ))
         .stderr(Stdio::from(log_file))
         .spawn()
         .map_err(|e| format!("failed to spawn helper: {e}"))?;
 
-    println!("helper pid     : {} (log: {})", child.id(), helper_log.display());
+    println!(
+        "helper pid     : {} (log: {})",
+        child.id(),
+        helper_log.display()
+    );
     println!("\nbooting for {boot_secs}s — watching scratch growth...\n");
 
     // --- Observe boot + scratch growth ---
@@ -126,7 +145,11 @@ fn run() -> Result<(), String> {
             (boot_secs as i64) - (deadline - Instant::now()).as_secs() as i64,
             scratch_len / 1024,
             console_len,
-            if child_exited(&mut child) { "[helper exited]" } else { "" }
+            if child_exited(&mut child) {
+                "[helper exited]"
+            } else {
+                ""
+            }
         );
         if child_exited(&mut child) {
             break;
@@ -143,7 +166,8 @@ fn run() -> Result<(), String> {
     let final_scratch = fs::metadata(&scratch_path).map(|m| m.len()).unwrap_or(0);
     let base_meta_after = fs::metadata(&disk).map_err(|e| e.to_string())?;
     let base_mtime_after = base_meta_after.modified().ok();
-    let base_unchanged = base_meta_after.len() == base_meta_before.len() && base_mtime_after == base_mtime_before;
+    let base_unchanged =
+        base_meta_after.len() == base_meta_before.len() && base_mtime_after == base_mtime_before;
 
     let log_text = fs::read_to_string(&helper_log).unwrap_or_default();
     let nbd_connected = log_text.contains("NBD client connected");
@@ -152,8 +176,15 @@ fn run() -> Result<(), String> {
 
     println!("\n================ VERDICT ================");
     println!("NBD client connected to server : {}", yn(nbd_connected));
-    println!("guest reached userspace        : {}  (markers: {booted:?})", yn(!booted.is_empty()));
-    println!("writes landed in scratch       : {}  (peak {} KiB)", yn(peak_scratch > 0), final_scratch / 1024);
+    println!(
+        "guest reached userspace        : {}  (markers: {booted:?})",
+        yn(!booted.is_empty())
+    );
+    println!(
+        "writes landed in scratch       : {}  (peak {} KiB)",
+        yn(peak_scratch > 0),
+        final_scratch / 1024
+    );
     println!("base image left untouched      : {}", yn(base_unchanged));
     println!("helper log : {}", helper_log.display());
     println!("console log: {}", console_log.display());
@@ -174,7 +205,9 @@ fn child_exited(child: &mut std::process::Child) -> bool {
 fn extract_cmdline(manifest: &Path) -> Result<String, String> {
     let text = fs::read_to_string(manifest).map_err(|e| e.to_string())?;
     let key = "\"kernel_command_line\"";
-    let start = text.find(key).ok_or("manifest has no kernel_command_line")?;
+    let start = text
+        .find(key)
+        .ok_or("manifest has no kernel_command_line")?;
     let after = &text[start + key.len()..];
     let q1 = after.find('"').ok_or("malformed kernel_command_line")?;
     let rest = &after[q1 + 1..];

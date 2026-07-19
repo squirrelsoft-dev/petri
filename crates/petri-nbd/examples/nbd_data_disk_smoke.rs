@@ -29,7 +29,10 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
-    let raw = PathBuf::from(args.next().ok_or("usage: nbd_data_disk_smoke <nocloud.raw> [secs]")?);
+    let raw = PathBuf::from(
+        args.next()
+            .ok_or("usage: nbd_data_disk_smoke <nocloud.raw> [secs]")?,
+    );
     let secs: u64 = args.next().map(|s| s.parse().unwrap_or(45)).unwrap_or(45);
     if !raw.exists() {
         return Err(format!("nocloud image not found: {}", raw.display()));
@@ -63,7 +66,10 @@ fn run() -> Result<(), String> {
     let url = server.url().to_string();
 
     println!("nocloud boot disk : {}", raw.display());
-    println!("nbd scratch       : {url}  (blank {} GiB)", SCRATCH_BYTES >> 30);
+    println!(
+        "nbd scratch       : {url}  (blank {} GiB)",
+        SCRATCH_BYTES >> 30
+    );
     println!("helper log        : {}", helper_log.display());
     println!("console log       : {}", console_log.display());
     println!("\nbooting EFI VM for {secs}s ...\n");
@@ -88,7 +94,9 @@ fn run() -> Result<(), String> {
         .arg("--console-log")
         .arg(&console_log)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(log_file.try_clone().map_err(|e| e.to_string())?))
+        .stdout(Stdio::from(
+            log_file.try_clone().map_err(|e| e.to_string())?,
+        ))
         .stderr(Stdio::from(log_file))
         .spawn()
         .map_err(|e| format!("failed to spawn petri-vz: {e}"))?;

@@ -207,7 +207,11 @@ workspace_path = "/workspace"
             },
         )
         .expect("cat dispatch should succeed");
-    assert_eq!(read_seed.status, Status::Success, "cat result: {read_seed:?}");
+    assert_eq!(
+        read_seed.status,
+        Status::Success,
+        "cat result: {read_seed:?}"
+    );
     assert_eq!(read_seed.stdout, "seed-from-host\n");
 
     // 2. The guest writes a file into /workspace; the host observes it.

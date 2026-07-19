@@ -147,7 +147,9 @@ pub fn parse_image_ref(s: &str) -> Result<(String, String)> {
 /// not the reserved `scratch`.
 pub fn validate_freeze_tag(tag: &str) -> Result<()> {
     if tag.is_empty() {
-        return Err(PetriError::invalid_argument("--tag must be a non-empty value"));
+        return Err(PetriError::invalid_argument(
+            "--tag must be a non-empty value",
+        ));
     }
     if tag.contains(':') {
         return Err(PetriError::invalid_argument(format!(
@@ -238,8 +240,9 @@ pub fn load_meta(paths: &ImagePaths) -> Result<ImageMeta> {
             PetriError::Io { path, source }
         }
     })?;
-    serde_json::from_str(&input)
-        .map_err(|err| PetriError::Cli(format!("failed to parse {}: {err}", paths.meta().display())))
+    serde_json::from_str(&input).map_err(|err| {
+        PetriError::Cli(format!("failed to parse {}: {err}", paths.meta().display()))
+    })
 }
 
 /// Persist an image's `meta.json` (pretty-printed, matching backend.rs).
@@ -482,9 +485,10 @@ pub fn inspect(images_root: &Path, name: &str, tag: &str) -> Result<String> {
     let meta = load_meta(&paths)?;
 
     if tag == SCRATCH_TAG {
-        let scratch = meta.scratch.as_ref().ok_or_else(|| {
-            PetriError::Cli(format!("image \"{name}\" has no scratch"))
-        })?;
+        let scratch = meta
+            .scratch
+            .as_ref()
+            .ok_or_else(|| PetriError::Cli(format!("image \"{name}\" has no scratch")))?;
         let nbd = match scratch.nbd_port {
             Some(port) => format!("running (port {port})"),
             None => "(not running)".to_string(),
@@ -644,7 +648,9 @@ fn delete_scratch(
     meta.scratch = None;
     if meta.layers.is_empty() {
         remove_image_dir(paths)?;
-        return Ok(format!("deleted '{name}:scratch' and removed image \"{name}\""));
+        return Ok(format!(
+            "deleted '{name}:scratch' and removed image \"{name}\""
+        ));
     }
     save_meta(paths, meta)?;
     Ok(format!("deleted '{name}:scratch'"))
@@ -693,7 +699,9 @@ fn delete_layer(paths: &ImagePaths, meta: &mut ImageMeta, name: &str, tag: &str)
 
     if meta.layers.is_empty() && !paths.scratch_data().exists() {
         remove_image_dir(paths)?;
-        return Ok(format!("deleted '{name}:{tag}' and removed image \"{name}\""));
+        return Ok(format!(
+            "deleted '{name}:{tag}' and removed image \"{name}\""
+        ));
     }
     save_meta(paths, meta)?;
     Ok(format!("deleted '{name}:{tag}'"))
@@ -719,9 +727,10 @@ pub fn show_provision(images_root: &Path, name: &str, tag: &str) -> Result<Strin
     let layer = meta
         .layer_by_tag(tag)
         .ok_or_else(|| PetriError::Cli(format!("image \"{name}\" has no tag '{tag}'")))?;
-    layer.provision_script.clone().ok_or_else(|| {
-        PetriError::Cli(format!("{name}:{tag} has no stored provision script"))
-    })
+    layer
+        .provision_script
+        .clone()
+        .ok_or_else(|| PetriError::Cli(format!("{name}:{tag} has no stored provision script")))
 }
 
 // --- rebuild helpers --------------------------------------------------------
@@ -755,9 +764,9 @@ pub fn boot_files_for(
 ) -> Result<(PathBuf, PathBuf, String)> {
     let paths = ImagePaths::new(images_root, name);
     let meta = load_meta(&paths)?;
-    let layer = meta.layer_by_tag(tag).ok_or_else(|| {
-        PetriError::Cli(format!("\"{name}:{tag}\" is not a frozen layer"))
-    })?;
+    let layer = meta
+        .layer_by_tag(tag)
+        .ok_or_else(|| PetriError::Cli(format!("\"{name}:{tag}\" is not a frozen layer")))?;
     match (&layer.kernel, &layer.initrd, &layer.cmdline) {
         (Some(kernel), Some(initrd), Some(cmdline)) => Ok((
             paths.dir.join(kernel),
@@ -793,8 +802,9 @@ pub fn reset_scratch_over_base(
             "\"{base_name}:{base_tag}\" is not frozen and cannot be used as a base"
         ))
     })?;
-    let base_id = LayerId::from_hex(&base_layer.id)
-        .ok_or_else(|| PetriError::Cli(format!("image \"{base_name}\" layer has a malformed id")))?;
+    let base_id = LayerId::from_hex(&base_layer.id).ok_or_else(|| {
+        PetriError::Cli(format!("image \"{base_name}\" layer has a malformed id"))
+    })?;
     let base_store = base_paths.open_store()?;
     let geometry = base_store
         .open_layer(&base_id)
@@ -916,12 +926,13 @@ pub fn auto_freeze(
     let paths = ImagePaths::new(images_root, name);
     let meta = load_meta(&paths)?;
     let parent_hex = meta.scratch.as_ref().and_then(|s| s.parent_id.clone());
-    let parents: Vec<LayerId> = match &parent_hex {
-        Some(hex) => vec![LayerId::from_hex(hex).ok_or_else(|| {
-            PetriError::Cli(format!("scratch parent id '{hex}' is malformed"))
-        })?],
-        None => Vec::new(),
-    };
+    let parents: Vec<LayerId> =
+        match &parent_hex {
+            Some(hex) => vec![LayerId::from_hex(hex).ok_or_else(|| {
+                PetriError::Cli(format!("scratch parent id '{hex}' is malformed"))
+            })?],
+            None => Vec::new(),
+        };
 
     let store = paths.open_store()?;
     let staging = paths
@@ -944,7 +955,15 @@ pub fn auto_freeze(
             path: paths.layers_root(),
             source,
         })?;
-    record_frozen_layer(images_root, name, &id, size_bytes, geometry, tag, provenance)
+    record_frozen_layer(
+        images_root,
+        name,
+        &id,
+        size_bytes,
+        geometry,
+        tag,
+        provenance,
+    )
 }
 
 /// Append a freshly sealed layer to `meta.json` and roll a new empty scratch on
@@ -1590,26 +1609,32 @@ mod tests {
         create(&root, "blank", None, None).unwrap();
         let handle = serve_scratch(&root, "blank").unwrap();
         // The served URL carries a real loopback port.
-        assert!(nbd_port_from_url(handle.url()).is_some(), "{}", handle.url());
+        assert!(
+            nbd_port_from_url(handle.url()).is_some(),
+            "{}",
+            handle.url()
+        );
 
-        let out =
-            auto_freeze(
-                &root,
-                "blank",
-                &handle,
-                "snap",
-                LayerProvenance {
-                    provision_script: Some("#!/bin/sh\n".into()),
-                    boot: None,
-                },
-            )
-            .unwrap();
+        let out = auto_freeze(
+            &root,
+            "blank",
+            &handle,
+            "snap",
+            LayerProvenance {
+                provision_script: Some("#!/bin/sh\n".into()),
+                boot: None,
+            },
+        )
+        .unwrap();
         assert!(out.contains("frozen 'blank:snap'"), "{out}");
         assert!(out.contains("new scratch created"), "{out}");
         drop(handle);
 
         let meta = load_meta(&ImagePaths::new(&root, "blank")).unwrap();
-        let layer = meta.layer_by_tag("snap").expect("snap layer recorded").clone();
+        let layer = meta
+            .layer_by_tag("snap")
+            .expect("snap layer recorded")
+            .clone();
         assert!(layer.provision_script.is_some());
         assert_eq!(meta.scratch.unwrap().parent_id, Some(layer.id));
     }
@@ -1644,7 +1669,10 @@ mod tests {
         });
         save_meta(&paths, &meta).unwrap();
 
-        assert_eq!(provision_for_rebuild(&root, "app", "v1").unwrap(), "echo hi");
+        assert_eq!(
+            provision_for_rebuild(&root, "app", "v1").unwrap(),
+            "echo hi"
+        );
         assert_eq!(
             provision_for_rebuild(&root, "app", "bare")
                 .unwrap_err()
@@ -1671,7 +1699,10 @@ mod tests {
         let err = reset_scratch_over_base(&root, "app", "app", "base")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("already exists over a different parent"), "{err}");
+        assert!(
+            err.contains("already exists over a different parent"),
+            "{err}"
+        );
 
         // Delete the scratch, then reset over base succeeds.
         delete(&root, "app", "scratch", true).unwrap();

@@ -560,10 +560,9 @@ allowlist = ["1.1.1.1", "8.8.8.0/24", "*.crates.io"]
         assert_eq!(off.network.max, NetworkLevel::None);
 
         // network_enabled = true with no [policy.network] -> full egress, fixed.
-        let on = Policy::from_toml_str(&VALID_POLICY.replace(
-            "network_enabled = false",
-            "network_enabled = true",
-        ))
+        let on = Policy::from_toml_str(
+            &VALID_POLICY.replace("network_enabled = false", "network_enabled = true"),
+        )
         .unwrap();
         assert_eq!(on.network.default, NetworkLevel::Full);
         assert_eq!(on.network.max, NetworkLevel::Full);
@@ -586,7 +585,10 @@ allowlist = ["1.1.1.1", "8.8.8.0/24", "*.crates.io"]
 
         let err = Policy::from_toml_str(&input).unwrap_err().to_string();
 
-        assert!(err.contains("requires network_enabled = true"), "got: {err}");
+        assert!(
+            err.contains("requires network_enabled = true"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -607,7 +609,10 @@ allowlist = ["1.1.1.1", "8.8.8.0/24", "*.crates.io"]
 
         let err = Policy::from_toml_str(&input).unwrap_err().to_string();
 
-        assert!(err.contains("unknown network level 'wide_open'"), "got: {err}");
+        assert!(
+            err.contains("unknown network level 'wide_open'"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -619,6 +624,9 @@ allowlist = ["1.1.1.1", "8.8.8.0/24", "*.crates.io"]
 
         let err = Policy::from_toml_str(&input).unwrap_err().to_string();
 
-        assert!(err.contains("duplicate network allowlist entry"), "got: {err}");
+        assert!(
+            err.contains("duplicate network allowlist entry"),
+            "got: {err}"
+        );
     }
 }

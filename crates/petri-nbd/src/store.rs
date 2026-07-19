@@ -250,8 +250,7 @@ mod tests {
         let store = LayerStore::open(&dir.0.join("store")).unwrap();
 
         // Seal a scratch to a loose path, then adopt it into the store.
-        let mut scratch =
-            ScratchLayer::create(&dir.0.join("loose.data"), geometry()).unwrap();
+        let mut scratch = ScratchLayer::create(&dir.0.join("loose.data"), geometry()).unwrap();
         scratch.write_block(1, &vec![0x5A; BS as usize]).unwrap();
         let loose = dir.0.join("loose.layer");
         let sealed = scratch.seal(&loose, &[]).unwrap();
@@ -264,8 +263,7 @@ mod tests {
         assert!(!loose.exists(), "adopt consumes the source file");
 
         // Adopting identical content again dedupes onto the existing layer.
-        let mut scratch2 =
-            ScratchLayer::create(&dir.0.join("loose2.data"), geometry()).unwrap();
+        let mut scratch2 = ScratchLayer::create(&dir.0.join("loose2.data"), geometry()).unwrap();
         scratch2.write_block(1, &vec![0x5A; BS as usize]).unwrap();
         let loose2 = dir.0.join("loose2.layer");
         scratch2.seal(&loose2, &[]).unwrap();

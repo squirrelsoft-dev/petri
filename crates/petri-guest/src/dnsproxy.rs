@@ -434,7 +434,10 @@ mod tests {
         assert_eq!(res.add4, vec![(Ipv4Addr::new(93, 184, 215, 14), 300)]);
         assert_eq!(
             res.add6,
-            vec![(Ipv6Addr::new(0x2606, 0x2800, 0x21f, 0xcb07, 0, 0, 0, 1), 300)]
+            vec![(
+                Ipv6Addr::new(0x2606, 0x2800, 0x21f, 0xcb07, 0, 0, 0, 1),
+                300
+            )]
         );
     }
 

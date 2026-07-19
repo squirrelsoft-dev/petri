@@ -31,8 +31,14 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
-    let raw = PathBuf::from(args.next().ok_or("usage: <nocloud.raw> <cidata.iso> [secs]")?);
-    let cidata = PathBuf::from(args.next().ok_or("usage: <nocloud.raw> <cidata.iso> [secs]")?);
+    let raw = PathBuf::from(
+        args.next()
+            .ok_or("usage: <nocloud.raw> <cidata.iso> [secs]")?,
+    );
+    let cidata = PathBuf::from(
+        args.next()
+            .ok_or("usage: <nocloud.raw> <cidata.iso> [secs]")?,
+    );
     let secs: u64 = args.next().map(|s| s.parse().unwrap_or(120)).unwrap_or(120);
     for p in [&raw, &cidata] {
         if !p.exists() {
@@ -41,7 +47,10 @@ fn run() -> Result<(), String> {
     }
     let helper = PathBuf::from("crates/petri-vz/.build/debug/petri-vz");
     if !helper.exists() {
-        return Err(format!("helper not found at {}; build+sign petri-vz first", helper.display()));
+        return Err(format!(
+            "helper not found at {}; build+sign petri-vz first",
+            helper.display()
+        ));
     }
 
     let work = PathBuf::from(format!("target/nbd-bootstrap-smoke/{}", std::process::id()));
@@ -63,7 +72,10 @@ fn run() -> Result<(), String> {
 
     println!("nocloud boot disk : {}  (vda)", raw.display());
     println!("cidata seed       : {}  (vdb, ro)", cidata.display());
-    println!("nbd scratch       : {url}  (blank {} GiB, the build target)", SCRATCH_BYTES >> 30);
+    println!(
+        "nbd scratch       : {url}  (blank {} GiB, the build target)",
+        SCRATCH_BYTES >> 30
+    );
     println!("\nbooting EFI VM (up to {secs}s for cloud-init to write + poweroff)...\n");
 
     let log_file = fs::File::create(&helper_log).map_err(|e| e.to_string())?;
@@ -88,7 +100,9 @@ fn run() -> Result<(), String> {
         .arg("--console-log")
         .arg(&console_log)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(log_file.try_clone().map_err(|e| e.to_string())?))
+        .stdout(Stdio::from(
+            log_file.try_clone().map_err(|e| e.to_string())?,
+        ))
         .stderr(Stdio::from(log_file))
         .spawn()
         .map_err(|e| format!("failed to spawn petri-vz: {e}"))?;
@@ -103,7 +117,11 @@ fn run() -> Result<(), String> {
         let status = helper_status(&control_sock).unwrap_or_default();
         print!(
             "\r  scratch={len} bytes, vm={:<8}",
-            if status.is_empty() { "?".into() } else { status }
+            if status.is_empty() {
+                "?".into()
+            } else {
+                status
+            }
         );
         let _ = std::io::stdout().flush();
         if len > 0 {
@@ -121,7 +139,8 @@ fn run() -> Result<(), String> {
     let sealed = server
         .seal_scratch(&sealed_path, &[])
         .map_err(|e| format!("seal_scratch failed: {e}"))?;
-    let verify_scratch = ScratchLayer::create(&work.join("verify.data"), geom).map_err(|e| e.to_string())?;
+    let verify_scratch =
+        ScratchLayer::create(&work.join("verify.data"), geom).map_err(|e| e.to_string())?;
     let mut composed = LayeredDisk::new(vec![sealed], verify_scratch).map_err(|e| e.to_string())?;
     let mut buf = vec![0u8; MARKER.len()];
     composed
@@ -143,7 +162,11 @@ fn run() -> Result<(), String> {
     println!("\n=== RESULT ===");
     println!("  guest wrote to NBD scratch  : {}", yn(wrote));
     println!("  final VM state              : {final_status}");
-    println!("  marker read back from seal  : {}  ({:?})", yn(marker_ok), String::from_utf8_lossy(&buf));
+    println!(
+        "  marker read back from seal  : {}  ({:?})",
+        yn(marker_ok),
+        String::from_utf8_lossy(&buf)
+    );
     println!("  logs preserved at           : {}", work.display());
 
     server.shutdown().map_err(|e| e.to_string())?;

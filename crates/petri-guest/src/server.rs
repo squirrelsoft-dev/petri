@@ -129,9 +129,7 @@ pub fn handle_frame(
                 "cancellation is not implemented in the skeleton guest",
                 None,
             ),
-            "set_mode" => {
-                handle_set_mode(request, policy, active_command, active_network, started)
-            }
+            "set_mode" => handle_set_mode(request, policy, active_command, active_network, started),
             _ => ResultFrame::rejected(
                 Some(request.id),
                 elapsed_ms(started.elapsed()),
@@ -525,7 +523,10 @@ fn effective_output_cap(request: &DispatchRequest, policy: &Policy) -> usize {
 /// layered on. Deliberately small: just enough for bare command names to
 /// resolve. Anything else a command needs must come from the request.
 fn baseline_env() -> [(&'static str, &'static str); 1] {
-    [("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")]
+    [(
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    )]
 }
 
 /// Everything needed to launch one workload process. Bundled into a struct so
@@ -593,14 +594,15 @@ fn execute_command(spec: CommandSpec, started: Instant) -> ResultFrame {
 
     if let Some(input) = stdin
         && let Some(mut child_stdin) = child.stdin.take()
-            && let Err(err) = child_stdin.write_all(input.as_bytes()) {
-                let _ = child.kill();
-                return guest_error(
-                    id,
-                    elapsed_ms(started.elapsed()),
-                    format!("failed to write command stdin: {err}"),
-                );
-            }
+        && let Err(err) = child_stdin.write_all(input.as_bytes())
+    {
+        let _ = child.kill();
+        return guest_error(
+            id,
+            elapsed_ms(started.elapsed()),
+            format!("failed to write command stdin: {err}"),
+        );
+    }
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();

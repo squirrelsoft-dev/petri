@@ -240,10 +240,7 @@ pub fn apply(
 /// `allowlist`, so the answer is irrelevant; callers (the proxy) log and
 /// continue rather than treating it as fatal.
 #[cfg(target_os = "linux")]
-pub fn add_resolved(
-    v4: &[(Ipv4Addr, u32)],
-    v6: &[(Ipv6Addr, u32)],
-) -> Result<(), NetfilterError> {
+pub fn add_resolved(v4: &[(Ipv4Addr, u32)], v6: &[(Ipv6Addr, u32)]) -> Result<(), NetfilterError> {
     let Some(script) = render_add_elements(v4, v6) else {
         return Ok(());
     };

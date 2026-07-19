@@ -158,10 +158,7 @@ impl HostBackend for PetriBackend {
         }
     }
 
-    fn run_bootstrap_builder(
-        &self,
-        params: BootstrapBuilderParams,
-    ) -> Result<BootstrapBuilderRun> {
+    fn run_bootstrap_builder(&self, params: BootstrapBuilderParams) -> Result<BootstrapBuilderRun> {
         self.macos.run_bootstrap_builder(params)
     }
 }
@@ -264,7 +261,7 @@ impl MacosBackend {
     }
 
     fn control_socket_path(&self, instance_id: &InstanceId) -> PathBuf {
-        self.instance_dir(instance_id).join("petri-vz.sock")
+        short_control_socket_path(instance_id.as_str())
     }
 
     fn config_dir(&self, instance_id: &InstanceId) -> PathBuf {
@@ -719,10 +716,7 @@ impl HostBackend for MacosBackend {
         self.remove_state(instance_id)
     }
 
-    fn run_bootstrap_builder(
-        &self,
-        params: BootstrapBuilderParams,
-    ) -> Result<BootstrapBuilderRun> {
+    fn run_bootstrap_builder(&self, params: BootstrapBuilderParams) -> Result<BootstrapBuilderRun> {
         if !cfg!(target_os = "macos") {
             return Err(backend_error(
                 "bootstrap builder requires macOS Virtualization.framework".to_string(),
@@ -831,7 +825,8 @@ impl HostBackend for MacosBackend {
             },
         );
         if let Err(err) = ready {
-            let _ = send_helper_request::<HelperResponse>(&control_socket, &HelperRequest::Teardown);
+            let _ =
+                send_helper_request::<HelperResponse>(&control_socket, &HelperRequest::Teardown);
             let _ = terminate_process(child.id());
             let _ = child.wait();
             return Err(err);
@@ -1048,6 +1043,48 @@ impl MacosVmSpec {
     }
 }
 
+/// The files an image bundle needs in order to Linux-direct-boot: the raw disk
+/// plus the kernel/initrd/cmdline that boot it. Resolved by
+/// [`bundle_boot_files`].
+///
+/// The bundle equivalent of [`crate::image::boot_files_for`], which answers the
+/// same question for a *frozen layer* in the image store. A bundle is a
+/// different artifact — a prebuilt directory (`petri-image.json` + `root.img` +
+/// `vmlinuz` + `initrd.img`) shipped by an external build — and carries no
+/// layer metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleBootFiles {
+    /// The raw boot disk. Read-only when booted under a scratch overlay.
+    pub disk: PathBuf,
+    pub kernel: PathBuf,
+    pub initrd: PathBuf,
+    pub cmdline: String,
+}
+
+/// Resolve an image bundle's direct-boot files. Errors unless the bundle
+/// carries all of kernel, initrd, and a kernel command line — one built for
+/// firmware boot has no kernel to hand the VM directly.
+pub fn bundle_boot_files(bundle_dir: &Path) -> Result<BundleBootFiles> {
+    let bundle = ImageBundle::load(bundle_dir)?;
+    let missing = |what: &str| {
+        PetriError::InvalidConfig(format!(
+            "image bundle {} has no {what} and cannot be direct-booted",
+            bundle_dir.display()
+        ))
+    };
+    Ok(BundleBootFiles {
+        disk: bundle.disk.clone(),
+        kernel: bundle.kernel.clone().ok_or_else(|| missing("kernel"))?,
+        initrd: bundle.initrd.clone().ok_or_else(|| missing("initrd"))?,
+        cmdline: bundle
+            .manifest
+            .kernel_command_line
+            .clone()
+            .filter(|cmdline| !cmdline.is_empty())
+            .ok_or_else(|| missing("kernel_command_line"))?,
+    })
+}
+
 #[derive(Debug, Clone)]
 struct ImageBundle {
     bundle_dir: PathBuf,
@@ -1193,7 +1230,6 @@ enum BootMode {
     Linux,
     Efi,
 }
-
 
 impl BootMode {
     fn as_str(self) -> &'static str {
@@ -1346,6 +1382,22 @@ pub fn instances_dir() -> PathBuf {
     default_state_dir()
 }
 
+/// The control socket for an instance, at a short, deterministic path in the
+/// system temp dir. It must NOT live in the instance directory: `sun_path` is
+/// 104 bytes on macOS, and a deep state dir (an app's Application Support
+/// tree) plus a descriptive instance name blows past it — the helper then
+/// dies with "control socket path is too long" before the VM boots. FNV-1a
+/// keeps the id→path mapping stable across processes without a hasher
+/// dependency.
+pub(crate) fn short_control_socket_path(instance_id: &str) -> PathBuf {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in instance_id.bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    std::env::temp_dir().join(format!("petri-{hash:016x}.sock"))
+}
+
 /// Resolves the petri-vz helper binary, honouring `PETRI_VZ_BIN`.
 pub fn resolve_petri_vz() -> Result<PathBuf> {
     resolve_helper_binary(&default_helper_binary())
@@ -1377,12 +1429,13 @@ fn resolve_sibling_binary(configured: &Path) -> Result<PathBuf> {
     }
 
     if let Ok(current_exe) = env::current_exe()
-        && let Some(dir) = current_exe.parent() {
-            let sibling = dir.join(configured);
-            if sibling.is_file() {
-                return Ok(sibling);
-            }
+        && let Some(dir) = current_exe.parent()
+    {
+        let sibling = dir.join(configured);
+        if sibling.is_file() {
+            return Ok(sibling);
         }
+    }
 
     Ok(configured.to_path_buf())
 }
@@ -1688,6 +1741,22 @@ mod tests {
         path
     }
 
+    #[test]
+    fn control_socket_path_is_short_and_deterministic() {
+        let long_id = "spore-conduit-bot-81c485ba-9cd9-462f-b222-a0dea1d8bd03-1784104070424209000";
+        let a = short_control_socket_path(long_id);
+        let b = short_control_socket_path(long_id);
+        assert_eq!(a, b, "same id must map to the same socket");
+        assert_ne!(a, short_control_socket_path("another-instance"));
+        // sun_path is 104 bytes on macOS; leave headroom for the NUL.
+        assert!(
+            a.as_os_str().len() < 104,
+            "socket path too long: {} bytes ({})",
+            a.as_os_str().len(),
+            a.display()
+        );
+    }
+
     fn runtime_state(id: InstanceId, lifecycle: LifecycleState) -> RuntimeState {
         RuntimeState {
             id,
@@ -1732,6 +1801,55 @@ mod tests {
             Some(fs::canonicalize(dir.join("vmlinuz")).unwrap())
         );
         assert_eq!(bundle.disk, fs::canonicalize(dir.join("root.img")).unwrap());
+    }
+
+    #[test]
+    fn bundle_boot_files_resolves_the_direct_boot_set() {
+        let dir = temp_dir("bundle-boot-files");
+        fs::write(dir.join("root.img"), b"disk").unwrap();
+        fs::write(dir.join("vmlinuz"), b"kernel").unwrap();
+        fs::write(dir.join("initrd.img"), b"initrd").unwrap();
+        fs::write(
+            dir.join("petri-image.json"),
+            r#"{
+                "architecture": "aarch64",
+                "kernel": "vmlinuz",
+                "disk": "root.img",
+                "initrd": "initrd.img",
+                "kernel_command_line": "root=/dev/vda1 rw"
+            }"#,
+        )
+        .unwrap();
+
+        let boot = bundle_boot_files(&dir).unwrap();
+
+        assert_eq!(boot.disk, fs::canonicalize(dir.join("root.img")).unwrap());
+        assert_eq!(boot.kernel, fs::canonicalize(dir.join("vmlinuz")).unwrap());
+        assert_eq!(
+            boot.initrd,
+            fs::canonicalize(dir.join("initrd.img")).unwrap()
+        );
+        assert_eq!(boot.cmdline, "root=/dev/vda1 rw");
+    }
+
+    #[test]
+    fn bundle_boot_files_rejects_a_bundle_that_cannot_direct_boot() {
+        // An EFI bundle boots via firmware and ships no kernel to hand the VM.
+        let dir = temp_dir("bundle-boot-files-efi");
+        fs::write(dir.join("root.img"), b"disk").unwrap();
+        fs::write(
+            dir.join("petri-image.json"),
+            r#"{
+                "architecture": "aarch64",
+                "boot_mode": "efi",
+                "disk": "root.img"
+            }"#,
+        )
+        .unwrap();
+
+        let err = bundle_boot_files(&dir).unwrap_err().to_string();
+
+        assert!(err.contains("has no kernel"), "got: {err}");
     }
 
     #[test]

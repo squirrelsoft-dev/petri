@@ -72,8 +72,15 @@ impl NbdServer {
                 listener.set_nonblocking(true)?;
                 let bound = listener.local_addr()?;
                 let url = format!("nbd://127.0.0.1:{}/{}", bound.port(), export_name);
-                let accept = spawn_tcp_accept(listener, disk, running.clone(), export_name, read_only);
-                Ok(NbdHandle { url, running, accept: Some(accept), unix_path: None, disk: disk_handle })
+                let accept =
+                    spawn_tcp_accept(listener, disk, running.clone(), export_name, read_only);
+                Ok(NbdHandle {
+                    url,
+                    running,
+                    accept: Some(accept),
+                    unix_path: None,
+                    disk: disk_handle,
+                })
             }
             BindMode::UnixSocket(path) => {
                 let _ = std::fs::remove_file(&path);
@@ -82,8 +89,15 @@ impl NbdServer {
                 // Canonical NBD URI form: export in the path, socket as a query
                 // param (https://github.com/NetworkBlockDevice/nbd .../uri.md).
                 let url = format!("nbd+unix:///{}?socket={}", export_name, path.display());
-                let accept = spawn_unix_accept(listener, disk, running.clone(), export_name, read_only);
-                Ok(NbdHandle { url, running, accept: Some(accept), unix_path: Some(path), disk: disk_handle })
+                let accept =
+                    spawn_unix_accept(listener, disk, running.clone(), export_name, read_only);
+                Ok(NbdHandle {
+                    url,
+                    running,
+                    accept: Some(accept),
+                    unix_path: Some(path),
+                    disk: disk_handle,
+                })
             }
         }
     }
@@ -109,7 +123,10 @@ impl NbdHandle {
     /// after the guest has quiesced its writes (e.g. VM stopped) for a
     /// consistent snapshot.
     pub fn seal_scratch(&self, dir: &Path, parents: &[LayerId]) -> io::Result<ImmutableLayer> {
-        self.disk.lock().expect("disk mutex poisoned").seal_scratch(dir, parents)
+        self.disk
+            .lock()
+            .expect("disk mutex poisoned")
+            .seal_scratch(dir, parents)
     }
 
     /// Stop accepting connections and join the accept loop.
@@ -177,8 +194,12 @@ fn spawn_unix_accept(
     })
 }
 
-fn spawn_worker<S>(stream: S, disk: &Arc<Mutex<LayeredDisk>>, export_name: &Arc<String>, read_only: bool)
-where
+fn spawn_worker<S>(
+    stream: S,
+    disk: &Arc<Mutex<LayeredDisk>>,
+    export_name: &Arc<String>,
+    read_only: bool,
+) where
     S: Read + Write + Send + 'static,
 {
     let disk = disk.clone();
@@ -213,7 +234,10 @@ fn serve_connection<S: Read + Write>(
     loop {
         let magic = read_u64(&mut stream)?;
         if magic != IHAVEOPT {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad option magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad option magic",
+            ));
         }
         let opt = read_u32(&mut stream)?;
         let len = read_u32(&mut stream)?;
@@ -282,7 +306,10 @@ fn transmission<S: Read + Write>(
                     continue;
                 }
                 let mut buf = vec![0u8; req.length as usize];
-                let res = disk.lock().expect("disk mutex poisoned").read_at(req.offset, &mut buf);
+                let res = disk
+                    .lock()
+                    .expect("disk mutex poisoned")
+                    .read_at(req.offset, &mut buf);
                 match res {
                     Ok(()) => {
                         write_simple_reply(stream, 0, req.handle)?;
@@ -295,7 +322,10 @@ fn transmission<S: Read + Write>(
             CMD_WRITE => {
                 // Payload must be drained to keep framing intact even on error.
                 if req.length > MAX_REQUEST_LEN {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "write too large"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "write too large",
+                    ));
                 }
                 let mut buf = vec![0u8; req.length as usize];
                 stream.read_exact(&mut buf)?;
@@ -521,7 +551,9 @@ mod tests {
             self.command(CMD_READ, 0, offset, length, &[])
         }
         fn write(&mut self, offset: u64, payload: &[u8]) -> io::Result<u32> {
-            Ok(self.command(CMD_WRITE, 0, offset, payload.len() as u32, payload)?.0)
+            Ok(self
+                .command(CMD_WRITE, 0, offset, payload.len() as u32, payload)?
+                .0)
         }
         fn disconnect(&mut self) -> io::Result<()> {
             write_u32(&mut self.0, REQUEST_MAGIC)?;
@@ -537,7 +569,11 @@ mod tests {
     fn serve_tcp(dir: &Path, read_only: bool) -> NbdHandle {
         NbdServer::serve(
             base_disk(dir),
-            ServeOpts { bind: BindMode::LoopbackTcp(0), export_name: "petri".into(), read_only },
+            ServeOpts {
+                bind: BindMode::LoopbackTcp(0),
+                export_name: "petri".into(),
+                read_only,
+            },
         )
         .unwrap()
     }
