@@ -3,7 +3,11 @@
 #
 # Exit codes are the hook contract, not qlty's:
 #   0 - clean, or nothing to do (qlty absent, no config, re-entrant call)
-#   2 - qlty found issues; stdout is fed back to Claude to fix
+#   2 - qlty found issues; STDERR is fed back to Claude to fix
+#
+# The findings must go to stderr, not stdout: on exit 2 Claude Code surfaces
+# stderr as the blocking message. Writing to stdout blocks the turn with an
+# empty reason, which is worse than not blocking at all.
 #
 # Degrades to exit 0 whenever it cannot run a meaningful check, so a
 # teammate without qlty installed is never blocked from ending a turn.
@@ -39,5 +43,5 @@ status=$?
 # Plugins in comment/monitor mode still print findings but exit 0, so
 # reaching here means something genuinely blocking fired.
 printf 'qlty check failed (exit %s). Fix these before finishing:\n\n%s\n' \
-  "$status" "$output"
+  "$status" "$output" >&2
 exit 2
