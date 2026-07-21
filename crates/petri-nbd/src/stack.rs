@@ -31,7 +31,7 @@ impl Geometry {
                 "block_size must be non-zero",
             ));
         }
-        if !virtual_size.is_multiple_of(block_size as u64) {
+        if !virtual_size.is_multiple_of(u64::from(block_size)) {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "virtual_size must be a multiple of block_size",
@@ -45,12 +45,25 @@ impl Geometry {
 
     /// Number of blocks spanning the virtual disk.
     pub fn block_count(&self) -> u64 {
-        self.virtual_size / self.block_size as u64
+        self.virtual_size / u64::from(self.block_size)
     }
 
-    fn check_range(&self, offset: u64, len: usize) -> io::Result<()> {
+    /// Byte offset of `pos` within the block that contains it.
+    ///
+    /// The result is `pos % block_size`, so it is always strictly less than
+    /// `block_size` — a u32. It is therefore representable in usize on every
+    /// supported target and the conversion cannot truncate. Centralizing it
+    /// here keeps that argument in one place instead of at each call site.
+    #[allow(clippy::cast_possible_truncation)]
+    fn block_offset(&self, pos: u64) -> usize {
+        (pos % u64::from(self.block_size)) as usize
+    }
+
+    /// `len` is a u64 byte count because callers work in disk offsets; taking
+    /// usize here only forced a cast back to u64 on the first line.
+    fn check_range(&self, offset: u64, len: u64) -> io::Result<()> {
         let end = offset
-            .checked_add(len as u64)
+            .checked_add(len)
             .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "offset + len overflows"))?;
         if end > self.virtual_size {
             return Err(Error::new(
@@ -125,13 +138,13 @@ impl LayeredDisk {
     /// Read `buf.len()` bytes starting at `offset`. Supports arbitrary
     /// (unaligned) offset and length; holes are zero-filled.
     pub fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        self.geometry.check_range(offset, buf.len())?;
+        self.geometry.check_range(offset, buf.len() as u64)?;
         let bs = self.geometry.block_size as usize;
         let mut done = 0usize;
         let mut pos = offset;
         while done < buf.len() {
             let block = pos / bs as u64;
-            let in_block = (pos % bs as u64) as usize;
+            let in_block = self.geometry.block_offset(pos);
             let n = (bs - in_block).min(buf.len() - done);
             // Borrow the scratch block buffer without aliasing `self`.
             let mut tmp = std::mem::take(&mut self.block_buf);
@@ -148,13 +161,13 @@ impl LayeredDisk {
     /// Write `buf` at `offset` into the scratch overlay only. Sub-block writes
     /// do read-modify-write against the resolved stack.
     pub fn write_at(&mut self, offset: u64, buf: &[u8]) -> io::Result<()> {
-        self.geometry.check_range(offset, buf.len())?;
+        self.geometry.check_range(offset, buf.len() as u64)?;
         let bs = self.geometry.block_size as usize;
         let mut done = 0usize;
         let mut pos = offset;
         while done < buf.len() {
             let block = pos / bs as u64;
-            let in_block = (pos % bs as u64) as usize;
+            let in_block = self.geometry.block_offset(pos);
             let n = (bs - in_block).min(buf.len() - done);
             if in_block == 0 && n == bs {
                 self.scratch.write_block(block, &buf[done..done + bs])?;
@@ -177,14 +190,14 @@ impl LayeredDisk {
     /// Zero a region by writing zeroes into the scratch overlay. Full blocks
     /// are written as zero blocks; partial blocks do read-modify-write.
     pub fn write_zeroes(&mut self, offset: u64, len: u64) -> io::Result<()> {
-        self.geometry.check_range(offset, len as usize)?;
+        self.geometry.check_range(offset, len)?;
         let bs = self.geometry.block_size as usize;
         let mut remaining = len;
         let mut pos = offset;
         while remaining > 0 {
             let block = pos / bs as u64;
-            let in_block = (pos % bs as u64) as usize;
-            let n = ((bs - in_block) as u64).min(remaining) as usize;
+            let in_block = self.geometry.block_offset(pos);
+            let n = (bs - in_block).min(usize::try_from(remaining).unwrap_or(usize::MAX));
             let mut tmp = std::mem::take(&mut self.block_buf);
             let res = if in_block == 0 && n == bs {
                 tmp.fill(0);
@@ -208,14 +221,14 @@ impl LayeredDisk {
     /// blocks are zeroed in scratch (their covered range becomes undefined →
     /// zero) so the untouched remainder still shadows lower layers.
     pub fn trim(&mut self, offset: u64, len: u64) -> io::Result<()> {
-        self.geometry.check_range(offset, len as usize)?;
+        self.geometry.check_range(offset, len)?;
         let bs = self.geometry.block_size as usize;
         let mut remaining = len;
         let mut pos = offset;
         while remaining > 0 {
             let block = pos / bs as u64;
-            let in_block = (pos % bs as u64) as usize;
-            let n = ((bs - in_block) as u64).min(remaining) as usize;
+            let in_block = self.geometry.block_offset(pos);
+            let n = (bs - in_block).min(usize::try_from(remaining).unwrap_or(usize::MAX));
             if in_block == 0 && n == bs {
                 self.scratch.forget_block(block);
             } else {
@@ -246,6 +259,9 @@ impl LayeredDisk {
 }
 
 #[cfg(test)]
+// Tests build offsets from the small `BS` block-size constant, so the widening
+// conversions here are scaffolding rather than production arithmetic.
+#[allow(clippy::cast_lossless)]
 mod tests {
     use super::*;
     use std::fs;

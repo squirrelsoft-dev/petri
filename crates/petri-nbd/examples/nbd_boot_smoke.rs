@@ -11,6 +11,16 @@
 //!
 //! Defaults: BUNDLE_DIR=target/petri-images/base, BOOT_SECS=45.
 
+// Diagnostic harness: byte counts are converted to f64 only to print
+// human-readable GiB, and elapsed seconds to i64 only for a countdown
+// display. Neither feeds storage arithmetic, so precision and sign are
+// immaterial here.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_lossless
+)]
+
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;

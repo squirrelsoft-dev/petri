@@ -10,6 +10,17 @@
 //! Milestone 1 (this module set) covers the local block stack. The NBD server
 //! (`server`/`protocol`) and sealing/store (`store`) land in later milestones.
 
+// This crate converts u64 disk offsets and metadata lengths to usize in the
+// block-resolution and layer-decoding paths. Those conversions are lossless
+// only where usize is at least 64 bits wide. Rather than thread fallible
+// conversions through the hot path, the assumption is asserted once here, at
+// compile time — a 32-bit target fails to build instead of silently
+// truncating an offset at runtime.
+const _: () = assert!(
+    usize::BITS >= u64::BITS,
+    "petri-nbd requires a 64-bit target: u64 disk offsets are converted to usize"
+);
+
 mod layer;
 mod protocol;
 mod server;

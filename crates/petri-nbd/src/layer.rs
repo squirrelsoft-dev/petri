@@ -96,7 +96,7 @@ impl ImmutableLayer {
     pub fn open_raw_base(path: &Path, geometry: Geometry) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).open(path)?;
         let len = file.metadata()?.len();
-        let bs = geometry.block_size as u64;
+        let bs = u64::from(geometry.block_size);
         // Round up: a partial trailing block still counts as present.
         let file_blocks = len.div_ceil(bs);
         Ok(Self {
@@ -155,7 +155,7 @@ impl ImmutableLayer {
                 if block >= *file_blocks {
                     return Ok(false);
                 }
-                let bs = self.geometry.block_size as u64;
+                let bs = u64::from(self.geometry.block_size);
                 let offset = block * bs;
                 // A trailing partial block reads short; zero-fill the remainder.
                 out.fill(0);
@@ -267,6 +267,21 @@ impl ScratchLayer {
     /// remains usable afterward, so an overlay can be sealed without tearing
     /// down the stack that is currently serving it.
     pub fn seal(&self, path: &Path, parents: &[LayerId]) -> io::Result<ImmutableLayer> {
+        // The on-disk format stores the parent count as u16 and the reader
+        // parses it as one, so a longer chain cannot round-trip. Reject it
+        // here rather than letting the cast wrap silently: a wrapped count
+        // would corrupt the metadata *and* feed a wrong length into the
+        // content hash below, which would silently collide content ids.
+        let parent_count = u16::try_from(parents.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "layer has {} parents, exceeding the {} the format can store",
+                    parents.len(),
+                    u16::MAX
+                ),
+            )
+        })?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -283,7 +298,7 @@ impl ScratchLayer {
         content.update(b"petri-nbd-layer-v1\0");
         content.update(self.geometry.block_size.to_le_bytes());
         content.update(self.geometry.virtual_size.to_le_bytes());
-        content.update((parents.len() as u16).to_le_bytes());
+        content.update(parent_count.to_le_bytes());
         for parent in parents {
             content.update(parent.as_bytes());
         }
@@ -304,7 +319,13 @@ impl ScratchLayer {
 
         // Append the metadata blob and the fixed footer right after the packed
         // block region (which ends at `offset`), then fsync the whole file.
-        let meta = encode_meta(&self.geometry, &content_id, parents, &new_index);
+        let meta = encode_meta(
+            &self.geometry,
+            &content_id,
+            parents,
+            parent_count,
+            &new_index,
+        );
         write_all_at(&out, offset, &meta)?;
         let footer = encode_footer(meta.len() as u64, crc32(&meta));
         write_all_at(&out, offset + meta.len() as u64, &footer)?;
@@ -339,15 +360,24 @@ struct Meta {
 /// `layer.meta` sidecar).
 const FOOTER_MAGIC: &[u8; 8] = b"PNBDLYR\x02";
 /// Fixed footer: `metadata_len u64 | metadata_crc u32 | version u16 | flags u16 | magic [8]`.
-const FOOTER_SIZE: u64 = 24;
+/// Fixed trailer size in bytes. Declared as usize because it sizes array
+/// literals, with a u64 twin for the file-offset arithmetic, so neither use
+/// needs a cast. The assertion keeps the two in step.
+const FOOTER_SIZE: usize = 24;
+const FOOTER_SIZE_U64: u64 = 24;
+const _: () = assert!(FOOTER_SIZE == 24 && FOOTER_SIZE_U64 == 24);
 const FORMAT_VERSION: u16 = 2;
 const HASH_ALGO_SHA256: u8 = 1;
 
 /// Encode the metadata blob (everything but the trailing fixed footer).
+/// `parent_count` is `parents.len()` already validated to fit in u16 by the
+/// caller, so the count written here and the one hashed into the content id
+/// cannot disagree.
 fn encode_meta(
     geometry: &Geometry,
     content_id: &LayerId,
     parents: &[LayerId],
+    parent_count: u16,
     index: &BTreeMap<u64, u64>,
 ) -> Vec<u8> {
     let mut m = Vec::new();
@@ -355,7 +385,8 @@ fn encode_meta(
     m.extend_from_slice(&geometry.virtual_size.to_le_bytes());
     m.push(HASH_ALGO_SHA256);
     m.extend_from_slice(content_id.as_bytes());
-    m.extend_from_slice(&(parents.len() as u16).to_le_bytes());
+    debug_assert_eq!(usize::from(parent_count), parents.len());
+    m.extend_from_slice(&parent_count.to_le_bytes());
     for parent in parents {
         m.extend_from_slice(parent.as_bytes());
     }
@@ -368,8 +399,8 @@ fn encode_meta(
 }
 
 /// Encode the fixed-size footer that terminates a sealed layer file.
-fn encode_footer(metadata_len: u64, metadata_crc: u32) -> [u8; FOOTER_SIZE as usize] {
-    let mut f = [0u8; FOOTER_SIZE as usize];
+fn encode_footer(metadata_len: u64, metadata_crc: u32) -> [u8; FOOTER_SIZE] {
+    let mut f = [0u8; FOOTER_SIZE];
     f[0..8].copy_from_slice(&metadata_len.to_le_bytes());
     f[8..12].copy_from_slice(&metadata_crc.to_le_bytes());
     f[12..14].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -381,14 +412,14 @@ fn encode_footer(metadata_len: u64, metadata_crc: u32) -> [u8; FOOTER_SIZE as us
 /// Read and validate a sealed layer's trailing footer, then its metadata blob.
 fn read_footer_meta(file: &File) -> io::Result<Meta> {
     let file_len = file.metadata()?.len();
-    if file_len < FOOTER_SIZE {
+    if file_len < FOOTER_SIZE_U64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "file shorter than layer footer",
         ));
     }
-    let mut footer = [0u8; FOOTER_SIZE as usize];
-    read_exact_at(file, file_len - FOOTER_SIZE, &mut footer)?;
+    let mut footer = [0u8; FOOTER_SIZE];
+    read_exact_at(file, file_len - FOOTER_SIZE_U64, &mut footer)?;
     if &footer[16..24] != FOOTER_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -404,7 +435,7 @@ fn read_footer_meta(file: &File) -> io::Result<Meta> {
     }
     let metadata_len = u64::from_le_bytes(footer[0..8].try_into().unwrap());
     let metadata_crc = u32::from_le_bytes(footer[8..12].try_into().unwrap());
-    let meta_offset = (file_len - FOOTER_SIZE)
+    let meta_offset = (file_len - FOOTER_SIZE_U64)
         .checked_sub(metadata_len)
         .ok_or_else(|| {
             io::Error::new(
@@ -412,7 +443,12 @@ fn read_footer_meta(file: &File) -> io::Result<Meta> {
                 "layer metadata length overflows file",
             )
         })?;
-    let mut bytes = vec![0u8; metadata_len as usize];
+    // metadata_len was just bounded by checked_sub against the real file
+    // length, so it cannot exceed the file; combined with the 64-bit target
+    // assertion in lib.rs the conversion is lossless.
+    #[allow(clippy::cast_possible_truncation)]
+    let metadata_len_usize = metadata_len as usize;
+    let mut bytes = vec![0u8; metadata_len_usize];
     read_exact_at(file, meta_offset, &mut bytes)?;
     if crc32(&bytes) != metadata_crc {
         return Err(io::Error::new(
@@ -462,7 +498,7 @@ fn decode_meta(bytes: &[u8]) -> io::Result<Meta> {
 fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &b in bytes {
-        crc ^= b as u32;
+        crc ^= u32::from(b);
         for _ in 0..8 {
             let mask = (crc & 1).wrapping_neg();
             crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
@@ -536,6 +572,9 @@ fn write_all_at(mut file: &File, offset: u64, buf: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(test)]
+// Tests build offsets from the small `BS` block-size constant, so the widening
+// conversions here are scaffolding rather than production arithmetic.
+#[allow(clippy::cast_lossless)]
 mod tests {
     use super::*;
     use crate::stack::LayeredDisk;
@@ -619,6 +658,36 @@ mod tests {
     }
 
     #[test]
+    fn seal_rejects_more_parents_than_the_format_can_store() {
+        // The format stores the parent count as u16 and the reader parses it
+        // as one. Before this was validated, `parents.len() as u16` wrapped:
+        // 65536 parents encoded as 0, producing metadata that could not
+        // round-trip and a content id hashed over the wrong count.
+        let dir = TestDir::new();
+        let mut scratch = ScratchLayer::create(&dir.path("overflow.data"), geometry()).unwrap();
+        scratch.write_block(1, &block(0x5A)).unwrap();
+
+        let too_many = vec![LayerId([0u8; 32]); usize::from(u16::MAX) + 1];
+        match scratch.seal(&dir.path("overflow"), &too_many) {
+            Ok(_) => panic!("seal must reject a parent chain the format cannot encode"),
+            Err(err) => {
+                assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+                assert!(
+                    err.to_string().contains("exceeding"),
+                    "unexpected error: {err}"
+                );
+            }
+        }
+
+        // The boundary case must still succeed.
+        let at_limit = vec![LayerId([0u8; 32]); usize::from(u16::MAX)];
+        assert!(
+            scratch.seal(&dir.path("at-limit"), &at_limit).is_ok(),
+            "u16::MAX parents must still seal"
+        );
+    }
+
+    #[test]
     fn content_id_is_stable_and_distinct() {
         let dir = TestDir::new();
         let a = seal_with(&dir, "a", 0xAA, &[]).content_id().unwrap();
@@ -693,7 +762,7 @@ mod tests {
         // Truncating below the footer is rejected.
         let truncated = dir.path("truncated.bin");
         let bytes = fs::read(&layer_path).unwrap();
-        fs::write(&truncated, &bytes[..(FOOTER_SIZE as usize - 1)]).unwrap();
+        fs::write(&truncated, &bytes[..(FOOTER_SIZE - 1)]).unwrap();
         assert!(ImmutableLayer::open_sealed(&truncated).is_err());
 
         // Clobbering the magic (last 8 bytes) is rejected.
@@ -707,7 +776,7 @@ mod tests {
         // Flipping a metadata byte trips the CRC check.
         let bad_meta = dir.path("bad-meta.bin");
         let mut m = bytes.clone();
-        let meta_byte = m.len() - FOOTER_SIZE as usize - 1; // last byte of the metadata blob
+        let meta_byte = m.len() - FOOTER_SIZE - 1; // last byte of the metadata blob
         m[meta_byte] ^= 0xFF;
         fs::write(&bad_meta, &m).unwrap();
         assert!(ImmutableLayer::open_sealed(&bad_meta).is_err());

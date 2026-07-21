@@ -366,7 +366,7 @@ fn transmission<S: Read + Write>(
                     match disk
                         .lock()
                         .expect("disk mutex poisoned")
-                        .trim(req.offset, req.length as u64)
+                        .trim(req.offset, u64::from(req.length))
                     {
                         Ok(()) => 0,
                         Err(_) => EIO,
@@ -384,7 +384,7 @@ fn transmission<S: Read + Write>(
                     match disk
                         .lock()
                         .expect("disk mutex poisoned")
-                        .write_zeroes(req.offset, req.length as u64)
+                        .write_zeroes(req.offset, u64::from(req.length))
                     {
                         Ok(()) => 0,
                         Err(_) => EIO,
@@ -408,21 +408,35 @@ fn export_flags(read_only: bool) -> u16 {
 }
 
 fn out_of_bounds(offset: u64, length: u32, vsize: u64) -> bool {
-    match offset.checked_add(length as u64) {
+    match offset.checked_add(u64::from(length)) {
         Some(end) => end > vsize,
         None => true,
     }
 }
 
 fn write_opt_reply(w: &mut impl Write, opt: u32, rep_type: u32, data: &[u8]) -> io::Result<()> {
+    // The option reply header carries the payload length as u32. Every payload
+    // this server builds is small (export names and info records), but encode
+    // the bound rather than truncating silently: a wrapped length would frame
+    // the reply wrongly and desynchronize the client's option stream.
+    let data_len = u32::try_from(data.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("option reply payload of {} bytes exceeds u32", data.len()),
+        )
+    })?;
     write_u64(w, REP_MAGIC)?;
     write_u32(w, opt)?;
     write_u32(w, rep_type)?;
-    write_u32(w, data.len() as u32)?;
+    write_u32(w, data_len)?;
     w.write_all(data)
 }
 
 #[cfg(test)]
+// Tests build offsets from the small `BS` block-size constant and frame
+// protocol messages from fixed literals, so the conversions here are
+// scaffolding rather than production arithmetic.
+#[allow(clippy::cast_lossless, clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
     use crate::stack::Geometry;
