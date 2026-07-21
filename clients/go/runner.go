@@ -31,8 +31,9 @@ func defaultRunner(ctx context.Context, petriPath string, args []string, stdin s
 	exitCode := 0
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
+			// A non-zero exit is not an execution error: report it via
+			// exitCode and return a nil error below.
 			exitCode = exitErr.ExitCode()
-			err = nil // non-zero exit is not an execution error
 		} else {
 			return nil, nil, 0, fmt.Errorf("petri: failed to run binary %q: %w", petriPath, err)
 		}

@@ -12,7 +12,7 @@ implementation resolves the binary via:
 from __future__ import annotations
 
 import os
-import subprocess
+import subprocess  # nosec B404 - this module exists to invoke the petri CLI
 from typing import Protocol
 
 from petri.errors import (
@@ -55,7 +55,12 @@ def make_default_runner(petri_path: str | None = None) -> Runner:
 
     def _run(argv: list[str], stdin: bytes | None = None) -> tuple[str, str, int]:
         full_argv = [binary] + argv
-        result = subprocess.run(
+        # nosec B603 - argv is passed in list form with shell=False (the
+        # default), so command arguments are never shell-interpreted. The
+        # binary itself is operator-controlled (explicit path, PETRI_BIN, or
+        # PATH); anyone able to set those can already influence the process
+        # via PATH/LD_PRELOAD, so this is the same trust boundary.
+        result = subprocess.run(  # nosec B603
             full_argv,
             input=stdin,
             capture_output=True,

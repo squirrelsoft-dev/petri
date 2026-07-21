@@ -121,14 +121,14 @@ type ErrorFrame struct {
 
 // resultFrame is the internal JSON shape of "petri sandbox exec" stdout.
 type resultFrame struct {
-	ProtocolVersion int        `json:"protocol_version"`
-	ID              string     `json:"id"`
-	Status          string     `json:"status"`
-	ElapsedMs       int64      `json:"elapsed_ms"`
-	Stdout          *string    `json:"stdout"`
-	Stderr          *string    `json:"stderr"`
-	ExitCode        *int       `json:"exit_code"`
-	OutputTruncated bool       `json:"output_truncated"`
+	ProtocolVersion int         `json:"protocol_version"`
+	ID              string      `json:"id"`
+	Status          string      `json:"status"`
+	ElapsedMs       int64       `json:"elapsed_ms"`
+	Stdout          *string     `json:"stdout"`
+	Stderr          *string     `json:"stderr"`
+	ExitCode        *int        `json:"exit_code"`
+	OutputTruncated bool        `json:"output_truncated"`
 	Error           *ErrorFrame `json:"error"`
 }
 

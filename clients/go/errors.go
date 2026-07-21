@@ -4,15 +4,15 @@ import "errors"
 
 // Sentinel errors for use with errors.Is.
 var (
-	ErrSandboxNotFound          = errors.New("sandbox not found")
-	ErrSandboxNotReady          = errors.New("sandbox not ready")
-	ErrPolicyDenied             = errors.New("policy denied")
-	ErrCommandTimeout           = errors.New("command timeout")
-	ErrOutputTruncated          = errors.New("output truncated")
-	ErrCommandFailed            = errors.New("command failed")
-	ErrProtocolVersionMismatch  = errors.New("protocol version mismatch")
-	ErrAuthorization            = errors.New("authorization error")
-	ErrNotImplemented           = errors.New("not implemented in v1")
+	ErrSandboxNotFound         = errors.New("sandbox not found")
+	ErrSandboxNotReady         = errors.New("sandbox not ready")
+	ErrPolicyDenied            = errors.New("policy denied")
+	ErrCommandTimeout          = errors.New("command timeout")
+	ErrOutputTruncated         = errors.New("output truncated")
+	ErrCommandFailed           = errors.New("command failed")
+	ErrProtocolVersionMismatch = errors.New("protocol version mismatch")
+	ErrAuthorization           = errors.New("authorization error")
+	ErrNotImplemented          = errors.New("not implemented in v1")
 )
 
 // PetriError is the base error type for all Petri SDK errors.

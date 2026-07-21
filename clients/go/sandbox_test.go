@@ -78,8 +78,6 @@ func makeResultFrameJSON(status string, stdout, stderr string, exitCode *int, tr
 	return b
 }
 
-func intPtr(v int) *int { return &v }
-
 // ─── Create ───────────────────────────────────────────────────────────────────
 
 func TestCreate_argv(t *testing.T) {
