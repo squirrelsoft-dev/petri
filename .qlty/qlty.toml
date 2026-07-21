@@ -68,10 +68,31 @@ default = true
 name = "bandit"
 
 [[plugin]]
-name = "clippy"
-
-[[plugin]]
 name = "gofmt"
+
+# ─── Why Rust is not linted by qlty ───────────────────────────────────────────
+# qlty pins its own Rust runtime at 1.77.2, which predates edition 2024
+# (stabilized in Rust 1.85). This workspace is edition 2024, so qlty's cargo
+# cannot even parse the manifests. `version = "..."` on the plugin does not
+# move the runtime — it was tried and ignored.
+#
+# The failure mode is what makes this dangerous rather than merely unhelpful:
+# clippy exits 101 with "feature `edition2024` is required", and qlty records
+# EXIT_RESULT_SUCCESS and prints "No issues". Enabling the plugin therefore
+# reports clean results for ~82% of this codebase while checking none of it.
+# It was enabled from adoption until this was caught, and contributed nothing.
+#
+# Rust is instead checked with the project's own toolchain:
+#   - `cargo fmt --all --check` runs in .claude/hooks/qlty-check.sh (blocking)
+#   - `cargo clippy` uses the curated lints in Cargo.toml [workspace.lints]
+# Re-evaluate the clippy/rustfmt plugins if qlty ships a Rust >= 1.85 runtime.
+
+# 860 lines of Swift in crates/petri-vz had no coverage at all. Note that
+# plugin `mode` does NOT affect local exit status in qlty 0.636.0 — only
+# --fail-level does — so a pre-existing backlog has to be handled with a
+# scoped [[ignore]] rather than by marking the plugin non-blocking.
+[[plugin]]
+name = "swiftlint"
 
 [[plugin]]
 name = "golangci-lint"
@@ -146,5 +167,30 @@ rules = [
 ]
 file_patterns = ["clients/go/go.mod"]
 
-# ripgrep's TODO/NOTE markers are a tracked-work inventory, not defects.
-# Kept visible (comment mode) but never build-failing.
+# ripgrep's TODO/NOTE markers are a tracked-work inventory, not defects. They
+# stay visible without failing the gate because they report at `note` level,
+# which is below the default --fail-level of `fmt` — not because of the
+# plugin's comment mode, which does not affect local exit status.
+
+# Swift adoption backlog. main.swift predates any Swift linting, and these
+# eight rules are what it currently trips. They are ignored ONLY in that file
+# so every other swiftlint rule is live on it, and all rules are live on new
+# Swift files. Burn these down and delete the block.
+#
+# identifier_name/trailing_comma/line_length/for_where are mechanical.
+# cyclomatic_complexity (23), function_body_length (62 lines),
+# type_body_length (313 lines), and file_length are the same structural
+# refactor class the [smells] backlog tracks — real work, not noise.
+[[ignore]]
+plugins = ["swiftlint"]
+rules = [
+  "swiftlint:identifier_name",
+  "swiftlint:trailing_comma",
+  "swiftlint:function_body_length",
+  "swiftlint:for_where",
+  "swiftlint:type_body_length",
+  "swiftlint:line_length",
+  "swiftlint:file_length",
+  "swiftlint:cyclomatic_complexity",
+]
+file_patterns = ["crates/petri-vz/Sources/petri-vz/main.swift"]

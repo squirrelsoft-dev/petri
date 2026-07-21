@@ -1,0 +1,37 @@
+version: "2"
+
+# Expanded beyond golangci-lint's default set (errcheck, govet, ineffassign,
+# staticcheck, unused). The additions target correctness and API robustness
+# rather than style — see the per-linter notes below.
+linters:
+  default: standard
+  enable:
+    - bodyclose    # unclosed HTTP response bodies leak connections
+    - errorlint    # type assertions on errors miss wrapped errors
+    - gocritic     # broad correctness/performance diagnostics
+    - gosec        # security issues (subprocess, file perms, crypto)
+    - nilerr       # returning nil when err is non-nil
+    - prealloc     # slice preallocation in hot loops
+    - revive       # golint successor: naming, docs, unused params
+    - unconvert    # redundant type conversions
+
+  settings:
+    revive:
+      rules:
+        # These SDKs deliberately share identifier names across Rust, Python,
+        # and Go so the three clients read alike; docs/spore-core-integration.md
+        # documents the shared error taxonomy. Go's stutter and ALL_CAPS
+        # conventions would force petri.PetriError -> petri.Error and
+        # PROTOCOL_VERSION -> ProtocolVersion, breaking that parity for a
+        # purely cosmetic gain. Cross-language consistency wins here.
+        - name: exported
+          disabled: true
+        - name: var-naming
+          disabled: true
+
+  exclusions:
+    rules:
+      # Table-test helpers routinely accept parameters they do not use.
+      - path: _test\.go
+        linters:
+          - prealloc

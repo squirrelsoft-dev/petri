@@ -12,3 +12,6 @@ toml = "0.9"
 
 [dev-dependencies]
 jsonschema = { version = "0.46.5", default-features = false }
+
+[lints]
+workspace = true

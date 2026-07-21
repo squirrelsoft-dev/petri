@@ -203,7 +203,10 @@ type Sandbox struct {
 	runner    Runner
 }
 
-func (s *Sandbox) run(ctx context.Context) Runner {
+// run selects the Runner for this sandbox: the injected test runner if one is
+// set, otherwise the production runner. It takes no context because it only
+// picks the function; the caller passes ctx when invoking the result.
+func (s *Sandbox) run() Runner {
 	if s.runner != nil {
 		return s.runner
 	}
@@ -406,7 +409,7 @@ type Commands struct {
 func (c *Commands) Run(ctx context.Context, command string, opts RunOptions) (*CommandResult, error) {
 	s := c.sandbox
 	petriPath := resolvePetriPath(s.petriPath)
-	runner := s.run(ctx)
+	runner := s.run()
 
 	args := []string{"sandbox", "exec", s.SandboxID}
 

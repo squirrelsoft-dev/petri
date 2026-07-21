@@ -3,6 +3,7 @@ package petri
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -19,7 +20,11 @@ type Runner func(ctx context.Context, petriPath string, args []string, stdin str
 // defaultRunner is the production Runner that shells out to the real petri
 // binary, resolving it via PetriPath option → PETRI_BIN env → "petri" on PATH.
 func defaultRunner(ctx context.Context, petriPath string, args []string, stdin string) ([]byte, []byte, int, error) {
-	cmd := exec.CommandContext(ctx, petriPath, args...)
+	// G204: petriPath is operator-controlled (explicit option, PETRI_BIN, or
+	// PATH) and args are built internally, never shell-interpreted. Anyone who
+	// can set those can already influence the process via PATH, so this is the
+	// same trust boundary rather than a new one.
+	cmd := exec.CommandContext(ctx, petriPath, args...) //nolint:gosec
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
@@ -30,7 +35,10 @@ func defaultRunner(ctx context.Context, petriPath string, args []string, stdin s
 	err := cmd.Run()
 	exitCode := 0
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		// errors.As rather than a type assertion so a wrapped ExitError is
+		// still recognized as a clean non-zero exit.
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
 			// A non-zero exit is not an execution error: report it via
 			// exitCode and return a nil error below.
 			exitCode = exitErr.ExitCode()

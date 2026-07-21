@@ -31,7 +31,8 @@ type fakeCall struct {
 	stdin     string
 }
 
-func (f *fakeRunner) Run(ctx context.Context, petriPath string, args []string, stdin string) ([]byte, []byte, int, error) {
+// ctx is unused but required to satisfy the Runner signature.
+func (f *fakeRunner) Run(_ context.Context, petriPath string, args []string, stdin string) ([]byte, []byte, int, error) {
 	f.calls = append(f.calls, fakeCall{petriPath: petriPath, args: args, stdin: stdin})
 	return f.result.stdout, f.result.stderr, f.result.exitCode, f.result.err
 }

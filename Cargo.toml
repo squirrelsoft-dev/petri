@@ -1,3 +1,40 @@
 [workspace]
 members = ["crates/petri", "crates/petri-guest", "crates/petri-nbd", "crates/petri-protocol"]
 resolver = "3"
+
+# Clippy lints beyond the default set, chosen individually rather than by
+# enabling the `pedantic` group wholesale. Measured on this tree, pedantic +
+# nursery produce ~900 findings, but ~360 of those are documentation policy
+# (missing_errors_doc, must_use_candidate, doc_markdown) rather than defects.
+# The lints below are the subset that catches real bugs and real waste.
+#
+# Add lints here rather than per-crate; each crate opts in with
+# `[lints] workspace = true`.
+[workspace.lints.clippy]
+# Numeric cast safety. This is the highest-value group for petri specifically:
+# the codebase manipulates disk offsets, block sizes, and memory addresses,
+# where a silent truncation is a correctness bug that tests rarely catch.
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_precision_loss = "warn"
+cast_lossless = "warn"
+cast_sign_loss = "warn"
+
+# Avoidable allocation and copying on I/O paths.
+redundant_clone = "warn"
+needless_pass_by_value = "warn"
+format_push_string = "warn"
+inefficient_to_string = "warn"
+
+# Correctness and clarity.
+match_same_arms = "warn"
+unnested_or_patterns = "warn"
+map_unwrap_or = "warn"
+redundant_closure_for_method_calls = "warn"
+semicolon_if_nothing_returned = "warn"
+use_self = "warn"
+
+# Deliberately NOT enabled — these fire 360+ times and are documentation
+# policy, not defects. Revisit only if the project adopts a docs standard:
+#   missing_errors_doc, missing_panics_doc, must_use_candidate,
+#   doc_markdown, too_long_first_doc_paragraph, missing_const_for_fn

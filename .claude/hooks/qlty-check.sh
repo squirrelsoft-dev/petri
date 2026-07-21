@@ -35,13 +35,24 @@ else
   exit 0
 fi
 
-output="$("$QLTY" check --all --no-progress --no-upgrade-check 2>&1)"
-status=$?
+failures=""
 
-[ "$status" -eq 0 ] && exit 0
+# Plugins in comment/monitor mode still print findings but exit 0, so a
+# non-zero status here means something genuinely blocking fired.
+if ! output="$("$QLTY" check --all --no-progress --no-upgrade-check 2>&1)"; then
+  failures="$failures"$'\n'"--- qlty check ---"$'\n'"$output"
+fi
 
-# Plugins in comment/monitor mode still print findings but exit 0, so
-# reaching here means something genuinely blocking fired.
-printf 'qlty check failed (exit %s). Fix these before finishing:\n\n%s\n' \
-  "$status" "$output" >&2
+# Rust formatting is checked here rather than via qlty's rustfmt plugin: qlty
+# bundles a two-year-old rustfmt that disagrees with this project's toolchain
+# on 17 files. cargo fmt uses the toolchain the project actually builds with.
+if command -v cargo >/dev/null 2>&1 && [ -f Cargo.toml ]; then
+  if ! fmt_output="$(cargo fmt --all --check 2>&1)"; then
+    failures="$failures"$'\n'"--- cargo fmt --all --check ---"$'\n'"$fmt_output"
+  fi
+fi
+
+[ -z "$failures" ] && exit 0
+
+printf 'Checks failed. Fix these before finishing:\n%s\n' "$failures" >&2
 exit 2
