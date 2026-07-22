@@ -117,8 +117,8 @@ impl Rpc {
             },
             "workspaceFolders": [{ "uri": root_uri, "name": "workspace" }]
         });
-        let result = self.request("initialize", params, deadline)?;
-        self.notify("initialized", json!({}))?;
+        let result = self.request("initialize", &params, deadline)?;
+        self.notify("initialized", &json!({}))?;
         Ok(result)
     }
 
@@ -127,7 +127,7 @@ impl Rpc {
     pub fn request(
         &mut self,
         method: &str,
-        params: Value,
+        params: &Value,
         deadline: Instant,
     ) -> Result<Value, LspError> {
         let id = self.next_id;
@@ -154,7 +154,7 @@ impl Rpc {
     }
 
     /// Send a notification (no response expected).
-    pub fn notify(&mut self, method: &str, params: Value) -> Result<(), LspError> {
+    pub fn notify(&mut self, method: &str, params: &Value) -> Result<(), LspError> {
         let message = json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -277,8 +277,8 @@ impl Rpc {
             return;
         }
         let deadline = Instant::now() + Duration::from_secs(2);
-        let _ = self.request("shutdown", Value::Null, deadline);
-        let _ = self.notify("exit", Value::Null);
+        let _ = self.request("shutdown", &Value::Null, deadline);
+        let _ = self.notify("exit", &Value::Null);
     }
 
     /// Whether the connection has been observed closed.
@@ -431,7 +431,7 @@ mod tests {
         });
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = rpc.request("hover", json!({}), deadline).unwrap();
+        let result = rpc.request("hover", &json!({}), deadline).unwrap();
         assert_eq!(result, json!({"ok": true}));
     }
 
@@ -451,7 +451,7 @@ mod tests {
         });
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let err = rpc.request("bogus", json!({}), deadline).unwrap_err();
+        let err = rpc.request("bogus", &json!({}), deadline).unwrap_err();
         match err {
             LspError::Rpc { code, message } => {
                 assert_eq!(code, -32601);
@@ -487,7 +487,7 @@ mod tests {
         });
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result = rpc.request("definition", json!({}), deadline).unwrap();
+        let result = rpc.request("definition", &json!({}), deadline).unwrap();
         assert_eq!(result, json!("done"));
     }
 
@@ -509,7 +509,7 @@ mod tests {
             write_message(&mut writer, &note).unwrap();
         });
 
-        rpc.notify("textDocument/didOpen", json!({})).unwrap();
+        rpc.notify("textDocument/didOpen", &json!({})).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let params = rpc
             .wait_for_diagnostics("file:///workspace/src/main.rs", deadline)
@@ -531,7 +531,7 @@ mod tests {
         });
 
         let deadline = Instant::now() + Duration::from_millis(100);
-        let err = rpc.request("hover", json!({}), deadline).unwrap_err();
+        let err = rpc.request("hover", &json!({}), deadline).unwrap_err();
         assert!(matches!(err, LspError::Timeout));
     }
 
@@ -544,7 +544,7 @@ mod tests {
         });
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let err = rpc.request("hover", json!({}), deadline).unwrap_err();
+        let err = rpc.request("hover", &json!({}), deadline).unwrap_err();
         assert!(
             err.is_connection_lost(),
             "expected connection-lost, got {err}"

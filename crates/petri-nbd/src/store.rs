@@ -42,7 +42,10 @@ impl LayerStore {
     /// Seal `scratch` into the store and return its content ID. If a layer with
     /// the same content already exists, the new copy is discarded (dedupe) and
     /// the existing ID is returned.
-    pub fn seal_into(&self, scratch: ScratchLayer, parents: &[LayerId]) -> io::Result<LayerId> {
+    /// `scratch` is borrowed, not consumed: `ScratchLayer::seal` snapshots the
+    /// overlay and leaves it usable, so a stack can be sealed while it is still
+    /// serving an export.
+    pub fn seal_into(&self, scratch: &ScratchLayer, parents: &[LayerId]) -> io::Result<LayerId> {
         // Seal to a private staging file first so the content-addressed move is
         // the commit point.
         let staging = self.root.join(".staging").join(unique_name());
@@ -214,7 +217,7 @@ mod tests {
         let mut scratch =
             ScratchLayer::create(&dir.join(format!("{tag}.data")), geometry()).unwrap();
         scratch.write_block(1, &vec![byte; BS as usize]).unwrap();
-        store.seal_into(scratch, parents).unwrap()
+        store.seal_into(&scratch, parents).unwrap()
     }
 
     #[test]

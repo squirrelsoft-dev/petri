@@ -247,10 +247,10 @@ pub fn run_with_stdin(
             let result = backend.dispatch(&command.instance_id, request)?;
             serde_json::to_string(&result).map_err(|err| PetriError::Cli(err.to_string()))
         }
-        Command::ImageBuild(command) => run_image_build(command, backend),
+        Command::ImageBuild(command) => run_image_build(&command, backend),
         Command::Image(command) => run_image_command(command, backend),
-        Command::SandboxList(command) => run_sandbox_list(command, backend),
-        Command::SandboxConnect(command) => run_sandbox_connect(command, backend),
+        Command::SandboxList(command) => run_sandbox_list(&command, backend),
+        Command::SandboxConnect(command) => run_sandbox_connect(&command, backend),
         Command::SandboxKill(command) => run_sandbox_kill(command, backend),
         Command::SandboxBootstrap(command) => run_sandbox_bootstrap(command, backend),
         Command::SandboxCreateFromBase(mut command) => {
@@ -1295,6 +1295,9 @@ fn parse_output_format(value: String) -> Result<OutputFormat> {
     }
 }
 
+// Owned by design: every caller hands over a String it just took from the
+// parsed argv, so borrowing would only add a lifetime for no saved work.
+#[allow(clippy::needless_pass_by_value)]
 fn parse_key_value_list(value: String, flag: &'static str) -> Result<BTreeMap<String, String>> {
     let mut pairs = BTreeMap::new();
     if value.is_empty() {
@@ -1334,7 +1337,7 @@ fn default_base_image() -> PathBuf {
     )
 }
 
-fn run_sandbox_list(command: SandboxListCommand, backend: &impl HostBackend) -> Result<String> {
+fn run_sandbox_list(command: &SandboxListCommand, backend: &impl HostBackend) -> Result<String> {
     let mut instances = backend.list()?;
     if !command.metadata.is_empty() {
         instances.retain(|instance| instance.matches_metadata(&command.metadata));
@@ -1370,7 +1373,7 @@ fn run_sandbox_list(command: SandboxListCommand, backend: &impl HostBackend) -> 
     }
 }
 
-fn run_sandbox_connect(command: InstanceCommand, backend: &impl HostBackend) -> Result<String> {
+fn run_sandbox_connect(command: &InstanceCommand, backend: &impl HostBackend) -> Result<String> {
     // Connecting confirms the sandbox exists and is running without tearing it
     // down on exit. Interactive PTY attach is deferred (#27/#29 v1), so this is
     // a non-interactive readiness check that reports the live handle.
@@ -2301,7 +2304,7 @@ fn run_image_rebuild(
     run_nocloud_provision_and_seal(images_root, name, script, disk, new_tag)
 }
 
-fn run_image_build(command: ImageBuildCommand, backend: &impl HostBackend) -> Result<String> {
+fn run_image_build(command: &ImageBuildCommand, backend: &impl HostBackend) -> Result<String> {
     if command.prepare_builder {
         return run_prepare_builder(command, backend);
     }
@@ -2337,7 +2340,7 @@ struct VerifiedBuilderSource {
     checksum_hex: String,
 }
 
-fn run_prepare_builder(command: ImageBuildCommand, backend: &impl HostBackend) -> Result<String> {
+fn run_prepare_builder(command: &ImageBuildCommand, backend: &impl HostBackend) -> Result<String> {
     let builder_image = command
         .builder_image
         .clone()
@@ -2389,7 +2392,7 @@ fn run_prepare_builder(command: ImageBuildCommand, backend: &impl HostBackend) -
         source,
     })?;
 
-    let source = acquire_builder_source(&command, &cache_dir)?;
+    let source = acquire_builder_source(command, &cache_dir)?;
     let parent = builder_image
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
@@ -3214,6 +3217,10 @@ fn write_sha256sums(dir: &Path, files: &[&str]) -> Result<()> {
     fs::write(&path, output).map_err(|source| PetriError::Io { path, source })
 }
 
+// `message` is owned because every call site passes a fresh `format!` result.
+// Taking &str would make each of the ~18 callers write `&format!(..)` to save
+// moving a String that was constructed for this call and is dropped after it.
+#[allow(clippy::needless_pass_by_value)]
 fn run_status(command: &mut ProcessCommand, message: String) -> Result<()> {
     let status = command.status().map_err(|source| PetriError::Io {
         path: PathBuf::from(command.get_program()),
@@ -3226,6 +3233,8 @@ fn run_status(command: &mut ProcessCommand, message: String) -> Result<()> {
     }
 }
 
+// Same as run_status: callers pass `format!` temporaries.
+#[allow(clippy::needless_pass_by_value)]
 fn command_stdout(command: &mut ProcessCommand, message: String) -> Result<String> {
     let output = command.output().map_err(|source| PetriError::Io {
         path: PathBuf::from(command.get_program()),
@@ -3298,11 +3307,11 @@ fn url_file_name(url: &str) -> Result<String> {
         .ok_or_else(|| PetriError::Cli(format!("URL has no file name: {url}")))
 }
 
-fn run_linux_image_build(command: ImageBuildCommand) -> Result<String> {
+fn run_linux_image_build(command: &ImageBuildCommand) -> Result<String> {
     let script = image_build_script();
     let mut process = ProcessCommand::new(&script);
 
-    append_image_build_script_args(&mut process, &command);
+    append_image_build_script_args(&mut process, command);
 
     let status = process.status().map_err(|source| PetriError::Io {
         path: script.clone(),
@@ -3354,7 +3363,7 @@ fn selected_image_builder(builder: ImageBuilder) -> Result<ImageBuilder> {
     }
 }
 
-fn run_vm_image_build(command: ImageBuildCommand, backend: &impl HostBackend) -> Result<String> {
+fn run_vm_image_build(command: &ImageBuildCommand, backend: &impl HostBackend) -> Result<String> {
     if command.skip_guest_build || command.guest_binary.is_some() {
         return Err(PetriError::Cli(
             "the VM image builder builds petri-guest on the host and passes it into the builder; do not pass --skip-guest-build or --guest-binary".to_string(),
@@ -3422,7 +3431,7 @@ fn run_vm_image_build(command: ImageBuildCommand, backend: &impl HostBackend) ->
         "bash",
         vec![
             "-lc".to_string(),
-            vm_build_script(&command, &staged_out_dir_in_vm, &guest_binary_in_vm)?,
+            vm_build_script(command, &staged_out_dir_in_vm, &guest_binary_in_vm)?,
         ],
         PathBuf::from("/workspace"),
         BTreeMap::new(),

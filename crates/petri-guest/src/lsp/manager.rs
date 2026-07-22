@@ -113,7 +113,7 @@ impl LspManager {
             }
             server
                 .rpc
-                .request(method, params, deadline(REQUEST_TIMEOUT))
+                .request(method, &params, deadline(REQUEST_TIMEOUT))
         })
     }
 
@@ -137,7 +137,7 @@ impl LspManager {
             });
             server
                 .rpc
-                .request("textDocument/rename", params, deadline(REQUEST_TIMEOUT))
+                .request("textDocument/rename", &params, deadline(REQUEST_TIMEOUT))
         })
     }
 
@@ -381,7 +381,7 @@ impl ServerProcess {
 
         self.rpc.notify(
             "textDocument/didOpen",
-            json!({
+            &json!({
                 "textDocument": {
                     "uri": uri,
                     "languageId": language_id,

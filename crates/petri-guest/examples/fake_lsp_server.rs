@@ -38,10 +38,10 @@ fn main() {
 
         match (method, id) {
             (Some("initialize"), Some(id)) => {
-                respond(&mut writer, id, json!({ "capabilities": {} }));
+                respond(&mut writer, &id, &json!({ "capabilities": {} }));
             }
             (Some("shutdown"), Some(id)) => {
-                respond(&mut writer, id, Value::Null);
+                respond(&mut writer, &id, &Value::Null);
             }
             (Some("exit"), _) => return,
             // Notifications and anything unrecognized: ignore.
@@ -57,15 +57,15 @@ fn main() {
                 }
                 respond(
                     &mut writer,
-                    id,
-                    json!({ "method": other, "recovered": true }),
+                    &id,
+                    &json!({ "method": other, "recovered": true }),
                 );
             }
         }
     }
 }
 
-fn respond(writer: &mut impl Write, id: Value, result: Value) {
+fn respond(writer: &mut impl Write, id: &Value, result: &Value) {
     let message = json!({ "jsonrpc": "2.0", "id": id, "result": result });
     let body = serde_json::to_vec(&message).unwrap();
     write!(writer, "Content-Length: {}\r\n\r\n", body.len()).unwrap();

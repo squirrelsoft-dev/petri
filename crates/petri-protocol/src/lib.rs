@@ -25,6 +25,13 @@ pub struct DispatchRequest {
 }
 
 impl DispatchRequest {
+    /// Clippy flags these as needless_pass_by_value: the body only serializes
+    /// them, so references would do. They stay owned deliberately. This is a
+    /// constructor, and callers build the argv, cwd and env expressly to pass
+    /// here rather than lending existing long-lived values — taking references
+    /// would push a borrow-lifetime problem onto every caller to spare a move
+    /// that costs a pointer copy.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn bash_command(
         id: impl Into<String>,
         command: impl Into<String>,
