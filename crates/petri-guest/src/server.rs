@@ -510,12 +510,20 @@ fn effective_timeout(request: &DispatchRequest, policy: &Policy) -> Duration {
 }
 
 fn effective_output_cap(request: &DispatchRequest, policy: &Policy) -> usize {
-    let policy_cap = policy.max_output_bytes as usize;
+    // Caps are u64 on the wire but bound an in-memory buffer, so they have to
+    // land in usize. Saturate rather than truncate: a cap larger than the
+    // address space is not a real limit, and wrapping it would silently turn a
+    // permissive policy into a tiny one.
+    let policy_cap = usize::try_from(policy.max_output_bytes).unwrap_or(usize::MAX);
     request
         .limits
         .as_ref()
         .and_then(|limits| limits.max_output_bytes)
-        .map(|request_cap| (request_cap as usize).min(policy_cap))
+        .map(|request_cap| {
+            usize::try_from(request_cap)
+                .unwrap_or(usize::MAX)
+                .min(policy_cap)
+        })
         .unwrap_or(policy_cap)
 }
 

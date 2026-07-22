@@ -1693,10 +1693,16 @@ fn wait_for_guest(addr: &SocketAddr, timeout: Duration) -> Result<()> {
 }
 
 fn terminate_process(pid: u32) -> Result<()> {
+    // pid_t is i32, so a u32 above its max wraps negative — and kill(2) reads
+    // a negative pid as a process *group*, with -1 meaning "every process this
+    // uid can signal". u32::MAX maps to exactly -1, so a truncating cast here
+    // turns "stop one guest" into "SIGTERM the whole session". Reject instead.
+    let target = libc::pid_t::try_from(pid)
+        .map_err(|_| backend_error(format!("pid {pid} is out of range for pid_t")))?;
     // Signal directly via libc rather than spawning /bin/kill: teardown should
     // not depend on PATH or pay for a process launch. SAFETY: kill(2) takes a
     // pid and signal number and has no memory-safety preconditions.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let rc = unsafe { libc::kill(target, libc::SIGTERM) };
     if rc == 0 {
         Ok(())
     } else {
@@ -1730,6 +1736,36 @@ fn guest_error(message: String) -> PetriError {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// DO NOT "verify" this test by removing the guard in `terminate_process`
+    /// and re-running it. pid_t is i32, so the old `pid as pid_t` cast turns
+    /// u32::MAX into -1, and kill(2) documents pid -1 as "sent to all
+    /// processes with the same uid as the user". Running the unguarded version
+    /// SIGTERMs the developer's entire session — it was done twice during the
+    /// work that added this guard. The reinterpretation below demonstrates the
+    /// hazard arithmetically instead, with no syscall.
+    #[test]
+    fn terminate_process_rejects_a_pid_that_does_not_fit_pid_t() {
+        // What the old cast produced, shown without performing it: the bit
+        // pattern of u32::MAX read as i32 is -1, the "signal everything" pid.
+        let old_cast_result = i32::from_ne_bytes(u32::MAX.to_ne_bytes());
+        assert_eq!(
+            old_cast_result, -1,
+            "the wrapped pid is kill(2)'s broadcast"
+        );
+
+        // The guard must convert that into a refusal, never a syscall.
+        let err = terminate_process(u32::MAX)
+            .expect_err("a pid above pid_t::MAX must be rejected, not signalled");
+        assert!(
+            err.to_string().contains("out of range"),
+            "unexpected error: {err}"
+        );
+
+        // Sanity: the guard must not reject ordinary pids. Signalling a real
+        // pid would have side effects, so assert on the boundary value only.
+        assert!(libc::pid_t::try_from(u32::try_from(libc::pid_t::MAX).unwrap()).is_ok());
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let unique = SystemTime::now()

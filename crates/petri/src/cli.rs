@@ -2141,9 +2141,19 @@ fn spawn_nbd_daemon(sandbox: &str, image_dir: &Path) -> Result<(String, u32)> {
 fn kill_pid(pid: u32) -> Result<()> {
     #[cfg(unix)]
     {
-        // SAFETY: kill(2) with a pid and signal number has no memory-safety
-        // preconditions; an invalid pid just returns an error we ignore.
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        // Only signal a pid that fits pid_t. A wrapping cast would turn a
+        // large pid negative, and kill(2) reads a negative pid as a process
+        // *group* — best-effort shutdown must not escalate into signalling a
+        // whole group. This pid comes from on-disk daemon state, so it is not
+        // guaranteed sane.
+        match libc::pid_t::try_from(pid) {
+            // SAFETY: kill(2) with a pid and signal number has no memory-safety
+            // preconditions; an invalid pid just returns an error we ignore.
+            Ok(target) => unsafe {
+                libc::kill(target, libc::SIGTERM);
+            },
+            Err(_) => return Ok(()),
+        }
     }
     #[cfg(not(unix))]
     let _ = pid;

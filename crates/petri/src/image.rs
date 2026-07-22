@@ -279,6 +279,9 @@ pub fn short_id(id: &str) -> String {
 /// Human-readable byte size, e.g. `8.0 GiB`, `3.4 GiB`, `512 B`.
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    // Display only: f64 loses precision past 2^53 bytes (8 PiB), which cannot
+    // show up in a value rendered to one decimal place.
+    #[allow(clippy::cast_precision_loss)]
     let mut value = bytes as f64;
     let mut unit = 0;
     while value >= 1024.0 && unit < UNITS.len() - 1 {
@@ -317,6 +320,9 @@ pub fn rfc3339_now() -> String {
 }
 
 fn rfc3339_from_unix(secs: u64) -> String {
+    // Cannot wrap for any u64 input: u64::MAX / 86_400 is about 2.1e14, four
+    // orders of magnitude below i64::MAX.
+    #[allow(clippy::cast_possible_wrap)]
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (hour, minute, second) = (rem / 3600, (rem % 3600) / 60, rem % 60);
@@ -334,8 +340,13 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
     let mp = (5 * doy + 2) / 153; // [0, 11]
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    // The algorithm bounds these to [1, 31] and [1, 12] for every input, so
+    // the conversions cannot fail. Checking rather than casting means a future
+    // mis-edit of the arithmetic fails loudly instead of silently emitting a
+    // wrong date into image metadata.
+    let day = u32::try_from(doy - (153 * mp + 2) / 5 + 1).expect("day is within [1, 31]");
+    let month =
+        u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).expect("month is within [1, 12]");
     let year = if month <= 2 { y + 1 } else { y };
     (year, month, day)
 }
