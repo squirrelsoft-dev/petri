@@ -117,10 +117,8 @@ struct Args {
             ("--workspace", workspace),
             ("--config-dir", configDir),
             ("--console-log", consoleLog),
-        ] {
-            if value?.isEmpty ?? true {
-                throw HelperError("\(name) is required")
-            }
+        ] where value?.isEmpty ?? true {
+            throw HelperError("\(name) is required")
         }
 
         // The boot disk is supplied either as a local image (--disk) or over
@@ -136,10 +134,8 @@ struct Args {
             for (name, value) in [
                 ("--kernel", kernel),
                 ("--command-line", commandLine),
-            ] {
-                if value?.isEmpty ?? true {
-                    throw HelperError("\(name) is required for linux boot mode")
-                }
+            ] where value?.isEmpty ?? true {
+                throw HelperError("\(name) is required for linux boot mode")
             }
         case "efi":
             if efiVariableStore?.isEmpty ?? true {
@@ -601,7 +597,10 @@ final class VMController: NSObject, VZVirtualMachineDelegate {
             }
         }
 
-        throw HelperError("guest vsock port \(args.dispatchPort) did not become ready: \(lastError.map(String.init(describing:)) ?? "unknown error")")
+        let detail = lastError.map(String.init(describing:)) ?? "unknown error"
+        throw HelperError(
+            "guest vsock port \(args.dispatchPort) did not become ready: \(detail)"
+        )
     }
 
     private func sendFrameToGuest(_ frame: Data) throws -> Data {

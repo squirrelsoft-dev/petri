@@ -1,0 +1,20 @@
+# SwiftLint configuration for crates/petri-vz.
+#
+# At the repository root because qlty invokes swiftlint with the root as its
+# working directory, and SwiftLint resolves config from there. Placed inside
+# the package it would apply to a local run but not to the gate.
+
+identifier_name:
+  # `fd` and `vm` are the conventional names for these things in systems code
+  # — fd is what POSIX calls a file descriptor, and this file is a thin shell
+  # over Virtualization.framework. Expanding them to fileDescriptor and
+  # virtualMachine would read as less idiomatic, not more.
+  excluded:
+    - fd
+    - vm
+
+trailing_comma:
+  # petri-vz consistently ends multi-line literals with a trailing comma, which
+  # keeps diffs to one line when an element is appended. Require that style
+  # rather than strip it: the default rule would fight the file's convention.
+  mandatory_comma: true

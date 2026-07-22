@@ -175,25 +175,38 @@ file_patterns = ["clients/go/go.mod"]
 # which is below the default --fail-level of `fmt` — not because of the
 # plugin's comment mode, which does not affect local exit status.
 
-# Swift adoption backlog. main.swift predates any Swift linting, and these
-# eight rules are what it currently trips. They are ignored ONLY in that file
-# so every other swiftlint rule is live on it, and all rules are live on new
-# Swift files. Burn these down and delete the block.
+# Swift structural findings in the VM launcher, scoped to that one file. These
+# are not deferred style nits — each was looked at, and the reasoning differs:
 #
-# identifier_name/trailing_comma/line_length/for_where are mechanical.
-# cyclomatic_complexity (23), function_body_length (62 lines),
-# type_body_length (313 lines), and file_length are the same structural
-# refactor class the [smells] backlog tracks — real work, not noise.
+#   cyclomatic_complexity / function_body_length on Args.parse
+#     The score is 19 `case` arms of a flat CLI flag table plus the loop around
+#     it. There is no tangled control flow to unpick; extracting helpers would
+#     scatter the flag list across functions and make the accepted arguments
+#     harder to read off in one place. The lint is measuring breadth here, not
+#     depth.
+#
+#   type_body_length on VMController, and file_length
+#     Real structural debt: 316 lines and 842 respectively. But VMController is
+#     18 small methods (~17 lines each), so this is a cohesive-controller
+#     splitting decision — VM construction versus delegate callbacks and state
+#     — not a mechanical extraction.
+#
+#   function_body_length on createVirtualMachine
+#     61 lines of linear VZVirtualMachineConfiguration property assignment.
+#     Splittable, but the ordering of those assignments relative to validate()
+#     is load-bearing.
+#
+# The blocker on all three is coverage: crates/petri-vz has no tests, so the
+# only verification available is that it compiles — which says nothing about
+# whether a VM still boots. Land Swift tests around Args.parse and VM
+# configuration first, then this block can be deleted and the split done
+# against something that can fail.
 [[ignore]]
 plugins = ["swiftlint"]
 rules = [
-  "swiftlint:identifier_name",
-  "swiftlint:trailing_comma",
-  "swiftlint:function_body_length",
-  "swiftlint:for_where",
-  "swiftlint:type_body_length",
-  "swiftlint:line_length",
-  "swiftlint:file_length",
   "swiftlint:cyclomatic_complexity",
+  "swiftlint:function_body_length",
+  "swiftlint:type_body_length",
+  "swiftlint:file_length",
 ]
 file_patterns = ["crates/petri-vz/Sources/petri-vz/main.swift"]
