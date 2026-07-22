@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 
 use petri_nbd::{Geometry, LayeredDisk, NbdServer, ScratchLayer, ServeOpts};
 
+#[path = "common/preflight.rs"]
+mod preflight;
+
 const BLOCK_SIZE: u32 = 64 * 1024;
 const SCRATCH_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MARKER: &[u8] = b"PETRI_NBD_MARKER_OK";
@@ -45,13 +48,7 @@ fn run() -> Result<(), String> {
             return Err(format!("missing input: {}", p.display()));
         }
     }
-    let helper = PathBuf::from("crates/petri-vz/.build/debug/petri-vz");
-    if !helper.exists() {
-        return Err(format!(
-            "helper not found at {}; build+sign petri-vz first",
-            helper.display()
-        ));
-    }
+    let helper = preflight::helper()?;
 
     let work = PathBuf::from(format!("target/nbd-bootstrap-smoke/{}", std::process::id()));
     let _ = fs::remove_dir_all(&work);

@@ -17,6 +17,9 @@ use std::time::Duration;
 
 use petri_nbd::{Geometry, LayeredDisk, NbdServer, ScratchLayer, ServeOpts};
 
+#[path = "common/preflight.rs"]
+mod preflight;
+
 const BLOCK_SIZE: u32 = 64 * 1024;
 const SCRATCH_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
@@ -38,14 +41,7 @@ fn run() -> Result<(), String> {
         return Err(format!("nocloud image not found: {}", raw.display()));
     }
 
-    let helper = PathBuf::from("crates/petri-vz/.build/debug/petri-vz");
-    if !helper.exists() {
-        return Err(format!(
-            "helper not found at {}; build+sign petri-vz first:\n  swift build --package-path crates/petri-vz\n  codesign --force --sign - --entitlements crates/petri-vz/petri-vz.entitlements {}",
-            helper.display(),
-            helper.display()
-        ));
-    }
+    let helper = preflight::helper()?;
 
     let work = PathBuf::from(format!("target/nbd-data-smoke/{}", std::process::id()));
     let _ = fs::remove_dir_all(&work);

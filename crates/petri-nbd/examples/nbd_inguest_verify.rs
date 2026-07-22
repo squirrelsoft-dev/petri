@@ -27,6 +27,9 @@ use petri_nbd::{
 };
 use serde_json::{Value, json};
 
+#[path = "common/preflight.rs"]
+mod preflight;
+
 const BLOCK_SIZE: u32 = 64 * 1024;
 const MARKER_PATH: &str = "/persist-marker";
 const MARKER_TEXT: &str = "petri-nbd-was-here";
@@ -196,12 +199,15 @@ struct BootEnv {
 
 impl BootEnv {
     fn resolve(bundle: &Path) -> Result<Self, String> {
-        let helper = PathBuf::from("crates/petri-vz/.build/debug/petri-vz");
+        // Checks entitlements too: a bare `swift build` leaves the helper in
+        // place but unsigned for virtualization, which otherwise shows up as a
+        // VM that never boots rather than a clear error.
+        let helper = preflight::helper()?;
         let kernel = bundle.join("vmlinuz");
         let initrd = bundle.join("initrd.img");
         let disk = bundle.join("root.img");
         let manifest = bundle.join("petri-image.json");
-        for p in [&helper, &kernel, &disk, &manifest] {
+        for p in [&kernel, &disk, &manifest] {
             if !p.exists() {
                 return Err(format!("missing required file: {}", p.display()));
             }

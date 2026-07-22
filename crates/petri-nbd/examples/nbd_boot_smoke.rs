@@ -33,6 +33,9 @@ use petri_nbd::{
     BindMode, Geometry, ImmutableLayer, LayeredDisk, NbdServer, ScratchLayer, ServeOpts,
 };
 
+#[path = "common/preflight.rs"]
+mod preflight;
+
 const BLOCK_SIZE: u32 = 64 * 1024;
 
 fn main() {
@@ -50,14 +53,7 @@ fn run() -> Result<(), String> {
     );
     let boot_secs: u64 = args.next().map_or(45, |s| s.parse().unwrap_or(45));
 
-    let helper = PathBuf::from("crates/petri-vz/.build/debug/petri-vz");
-    if !helper.exists() {
-        return Err(format!(
-            "helper not found at {}; build+sign it first:\n  swift build --package-path crates/petri-vz\n  codesign --force --sign - --entitlements crates/petri-vz/petri-vz.entitlements {}",
-            helper.display(),
-            helper.display()
-        ));
-    }
+    let helper = preflight::helper()?;
 
     let kernel = bundle.join("vmlinuz");
     let initrd = bundle.join("initrd.img");
