@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -3207,7 +3208,7 @@ fn write_sha256sums(dir: &Path, files: &[&str]) -> Result<()> {
     let mut output = String::new();
     for file in files {
         let checksum = file_checksum(&dir.join(file), "sha256")?;
-        output.push_str(&format!("{checksum}  {file}\n"));
+        let _ = writeln!(output, "{checksum}  {file}");
     }
     let path = dir.join("SHA256SUMS");
     fs::write(&path, output).map_err(|source| PetriError::Io { path, source })

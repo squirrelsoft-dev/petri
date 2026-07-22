@@ -15,6 +15,7 @@
 //! resolution and are enforced by the DNS-proxy layer (a follow-up); they are
 //! reported as skipped rather than silently dropped.
 
+use std::fmt::Write as _;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::policy::NetworkLevel;
@@ -113,29 +114,44 @@ pub const RESOLVED6: &str = "resolved6";
 /// connections, never an in-flight transfer.
 fn render_ruleset(v4: &[String], v6: &[String], has_domains: bool) -> String {
     let mut out = String::new();
+    // Formatting into a String cannot fail, so the builder below uses `?`
+    // freely and this single expect absorbs the Result once — rather than
+    // each line pushing an intermediate String from `format!`.
+    write_ruleset(&mut out, v4, v6, has_domains).expect("formatting into a String cannot fail");
+    out
+}
+
+fn write_ruleset(
+    out: &mut String,
+    v4: &[String],
+    v6: &[String],
+    has_domains: bool,
+) -> std::fmt::Result {
     // `add` then `delete` makes the redefinition idempotent whether or not the
     // table already exists (delete alone errors when absent).
-    out.push_str(&format!("add table inet {TABLE}\n"));
-    out.push_str(&format!("delete table inet {TABLE}\n"));
-    out.push_str(&format!("table inet {TABLE} {{\n"));
+    writeln!(out, "add table inet {TABLE}")?;
+    writeln!(out, "delete table inet {TABLE}")?;
+    writeln!(out, "table inet {TABLE} {{")?;
 
     if !v4.is_empty() {
         out.push_str("\tset allow4 {\n\t\ttype ipv4_addr\n\t\tflags interval\n");
-        out.push_str(&format!("\t\telements = {{ {} }}\n", v4.join(", ")));
+        writeln!(out, "\t\telements = {{ {} }}", v4.join(", "))?;
         out.push_str("\t}\n");
     }
     if !v6.is_empty() {
         out.push_str("\tset allow6 {\n\t\ttype ipv6_addr\n\t\tflags interval\n");
-        out.push_str(&format!("\t\telements = {{ {} }}\n", v6.join(", ")));
+        writeln!(out, "\t\telements = {{ {} }}", v6.join(", "))?;
         out.push_str("\t}\n");
     }
     if has_domains {
-        out.push_str(&format!(
-            "\tset {RESOLVED4} {{\n\t\ttype ipv4_addr\n\t\tflags timeout\n\t}}\n"
-        ));
-        out.push_str(&format!(
-            "\tset {RESOLVED6} {{\n\t\ttype ipv6_addr\n\t\tflags timeout\n\t}}\n"
-        ));
+        writeln!(
+            out,
+            "\tset {RESOLVED4} {{\n\t\ttype ipv4_addr\n\t\tflags timeout\n\t}}"
+        )?;
+        writeln!(
+            out,
+            "\tset {RESOLVED6} {{\n\t\ttype ipv6_addr\n\t\tflags timeout\n\t}}"
+        )?;
     }
 
     out.push_str("\tchain output {\n");
@@ -158,11 +174,11 @@ fn render_ruleset(v4: &[String], v6: &[String], has_domains: bool) -> String {
         out.push_str("\t\tip6 daddr @allow6 accept\n");
     }
     if has_domains {
-        out.push_str(&format!("\t\tip daddr @{RESOLVED4} accept\n"));
-        out.push_str(&format!("\t\tip6 daddr @{RESOLVED6} accept\n"));
+        writeln!(out, "\t\tip daddr @{RESOLVED4} accept")?;
+        writeln!(out, "\t\tip6 daddr @{RESOLVED6} accept")?;
     }
     out.push_str("\t}\n}\n");
-    out
+    Ok(())
 }
 
 /// Errors applying the ruleset to the running guest.
@@ -262,16 +278,18 @@ fn render_add_elements(v4: &[(Ipv4Addr, u32)], v6: &[(Ipv6Addr, u32)]) -> Option
     }
     let mut out = String::new();
     if !v4.is_empty() {
-        out.push_str(&format!(
-            "add element inet {TABLE} {RESOLVED4} {{ {} }}\n",
+        let _ = writeln!(
+            out,
+            "add element inet {TABLE} {RESOLVED4} {{ {} }}",
             render_timed_elements(v4)
-        ));
+        );
     }
     if !v6.is_empty() {
-        out.push_str(&format!(
-            "add element inet {TABLE} {RESOLVED6} {{ {} }}\n",
+        let _ = writeln!(
+            out,
+            "add element inet {TABLE} {RESOLVED6} {{ {} }}",
             render_timed_elements(v6)
-        ));
+        );
     }
     Some(out)
 }
@@ -390,6 +408,57 @@ mod tests {
         let add = script.find("add table inet petri").unwrap();
         let delete = script.find("delete table inet petri").unwrap();
         assert!(add < delete, "add must precede delete for idempotency");
+    }
+
+    /// Exact-output snapshot of the fully-populated ruleset.
+    ///
+    /// The other tests here assert with `contains`, which cannot see a changed
+    /// rule *order* or stray whitespace — and in a default-drop firewall,
+    /// order decides whether a packet is accepted or dropped. This pins the
+    /// whole script. If it fails, diff the two strings and confirm the change
+    /// was intended before updating the expectation.
+    #[test]
+    fn ruleset_matches_exact_snapshot() {
+        let v4 = vec!["1.2.3.4".to_string()];
+        let v6 = vec!["::1".to_string()];
+        let expected = "\
+add table inet petri
+delete table inet petri
+table inet petri {
+\tset allow4 {
+\t\ttype ipv4_addr
+\t\tflags interval
+\t\telements = { 1.2.3.4 }
+\t}
+\tset allow6 {
+\t\ttype ipv6_addr
+\t\tflags interval
+\t\telements = { ::1 }
+\t}
+\tset resolved4 {
+\t\ttype ipv4_addr
+\t\tflags timeout
+\t}
+\tset resolved6 {
+\t\ttype ipv6_addr
+\t\tflags timeout
+\t}
+\tchain output {
+\t\ttype filter hook output priority 0; policy drop;
+\t\toifname \"lo\" accept
+\t\tct state established,related accept
+\t\tmeta skuid 0 udp dport { 53, 853 } accept
+\t\tmeta skuid 0 tcp dport { 53, 853 } accept
+\t\tudp dport { 53, 853 } drop
+\t\ttcp dport { 53, 853 } drop
+\t\tip daddr @allow4 accept
+\t\tip6 daddr @allow6 accept
+\t\tip daddr @resolved4 accept
+\t\tip6 daddr @resolved6 accept
+\t}
+}
+";
+        assert_eq!(render_ruleset(&v4, &v6, true), expected);
     }
 
     #[test]

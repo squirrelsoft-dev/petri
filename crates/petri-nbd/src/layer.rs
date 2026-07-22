@@ -7,7 +7,7 @@
 //! lives in [`crate::stack::LayeredDisk`].
 
 use std::collections::BTreeMap;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -29,7 +29,9 @@ impl LayerId {
     pub fn to_hex(&self) -> String {
         let mut s = String::with_capacity(64);
         for b in self.0 {
-            s.push_str(&format!("{b:02x}"));
+            // write! formats in place; push_str(&format!(..)) would allocate a
+            // throwaway String per byte, 32 of them for every id rendered.
+            let _ = write!(s, "{b:02x}");
         }
         s
     }

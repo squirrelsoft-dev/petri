@@ -6,6 +6,7 @@
 //! is dropped.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -431,7 +432,9 @@ fn path_to_uri(path: &Path) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
                 uri.push(*byte as char);
             }
-            other => uri.push_str(&format!("%{other:02X}")),
+            other => {
+                let _ = write!(uri, "%{other:02X}");
+            }
         }
     }
     uri
