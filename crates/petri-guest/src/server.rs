@@ -800,7 +800,8 @@ fn spawn_output_reader(
         let mut buffer = [0_u8; 8192];
         loop {
             match stream.read(&mut buffer) {
-                Ok(0) => break,
+                // Clean EOF and a read error both end the stream.
+                Ok(0) | Err(_) => break,
                 Ok(bytes_read) => {
                     if let Ok(mut output) = output.lock() {
                         output.append(kind, &buffer[..bytes_read]);
@@ -808,7 +809,6 @@ fn spawn_output_reader(
                         break;
                     }
                 }
-                Err(_) => break,
             }
         }
     })

@@ -188,14 +188,14 @@ fn helper_status(sock: &Path) -> Option<String> {
     let mut byte = [0u8; 1];
     while resp.len() < 4096 {
         match stream.read(&mut byte) {
-            Ok(0) => break,
+            // EOF or a read error both end the response.
+            Ok(0) | Err(_) => break,
             Ok(_) => {
                 if byte[0] == b'\n' {
                     break;
                 }
                 resp.push(byte[0]);
             }
-            Err(_) => break,
         }
     }
     let text = String::from_utf8_lossy(&resp);

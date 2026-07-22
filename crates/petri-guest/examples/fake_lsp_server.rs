@@ -44,8 +44,8 @@ fn main() {
                 respond(&mut writer, id, Value::Null);
             }
             (Some("exit"), _) => return,
-            // Notifications: ignore.
-            (Some(_), None) => {}
+            // Notifications and anything unrecognized: ignore.
+            (Some(_), None) | (None, _) => {}
             // Any other tool request.
             (Some(other), Some(id)) => {
                 if let Some(path) = &state_file
@@ -61,7 +61,6 @@ fn main() {
                     json!({ "method": other, "recovered": true }),
                 );
             }
-            _ => {}
         }
     }
 }

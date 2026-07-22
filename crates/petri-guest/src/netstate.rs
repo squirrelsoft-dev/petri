@@ -36,6 +36,11 @@ fn to_u8(level: NetworkLevel) -> u8 {
     }
 }
 
+// The `0` and `_` arms yield the same level but say different things: 0 is the
+// defined encoding for `None`, while `_` is a fallback for a byte no writer
+// produces. Collapsing them would delete the encoding from the match, so the
+// duplication is kept deliberately.
+#[allow(clippy::match_same_arms)]
 fn from_u8(value: u8) -> NetworkLevel {
     match value {
         0 => NetworkLevel::None,

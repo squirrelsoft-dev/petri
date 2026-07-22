@@ -220,6 +220,11 @@ impl Rpc {
 
     /// React to a parsed inbound message: stash diagnostics and answer
     /// server-initiated requests so the server does not block.
+    // The two do-nothing arms are distinct protocol cases that happen to share
+    // an empty body: an unhandled server *notification* versus a *response* to
+    // one of our own requests, which `request()` collects elsewhere. Merging
+    // them would hide that this match enumerates every JSON-RPC message shape.
+    #[allow(clippy::match_same_arms)]
     fn handle_inbound(&mut self, message: &Value) -> Result<(), LspError> {
         let method = message.get("method").and_then(Value::as_str);
         let has_id = message.get("id").is_some();

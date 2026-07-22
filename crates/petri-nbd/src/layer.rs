@@ -143,8 +143,7 @@ impl ImmutableLayer {
     pub fn parent_ids(&self) -> &[LayerId] {
         self.sealed
             .as_ref()
-            .map(|m| m.parents.as_slice())
-            .unwrap_or(&[])
+            .map_or(&[][..], |m| m.parents.as_slice())
     }
 
     /// Read block `block` into `out` (which must be exactly one block long).

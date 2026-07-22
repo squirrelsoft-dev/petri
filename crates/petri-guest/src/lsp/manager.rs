@@ -103,7 +103,6 @@ impl LspManager {
         };
         let line = args.line;
         let col = args.col;
-        let context = context;
         self.run(&prepared, move |server, uri| {
             let mut params = json!({
                 "textDocument": { "uri": uri },
