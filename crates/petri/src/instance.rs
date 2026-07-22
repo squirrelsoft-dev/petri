@@ -78,22 +78,20 @@ impl LifecycleState {
     pub fn can_transition_to(self, to: Self) -> bool {
         matches!(
             (self, to),
-            (Self::Provisioning, Self::Booting)
-                | (Self::Provisioning, Self::Failed)
-                | (Self::Provisioning, Self::TornDown)
-                | (Self::Booting, Self::Ready)
-                | (Self::Booting, Self::Stopping)
-                | (Self::Booting, Self::Failed)
-                | (Self::Booting, Self::TornDown)
+            (
+                Self::Provisioning,
+                Self::Booting | Self::Failed | Self::TornDown
+            ) | (Self::Booting | Self::RunningDispatch, Self::Ready)
+                | (Self::Booting | Self::Ready, Self::Stopping)
+                | (
+                    Self::Booting | Self::Ready | Self::RunningDispatch | Self::Stopping,
+                    Self::Failed
+                )
+                | (
+                    Self::Booting | Self::Ready | Self::Stopping | Self::Failed,
+                    Self::TornDown
+                )
                 | (Self::Ready, Self::RunningDispatch)
-                | (Self::Ready, Self::Stopping)
-                | (Self::Ready, Self::Failed)
-                | (Self::Ready, Self::TornDown)
-                | (Self::RunningDispatch, Self::Ready)
-                | (Self::RunningDispatch, Self::Failed)
-                | (Self::Stopping, Self::Failed)
-                | (Self::Stopping, Self::TornDown)
-                | (Self::Failed, Self::TornDown)
         )
     }
 

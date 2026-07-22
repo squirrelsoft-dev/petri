@@ -102,7 +102,7 @@ impl LspManager {
         };
         let line = args.line;
         let col = args.col;
-        let context = context.clone();
+        let context = context;
         self.run(&prepared, move |server, uri| {
             let mut params = json!({
                 "textDocument": { "uri": uri },
@@ -235,7 +235,10 @@ impl LspManager {
     where
         F: Fn(&mut ServerProcess, &str) -> Result<Value, LspError>,
     {
-        let mut servers = self.servers.lock().unwrap_or_else(|err| err.into_inner());
+        let mut servers = self
+            .servers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         for attempt in 0..2 {
             // (Re)start if absent or the previous process died.
@@ -295,7 +298,10 @@ impl LspManager {
 
     /// Cleanly shut down all running servers.
     pub fn shutdown(&self) {
-        let mut servers = self.servers.lock().unwrap_or_else(|err| err.into_inner());
+        let mut servers = self
+            .servers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for (_, mut server) in servers.drain() {
             server.shutdown();
         }
@@ -423,7 +429,7 @@ fn path_to_uri(path: &Path) -> String {
             b'/' => uri.push('/'),
             // RFC 3986 unreserved set, kept verbatim.
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                uri.push(*byte as char)
+                uri.push(*byte as char);
             }
             other => uri.push_str(&format!("%{other:02X}")),
         }
@@ -504,7 +510,7 @@ mod tests {
         );
         match outcome {
             LspOutcome::Unavailable { language, .. } => {
-                assert_eq!(language.as_deref(), Some("go"))
+                assert_eq!(language.as_deref(), Some("go"));
             }
             other => panic!("expected unavailable, got {other:?}"),
         }

@@ -282,7 +282,7 @@ mod tests {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
             let dir = std::env::temp_dir().join(format!("petri-nbd-{}-{}", std::process::id(), n));
             fs::create_dir_all(&dir).unwrap();
-            TestDir(dir)
+            Self(dir)
         }
         fn path(&self, name: &str) -> PathBuf {
             self.0.join(name)

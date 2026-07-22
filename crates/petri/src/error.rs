@@ -84,7 +84,7 @@ impl PetriError {
     /// image reference). Renders the message verbatim, matching the codebase's
     /// freeform CLI-error style.
     pub fn invalid_argument(message: impl Into<String>) -> Self {
-        PetriError::Cli(message.into())
+        Self::Cli(message.into())
     }
 
     /// Whether a dispatch failure leaves the guest VM presumed-alive, so the

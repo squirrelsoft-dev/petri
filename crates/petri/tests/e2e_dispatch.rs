@@ -86,9 +86,10 @@ fn resolve_helper() -> Option<PathBuf> {
 /// Prefers `PETRI_BASE_IMAGE`, then `target/petri-images/base/`. A directory
 /// only counts if it holds the `petri-image.json` manifest the backend loads.
 fn resolve_image() -> Option<PathBuf> {
-    let dir = std::env::var_os("PETRI_BASE_IMAGE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| repo_root().join("target/petri-images/base"));
+    let dir = std::env::var_os("PETRI_BASE_IMAGE").map_or_else(
+        || repo_root().join("target/petri-images/base"),
+        PathBuf::from,
+    );
     dir.join("petri-image.json").is_file().then_some(dir)
 }
 
@@ -176,7 +177,7 @@ workspace_path = "/workspace"
     let sandbox =
         Sandbox::create(backend.clone(), options).expect("create should boot the VM to Ready");
     let mut guard = VmGuard {
-        backend: backend.clone(),
+        backend,
         id: InstanceId::new(&sandbox_id).unwrap(),
         armed: true,
     };

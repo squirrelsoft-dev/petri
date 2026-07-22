@@ -190,7 +190,7 @@ mod tests {
             let dir =
                 std::env::temp_dir().join(format!("petri-nbd-store-{}-{}", std::process::id(), n));
             fs::create_dir_all(&dir).unwrap();
-            TestDir(dir)
+            Self(dir)
         }
     }
     impl Drop for TestDir {

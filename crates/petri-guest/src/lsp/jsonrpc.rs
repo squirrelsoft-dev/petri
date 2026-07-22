@@ -255,8 +255,7 @@ impl Rpc {
                 .get("params")
                 .and_then(|params| params.get("items"))
                 .and_then(Value::as_array)
-                .map(|items| items.len())
-                .unwrap_or(0);
+                .map_or(0, std::vec::Vec::len);
             return Value::Array(vec![Value::Null; count]);
         }
         Value::Null

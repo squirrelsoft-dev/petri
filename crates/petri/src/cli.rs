@@ -433,7 +433,7 @@ fn parse_image_create(mut args: impl Iterator<Item = String>) -> Result<Command>
             "--base" => base = Some(next_arg(&mut args, "--base")?),
             "--size" => size_gib = Some(parse_u64(next_arg(&mut args, "--size")?, "--size")?),
             "--from-nocloud" => {
-                from_nocloud = Some(PathBuf::from(next_arg(&mut args, "--from-nocloud")?))
+                from_nocloud = Some(PathBuf::from(next_arg(&mut args, "--from-nocloud")?));
             }
             "--tag" => tag = Some(next_arg(&mut args, "--tag")?),
             "--provision" => provision = Some(PathBuf::from(next_arg(&mut args, "--provision")?)),
@@ -704,7 +704,7 @@ fn parse_sandbox_list(mut args: impl Iterator<Item = String>) -> Result<Command>
             "--state" => command.state = Some(parse_state_filter(next_arg(&mut args, "--state")?)?),
             "--metadata" => {
                 command.metadata =
-                    parse_key_value_list(next_arg(&mut args, "--metadata")?, "--metadata")?
+                    parse_key_value_list(next_arg(&mut args, "--metadata")?, "--metadata")?;
             }
             "--limit" => {
                 let value = parse_u64(next_arg(&mut args, "--limit")?, "--limit")?;
@@ -918,13 +918,13 @@ fn parse_sandbox_exec(args: impl Iterator<Item = String>) -> Result<Command> {
                 timeout_ms = Some(parse_u64(
                     next_arg(&mut args, "--timeout-ms")?,
                     "--timeout-ms",
-                )?)
+                )?);
             }
             "--max-output-bytes" => {
                 max_output_bytes = Some(parse_u64(
                     next_arg(&mut args, "--max-output-bytes")?,
                     "--max-output-bytes",
-                )?)
+                )?);
             }
             "--help" | "-h" => return Err(PetriError::Cli(sandbox_exec_usage())),
             "--background" => {
@@ -1030,28 +1030,29 @@ fn parse_image_build(mut args: impl Iterator<Item = String>) -> Result<Command> 
             "--disk-size" => command.disk_size = Some(next_arg(&mut args, "--disk-size")?),
             "--skip-guest-build" => command.skip_guest_build = true,
             "--guest-binary" => {
-                command.guest_binary = Some(PathBuf::from(next_arg(&mut args, "--guest-binary")?))
+                command.guest_binary = Some(PathBuf::from(next_arg(&mut args, "--guest-binary")?));
             }
             "--builder" => {
-                command.builder = parse_image_builder(next_arg(&mut args, "--builder")?)?
+                command.builder = parse_image_builder(next_arg(&mut args, "--builder")?)?;
             }
             "--builder-image" => {
-                command.builder_image = Some(PathBuf::from(next_arg(&mut args, "--builder-image")?))
+                command.builder_image =
+                    Some(PathBuf::from(next_arg(&mut args, "--builder-image")?));
             }
             "--builder-source" => {
-                command.builder_source = Some(next_arg(&mut args, "--builder-source")?)
+                command.builder_source = Some(next_arg(&mut args, "--builder-source")?);
             }
             "--builder-source-sha256" => {
                 command.builder_source_sha256 =
-                    Some(next_arg(&mut args, "--builder-source-sha256")?)
+                    Some(next_arg(&mut args, "--builder-source-sha256")?);
             }
             "--builder-source-checksums" => {
                 command.builder_source_checksums =
-                    Some(next_arg(&mut args, "--builder-source-checksums")?)
+                    Some(next_arg(&mut args, "--builder-source-checksums")?);
             }
             "--builder-cache-dir" => {
                 command.builder_cache_dir =
-                    Some(PathBuf::from(next_arg(&mut args, "--builder-cache-dir")?))
+                    Some(PathBuf::from(next_arg(&mut args, "--builder-cache-dir")?));
             }
             "--prepare-builder" => command.prepare_builder = true,
             "--help" | "-h" => return Err(PetriError::Cli(image_build_usage())),
@@ -1139,13 +1140,13 @@ fn parse_dispatch(mut args: impl Iterator<Item = String>) -> Result<Command> {
                 timeout_ms = Some(parse_u64(
                     next_arg(&mut args, "--timeout-ms")?,
                     "--timeout-ms",
-                )?)
+                )?);
             }
             "--max-output-bytes" => {
                 max_output_bytes = Some(parse_u64(
                     next_arg(&mut args, "--max-output-bytes")?,
                     "--max-output-bytes",
-                )?)
+                )?);
             }
             "--help" | "-h" => return Err(PetriError::Cli(dispatch_usage())),
             _ => {
@@ -1321,14 +1322,15 @@ fn parse_key_value_list(value: String, flag: &'static str) -> Result<BTreeMap<St
 }
 
 fn default_base_image() -> PathBuf {
-    std::env::var_os("PETRI_BASE_IMAGE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
+    std::env::var_os("PETRI_BASE_IMAGE").map_or_else(
+        || {
             repo_root_fallback()
                 .join("target")
                 .join("petri-images")
                 .join("base")
-        })
+        },
+        PathBuf::from,
+    )
 }
 
 fn run_sandbox_list(command: SandboxListCommand, backend: &impl HostBackend) -> Result<String> {
@@ -1818,8 +1820,7 @@ fn run_nocloud_provision_and_seal(
     // Copy petri-guest into the artifacts share so provision scripts can install
     // it into the target rootfs. Best-effort: skip silently if not found.
     let guest_bin: PathBuf = std::env::var_os("PETRI_GUEST_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("petri-guest"));
+        .map_or_else(|| PathBuf::from("petri-guest"), PathBuf::from);
     if guest_bin.is_file() {
         let dst = artifacts_dir.join("petri-guest");
         let _ = fs::copy(&guest_bin, &dst);
@@ -2390,8 +2391,7 @@ fn run_prepare_builder(command: ImageBuildCommand, backend: &impl HostBackend) -
     let source = acquire_builder_source(&command, &cache_dir)?;
     let parent = builder_image
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     fs::create_dir_all(&parent).map_err(|source| PetriError::Io {
         path: parent.clone(),
         source,
@@ -2447,13 +2447,8 @@ fn run_prepare_builder(command: ImageBuildCommand, backend: &impl HostBackend) -
 
     let policy = write_builder_policy(&repo_root)?;
     let instance_id = InstanceId::new(format!("petri-bootstrap-{}", unique_build_id()?))?;
-    let config = InstanceConfig::new(
-        instance_id.clone(),
-        "macos",
-        repo_root.clone(),
-        policy.clone(),
-    )
-    .with_image(staging.clone());
+    let config = InstanceConfig::new(instance_id.clone(), "macos", repo_root, policy)
+        .with_image(staging.clone());
 
     let _ = backend.teardown(&instance_id);
     backend.create(config).inspect_err(|_| {
@@ -2745,7 +2740,7 @@ fn file_checksum(path: &Path, algorithm: &str) -> Result<String> {
     String::from_utf8_lossy(&output.stdout)
         .split_whitespace()
         .next()
-        .map(|value| value.to_ascii_lowercase())
+        .map(str::to_ascii_lowercase)
         .ok_or_else(|| PetriError::Cli(format!("shasum produced no output for {}", path.display())))
 }
 
@@ -3248,9 +3243,9 @@ fn command_stdout(command: &mut ProcessCommand, message: String) -> Result<Strin
 fn parse_disk_size(value: &str) -> Result<u64> {
     let value = value.trim();
     let (digits, multiplier) = match value.as_bytes().last().copied() {
-        Some(b'G') | Some(b'g') => (&value[..value.len() - 1], 1024_u64.pow(3)),
-        Some(b'M') | Some(b'm') => (&value[..value.len() - 1], 1024_u64.pow(2)),
-        Some(b'K') | Some(b'k') => (&value[..value.len() - 1], 1024_u64),
+        Some(b'G' | b'g') => (&value[..value.len() - 1], 1024_u64.pow(3)),
+        Some(b'M' | b'm') => (&value[..value.len() - 1], 1024_u64.pow(2)),
+        Some(b'K' | b'k') => (&value[..value.len() - 1], 1024_u64),
         _ => (value, 1),
     };
     let number = digits
@@ -3415,13 +3410,8 @@ fn run_vm_image_build(command: ImageBuildCommand, backend: &impl HostBackend) ->
 
     let policy = write_builder_policy(&repo_root)?;
     let instance_id = InstanceId::new(format!("petri-builder-{}", unique_build_id()?))?;
-    let config = InstanceConfig::new(
-        instance_id.clone(),
-        "macos",
-        repo_root.clone(),
-        policy.clone(),
-    )
-    .with_image(builder_image);
+    let config = InstanceConfig::new(instance_id.clone(), "macos", repo_root, policy)
+        .with_image(builder_image);
 
     let _ = backend.teardown(&instance_id);
     backend.create(config)?;
@@ -3461,9 +3451,10 @@ fn run_vm_image_build(command: ImageBuildCommand, backend: &impl HostBackend) ->
 }
 
 fn configured_guest_target(config: Option<&Path>) -> String {
-    let config = config
-        .map(PathBuf::from)
-        .unwrap_or_else(|| repo_root_fallback().join("images/base/petri-base-image.toml"));
+    let config = config.map_or_else(
+        || repo_root_fallback().join("images/base/petri-base-image.toml"),
+        PathBuf::from,
+    );
 
     fs::read_to_string(config)
         .ok()
@@ -3618,8 +3609,7 @@ fn replace_dir(from: &Path, to: &Path) -> Result<()> {
 fn atomic_replace_dir(from: &Path, to: &Path) -> Result<()> {
     let parent = to
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let backup = parent.join(format!(
         ".{}-old-{}",
         to.file_name()
@@ -3732,11 +3722,10 @@ fn shell_quote_str(value: &str) -> String {
 }
 
 fn image_build_script() -> PathBuf {
-    std::env::var_os("PETRI_IMAGE_BUILD_SCRIPT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/build-base-image.sh")
-        })
+    std::env::var_os("PETRI_IMAGE_BUILD_SCRIPT").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/build-base-image.sh"),
+        PathBuf::from,
+    )
 }
 
 pub fn usage() -> String {

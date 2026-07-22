@@ -362,7 +362,7 @@ mod tests {
             let request = Message::from_bytes(raw).unwrap();
             let q = request.queries.first().unwrap().clone();
             let name = q.name().clone();
-            let mut response = request.clone();
+            let mut response = request;
             response.metadata.message_type = MessageType::Response;
             response.answers.push(Record::from_rdata(
                 name.clone(),

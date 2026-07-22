@@ -44,7 +44,7 @@ impl LayerId {
         for (i, b) in bytes.iter_mut().enumerate() {
             *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
         }
-        Some(LayerId(bytes))
+        Some(Self(bytes))
     }
 }
 
@@ -593,7 +593,7 @@ mod tests {
             let dir =
                 std::env::temp_dir().join(format!("petri-nbd-seal-{}-{}", std::process::id(), n));
             fs::create_dir_all(&dir).unwrap();
-            TestDir(dir)
+            Self(dir)
         }
         fn path(&self, name: &str) -> PathBuf {
             self.0.join(name)
@@ -775,7 +775,7 @@ mod tests {
 
         // Flipping a metadata byte trips the CRC check.
         let bad_meta = dir.path("bad-meta.bin");
-        let mut m = bytes.clone();
+        let mut m = bytes;
         let meta_byte = m.len() - FOOTER_SIZE - 1; // last byte of the metadata blob
         m[meta_byte] ^= 0xFF;
         fs::write(&bad_meta, &m).unwrap();

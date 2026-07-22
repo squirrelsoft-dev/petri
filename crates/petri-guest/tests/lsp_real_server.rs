@@ -26,8 +26,7 @@ fn have(binary: &str) -> bool {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+            .is_ok_and(|status| status.success())
     })
 }
 
@@ -47,7 +46,7 @@ fn manager(language: &str, binary: &str, args: &[&str], workspace: &Path) -> Lsp
         servers: vec![LspServerConfig {
             language: language.to_string(),
             binary: binary.to_string(),
-            args: args.iter().map(|a| a.to_string()).collect(),
+            args: args.iter().map(std::string::ToString::to_string).collect(),
         }],
     };
     LspManager::new(config, workspace.to_path_buf())

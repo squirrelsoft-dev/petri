@@ -39,7 +39,7 @@ fn run() -> Result<(), String> {
         args.next()
             .ok_or("usage: <nocloud.raw> <cidata.iso> [secs]")?,
     );
-    let secs: u64 = args.next().map(|s| s.parse().unwrap_or(120)).unwrap_or(120);
+    let secs: u64 = args.next().map_or(120, |s| s.parse().unwrap_or(120));
     for p in [&raw, &cidata] {
         if !p.exists() {
             return Err(format!("missing input: {}", p.display()));
@@ -113,7 +113,7 @@ fn run() -> Result<(), String> {
     let mut wrote = false;
     while Instant::now() < deadline {
         thread::sleep(Duration::from_secs(2));
-        let len = fs::metadata(&scratch_path).map(|m| m.len()).unwrap_or(0);
+        let len = fs::metadata(&scratch_path).map_or(0, |m| m.len());
         let status = helper_status(&control_sock).unwrap_or_default();
         print!(
             "\r  scratch={len} bytes, vm={:<8}",
@@ -203,7 +203,7 @@ fn helper_status(sock: &Path) -> Option<String> {
     text.split("\"status\"")
         .nth(1)
         .and_then(|s| s.split('"').nth(1))
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
 }
 
 fn yn(b: bool) -> &'static str {

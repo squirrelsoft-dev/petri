@@ -333,7 +333,7 @@ fn validate_allowlist(entries: Vec<String>) -> Result<Vec<String>, PolicyError> 
                 "network allowlist entries must be non-empty".to_string(),
             ));
         }
-        if entry.chars().any(|ch| ch.is_whitespace()) {
+        if entry.chars().any(char::is_whitespace) {
             return Err(PolicyError::Invalid(format!(
                 "network allowlist entry '{entry}' must not contain whitespace"
             )));

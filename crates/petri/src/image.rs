@@ -173,10 +173,10 @@ pub fn images_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("PETRI_IMAGES_DIR") {
         return PathBuf::from(dir);
     }
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".petri").join("images"))
-        .unwrap_or_else(|| std::env::temp_dir().join("petri").join("images"))
+    std::env::var_os("HOME").map(PathBuf::from).map_or_else(
+        || std::env::temp_dir().join("petri").join("images"),
+        |home| home.join(".petri").join("images"),
+    )
 }
 
 /// Filesystem paths for one named image under `<images-root>/<name>/`.
@@ -314,8 +314,7 @@ pub fn create_scratch(path: &Path, geometry: Geometry) -> Result<ScratchLayer> {
 pub fn rfc3339_now() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     rfc3339_from_unix(secs)
 }
 
@@ -646,7 +645,7 @@ fn delete_scratch(
 
     // A scratch that has written blocks is real data; require --force to drop it.
     let data = paths.scratch_data();
-    let non_empty = fs::metadata(&data).map(|m| m.len() > 0).unwrap_or(false);
+    let non_empty = fs::metadata(&data).is_ok_and(|m| m.len() > 0);
     if non_empty && !force {
         return Err(PetriError::Cli(format!(
             "{name}:scratch has written data; pass --force to delete"
@@ -957,7 +956,7 @@ pub fn auto_freeze(
             source,
         })?;
     let geometry = sealed.geometry();
-    let size_bytes = fs::metadata(&staging).map(|m| m.len()).unwrap_or(0);
+    let size_bytes = fs::metadata(&staging).map_or(0, |m| m.len());
     drop(sealed); // release the handle on the staging file before adopting it
 
     let id = store
@@ -1536,7 +1535,7 @@ mod tests {
     fn freeze_with_data(root: &Path, name: &str, tag: &str, writes: &[(u64, Vec<u8>)]) -> LayerId {
         let paths = ImagePaths::new(root, name);
         let meta = load_meta(&paths).unwrap();
-        let scratch_meta = meta.scratch.clone().unwrap();
+        let scratch_meta = meta.scratch.unwrap();
         let lower = lower_layers_for(root, scratch_meta.parent_id.as_deref()).unwrap();
         let geometry = match lower.first() {
             Some(layer) => layer.geometry(),

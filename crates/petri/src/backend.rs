@@ -507,7 +507,7 @@ impl MacosBackend {
             host_policy: policy,
             guest_policy,
             image: state_image,
-            metadata: config.metadata.clone(),
+            metadata: config.metadata,
             transport: GuestTransport::Vsock,
             vm,
         };
@@ -581,7 +581,7 @@ impl MacosBackend {
             image: config.image.clone(),
             metadata: config.metadata.clone(),
             transport: GuestTransport::TcpLoopback,
-            vm: MacosVmSpec::loopback(config.image.clone()),
+            vm: MacosVmSpec::loopback(config.image),
         };
         self.write_state(&state)?;
 
@@ -1079,7 +1079,6 @@ pub fn bundle_boot_files(bundle_dir: &Path) -> Result<BundleBootFiles> {
         cmdline: bundle
             .manifest
             .kernel_command_line
-            .clone()
             .filter(|cmdline| !cmdline.is_empty())
             .ok_or_else(|| missing("kernel_command_line"))?,
     })
@@ -1183,8 +1182,7 @@ impl ImageManifest {
             if self
                 .kernel
                 .as_ref()
-                .map(|path| path.as_os_str().is_empty())
-                .unwrap_or(true)
+                .is_none_or(|path| path.as_os_str().is_empty())
             {
                 return Err(PetriError::InvalidConfig(
                     "linux boot image kernel path must be non-empty".to_string(),
@@ -1325,15 +1323,11 @@ fn default_state_dir() -> PathBuf {
 }
 
 fn default_helper_binary() -> PathBuf {
-    env::var_os("PETRI_VZ_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("petri-vz"))
+    env::var_os("PETRI_VZ_BIN").map_or_else(|| PathBuf::from("petri-vz"), PathBuf::from)
 }
 
 fn default_guest_binary() -> PathBuf {
-    env::var_os("PETRI_GUEST_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("petri-guest"))
+    env::var_os("PETRI_GUEST_BIN").map_or_else(|| PathBuf::from("petri-guest"), PathBuf::from)
 }
 
 fn default_dispatch_port() -> u32 {
@@ -1349,9 +1343,7 @@ fn default_runtime_lifecycle() -> LifecycleState {
 }
 
 fn loopback_fallback_enabled() -> bool {
-    env::var("PETRI_MACOS_BACKEND_FALLBACK")
-        .map(|value| value == "loopback")
-        .unwrap_or(false)
+    env::var("PETRI_MACOS_BACKEND_FALLBACK").is_ok_and(|value| value == "loopback")
 }
 
 fn canonical_bundle_file(bundle_dir: &Path, relative: &Path, name: &str) -> Result<PathBuf> {
@@ -1513,7 +1505,7 @@ fn wait_for_helper_ready(
             Ok(HelperResponse::Ready) => return Ok(()),
             Ok(HelperResponse::Error { message }) => return Err(backend_error(message)),
             Ok(_) | Err(_) if started.elapsed() < timeout => {
-                thread::sleep(Duration::from_millis(100))
+                thread::sleep(Duration::from_millis(100));
             }
             Ok(other) => {
                 return Err(backend_error(format!(

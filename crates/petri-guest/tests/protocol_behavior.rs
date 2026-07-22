@@ -137,7 +137,7 @@ fn accepts_valid_dispatch_and_captures_process_result() {
         "args": {
             "command": "printf",
             "argv": ["hello"],
-            "cwd": workspace.clone(),
+            "cwd": workspace,
         }
     })
     .to_string();
@@ -177,7 +177,7 @@ fn rejects_command_disallowed_by_policy() {
         "tool": "bash_command",
         "args": {
             "command": "false",
-            "cwd": workspace.clone(),
+            "cwd": workspace,
         }
     })
     .to_string();
@@ -200,7 +200,7 @@ fn reports_non_zero_exit_as_command_failure() {
         "tool": "bash_command",
         "args": {
             "command": "false",
-            "cwd": workspace.clone(),
+            "cwd": workspace,
         }
     })
     .to_string();
@@ -224,7 +224,7 @@ fn times_out_when_request_limit_is_exceeded() {
         "args": {
             "command": "sleep",
             "argv": ["1"],
-            "cwd": workspace.clone(),
+            "cwd": workspace,
         },
         "limits": {
             "timeout_ms": 20,
@@ -250,7 +250,7 @@ fn truncates_output_to_request_limit() {
         "args": {
             "command": "printf",
             "argv": ["abcdef"],
-            "cwd": workspace.clone(),
+            "cwd": workspace,
         },
         "limits": {
             "max_output_bytes": 4,

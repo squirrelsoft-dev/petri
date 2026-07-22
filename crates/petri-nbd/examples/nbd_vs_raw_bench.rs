@@ -49,7 +49,7 @@ fn run() -> Result<(), String> {
         args.next()
             .unwrap_or_else(|| "target/petri-images/base".into()),
     );
-    let iters: usize = args.next().map(|s| s.parse().unwrap_or(2)).unwrap_or(2);
+    let iters: usize = args.next().map_or(2, |s| s.parse().unwrap_or(2));
 
     let helper = PathBuf::from("crates/petri-vz/.build/debug/petri-vz");
     let kernel = bundle.join("vmlinuz");

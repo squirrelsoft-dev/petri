@@ -33,7 +33,7 @@ fn run() -> Result<(), String> {
         args.next()
             .ok_or("usage: nbd_data_disk_smoke <nocloud.raw> [secs]")?,
     );
-    let secs: u64 = args.next().map(|s| s.parse().unwrap_or(45)).unwrap_or(45);
+    let secs: u64 = args.next().map_or(45, |s| s.parse().unwrap_or(45));
     if !raw.exists() {
         return Err(format!("nocloud image not found: {}", raw.display()));
     }
@@ -107,7 +107,7 @@ fn run() -> Result<(), String> {
 
     let helper_text = fs::read_to_string(&helper_log).unwrap_or_default();
     let console_text = fs::read_to_string(&console_log).unwrap_or_default();
-    let scratch_len = fs::metadata(&scratch_path).map(|m| m.len()).unwrap_or(0);
+    let scratch_len = fs::metadata(&scratch_path).map_or(0, |m| m.len());
 
     println!("=== petri-vz helper log (tail) ===");
     let lines: Vec<&str> = helper_text.lines().collect();

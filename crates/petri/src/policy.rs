@@ -67,10 +67,10 @@ pub fn policies_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("PETRI_POLICIES_DIR") {
         return PathBuf::from(dir);
     }
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".petri").join("policies"))
-        .unwrap_or_else(|| std::env::temp_dir().join("petri").join("policies"))
+    std::env::var_os("HOME").map(PathBuf::from).map_or_else(
+        || std::env::temp_dir().join("petri").join("policies"),
+        |home| home.join(".petri").join("policies"),
+    )
 }
 
 /// Path of a user template file under the registry root.
@@ -178,17 +178,17 @@ enum Source {
 impl Source {
     fn user_for(name: &str) -> Self {
         if builtin(name).is_some() {
-            Source::Override
+            Self::Override
         } else {
-            Source::User
+            Self::User
         }
     }
 
     fn label(self) -> &'static str {
         match self {
-            Source::Builtin => "builtin",
-            Source::User => "user",
-            Source::Override => "override",
+            Self::Builtin => "builtin",
+            Self::User => "user",
+            Self::Override => "override",
         }
     }
 }

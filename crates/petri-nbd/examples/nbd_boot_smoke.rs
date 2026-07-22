@@ -48,7 +48,7 @@ fn run() -> Result<(), String> {
         args.next()
             .unwrap_or_else(|| "target/petri-images/base".into()),
     );
-    let boot_secs: u64 = args.next().map(|s| s.parse().unwrap_or(45)).unwrap_or(45);
+    let boot_secs: u64 = args.next().map_or(45, |s| s.parse().unwrap_or(45));
 
     let helper = PathBuf::from("crates/petri-vz/.build/debug/petri-vz");
     if !helper.exists() {
@@ -147,9 +147,9 @@ fn run() -> Result<(), String> {
     let mut peak_scratch = 0u64;
     while Instant::now() < deadline {
         thread::sleep(Duration::from_secs(2));
-        let scratch_len = fs::metadata(&scratch_path).map(|m| m.len()).unwrap_or(0);
+        let scratch_len = fs::metadata(&scratch_path).map_or(0, |m| m.len());
         peak_scratch = peak_scratch.max(scratch_len);
-        let console_len = fs::metadata(&console_log).map(|m| m.len()).unwrap_or(0);
+        let console_len = fs::metadata(&console_log).map_or(0, |m| m.len());
         println!(
             "  t+{:>3}s  scratch={:>9} KiB  console={:>7} B  {}",
             (boot_secs as i64) - (deadline - Instant::now()).as_secs() as i64,
@@ -173,7 +173,7 @@ fn run() -> Result<(), String> {
     let _ = child.wait();
     let _ = server.shutdown();
 
-    let final_scratch = fs::metadata(&scratch_path).map(|m| m.len()).unwrap_or(0);
+    let final_scratch = fs::metadata(&scratch_path).map_or(0, |m| m.len());
     let base_meta_after = fs::metadata(&disk).map_err(|e| e.to_string())?;
     let base_mtime_after = base_meta_after.modified().ok();
     let base_unchanged =

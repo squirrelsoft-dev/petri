@@ -169,13 +169,13 @@ fn serve_scratch_overlay(image: &Path, scratch_dir: &Path) -> Result<(DirectBoot
     let scratch_path = scratch_dir.join(SCRATCH_FILE);
     // Ephemeral: a leftover scratch from a previous boot would resurrect that
     // run's filesystem, so start empty every time.
-    if let Err(source) = std::fs::remove_file(&scratch_path) {
-        if source.kind() != std::io::ErrorKind::NotFound {
-            return Err(PetriError::Io {
-                path: scratch_path,
-                source,
-            });
-        }
+    if let Err(source) = std::fs::remove_file(&scratch_path)
+        && source.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(PetriError::Io {
+            path: scratch_path,
+            source,
+        });
     }
 
     let io_err = |path: &Path| {
@@ -426,9 +426,10 @@ impl<B: HostBackend> Commands<'_, B> {
             .cwd
             .clone()
             .unwrap_or_else(|| PathBuf::from(crate::instance::GUEST_WORKSPACE_PATH));
-        let request_id = options.request_id.clone().map(Ok).unwrap_or_else(|| {
-            Ok::<_, PetriError>(format!("commands-run-{}", generate_sandbox_id()?))
-        })?;
+        let request_id = options.request_id.clone().map_or_else(
+            || Ok::<_, PetriError>(format!("commands-run-{}", generate_sandbox_id()?)),
+            Ok,
+        )?;
         let limits = options.limits();
         let request = DispatchRequest::bash_command(
             request_id,

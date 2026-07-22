@@ -82,7 +82,7 @@ pub fn handle_frame(
     };
 
     let id = request_id_from_value(&value);
-    let request = match serde_json::from_value::<DispatchRequest>(value.clone()) {
+    let request = match serde_json::from_value::<DispatchRequest>(value) {
         Ok(request) => request,
         Err(err) => {
             return ResultFrame::rejected(
@@ -505,8 +505,9 @@ fn effective_timeout(request: &DispatchRequest, policy: &Policy) -> Duration {
         .as_ref()
         .and_then(|limits| limits.timeout_ms)
         .map(Duration::from_millis)
-        .map(|request_timeout| request_timeout.min(policy_timeout))
-        .unwrap_or(policy_timeout)
+        .map_or(policy_timeout, |request_timeout| {
+            request_timeout.min(policy_timeout)
+        })
 }
 
 fn effective_output_cap(request: &DispatchRequest, policy: &Policy) -> usize {
@@ -519,12 +520,11 @@ fn effective_output_cap(request: &DispatchRequest, policy: &Policy) -> usize {
         .limits
         .as_ref()
         .and_then(|limits| limits.max_output_bytes)
-        .map(|request_cap| {
+        .map_or(policy_cap, |request_cap| {
             usize::try_from(request_cap)
                 .unwrap_or(usize::MAX)
                 .min(policy_cap)
         })
-        .unwrap_or(policy_cap)
 }
 
 /// Minimal environment handed to every workload before the request env is
@@ -822,9 +822,13 @@ fn join_reader(handle: Option<thread::JoinHandle<()>>) {
 
 fn finish_output(output: Arc<Mutex<CapturedOutput>>) -> FinishedOutput {
     let output = match Arc::try_unwrap(output) {
-        Ok(output) => output.into_inner().unwrap_or_else(|err| err.into_inner()),
+        Ok(output) => output
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
         Err(output) => {
-            let mut output = output.lock().unwrap_or_else(|err| err.into_inner());
+            let mut output = output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             std::mem::replace(&mut *output, CapturedOutput::new(0))
         }
     };
@@ -935,7 +939,7 @@ mod tests {
             "args": {
                 "command": "printf",
                 "argv": ["hello"],
-                "cwd": workspace.clone(),
+                "cwd": workspace,
             }
         })
         .to_string();
@@ -960,7 +964,7 @@ mod tests {
             "args": {
                 "command": "sh",
                 "argv": ["-c", "printf '%s:' \"$PETRI_TEST_VALUE\"; cat"],
-                "cwd": workspace.clone(),
+                "cwd": workspace,
                 "env": {
                     "PETRI_TEST_VALUE": "env-ok"
                 },
@@ -994,7 +998,7 @@ mod tests {
             "args": {
                 "command": "sh",
                 "argv": ["-c", format!("printf '%s' \"${{{var}:-clean}}\"")],
-                "cwd": workspace.clone(),
+                "cwd": workspace,
             }
         })
         .to_string();
@@ -1016,7 +1020,7 @@ mod tests {
             "tool": "bash_command",
             "args": {
                 "command": "false",
-                "cwd": workspace.clone(),
+                "cwd": workspace,
             }
         })
         .to_string();
@@ -1037,7 +1041,7 @@ mod tests {
             "args": {
                 "command": "printf",
                 "argv": ["ok"],
-                "cwd": workspace.clone(),
+                "cwd": workspace,
                 "future_arg": true,
             },
             "future_field": true,
@@ -1103,7 +1107,7 @@ mod tests {
             "args": {
                 "command": "sleep",
                 "argv": ["1"],
-                "cwd": workspace.clone(),
+                "cwd": workspace,
             },
             "limits": {
                 "timeout_ms": 20,
@@ -1128,7 +1132,7 @@ mod tests {
             "args": {
                 "command": "printf",
                 "argv": ["abcdef"],
-                "cwd": workspace.clone(),
+                "cwd": workspace,
             },
             "limits": {
                 "max_output_bytes": 4,
@@ -1174,7 +1178,7 @@ mod tests {
             "args": {
                 "command": "printf",
                 "argv": ["ok"],
-                "cwd": workspace.clone(),
+                "cwd": workspace,
             }
         })
         .to_string()
@@ -1247,7 +1251,7 @@ mod tests {
             "protocol_version": 1,
             "id": "r1",
             "tool": "bash_command",
-            "args": { "command": "printf", "argv": ["hi"], "cwd": workspace.clone() }
+            "args": { "command": "printf", "argv": ["hi"], "cwd": workspace }
         })
         .to_string();
         let denied = handle_frame(&printf, &policy, &lsp, &mut active, &net);

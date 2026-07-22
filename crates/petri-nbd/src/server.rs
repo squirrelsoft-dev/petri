@@ -495,7 +495,7 @@ mod tests {
             let _flags = read_u16(&mut s)?;
             let mut pad = [0u8; 124];
             s.read_exact(&mut pad)?;
-            Ok((Client(s), size))
+            Ok((Self(s), size))
         }
 
         /// Connect via the modern `GO` path and return (client, size).
@@ -531,7 +531,7 @@ mod tests {
                     break;
                 }
             }
-            Ok((Client(s), size))
+            Ok((Self(s), size))
         }
 
         fn command(
