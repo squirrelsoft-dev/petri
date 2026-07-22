@@ -118,15 +118,17 @@ impl NbdHandle {
         &self.url
     }
 
-    /// Seal the served stack's scratch overlay into an immutable layer under
-    /// `dir`, without interrupting the export (the scratch stays live). Use
-    /// after the guest has quiesced its writes (e.g. VM stopped) for a
-    /// consistent snapshot.
-    pub fn seal_scratch(&self, dir: &Path, parents: &[LayerId]) -> io::Result<ImmutableLayer> {
+    /// Seal the served stack's scratch overlay into a self-describing
+    /// immutable layer file at `path`, without interrupting the export (the
+    /// scratch stays live). Use after the guest has quiesced its writes
+    /// (e.g. VM stopped) for a consistent snapshot.
+    ///
+    /// `path` is the layer file to create, not a directory to create it in.
+    pub fn seal_scratch(&self, path: &Path, parents: &[LayerId]) -> io::Result<ImmutableLayer> {
         self.disk
             .lock()
             .expect("disk mutex poisoned")
-            .seal_scratch(dir, parents)
+            .seal_scratch(path, parents)
     }
 
     /// Stop accepting connections and join the accept loop.
@@ -661,6 +663,79 @@ mod tests {
         assert_eq!(err, EINVAL);
         c.disconnect().unwrap();
         server.shutdown().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end: serve an export, write to it over the NBD wire, seal the
+    /// scratch through the live handle, then reopen the sealed layer and
+    /// confirm the bytes that went over the socket are the bytes on disk.
+    ///
+    /// The write is deliberately unaligned and block-spanning so it drives the
+    /// read-modify-write path (partial head block, whole middle, partial tail)
+    /// rather than the easy whole-block case, and the base underneath is
+    /// non-zero so a dropped write shows up as base data instead of zeroes.
+    #[test]
+    fn serve_write_seal_reopen_roundtrip() {
+        let dir = unique_dir();
+        let sock = dir.join("nbd.sock");
+        let server = NbdServer::serve(
+            base_disk(&dir),
+            ServeOpts {
+                bind: BindMode::UnixSocket(sock.clone()),
+                export_name: "petri".into(),
+                read_only: false,
+            },
+        )
+        .unwrap();
+
+        // Straddle a block boundary: 6 bytes into block 1, running 20 bytes
+        // across into block 2 (BS is 16).
+        let offset = u64::from(BS) + 6;
+        let payload: Vec<u8> = (0..20u8).map(|i| 0xE0 ^ i).collect();
+
+        let stream = UnixStream::connect(&sock).unwrap();
+        let (mut client, size) = Client::export_name(stream).unwrap();
+        assert_eq!(size, VSIZE);
+        assert_eq!(client.write(offset, &payload).unwrap(), 0);
+
+        // Read back over the wire before sealing.
+        let (err, got) = client.read(offset, payload.len() as u32).unwrap();
+        assert_eq!(err, 0);
+        assert_eq!(got, payload, "NBD read did not return what was written");
+        client.disconnect().unwrap();
+
+        // Seal through the live handle — the export stays up.
+        let sealed_path = dir.join("sealed.layer");
+        let sealed = server.seal_scratch(&sealed_path, &[]).unwrap();
+        let content_id = sealed.content_id().expect("sealed layer has a content id");
+        drop(sealed);
+        server.shutdown().unwrap();
+
+        // Reopen the sealed layer standalone and stack it over the same base.
+        let reopened = ImmutableLayer::open_sealed(&sealed_path).unwrap();
+        assert_eq!(reopened.content_id(), Some(content_id));
+
+        let base_path = dir.join("base.raw");
+        let base = ImmutableLayer::open_raw_base(&base_path, geometry()).unwrap();
+        let fresh_scratch = ScratchLayer::create(&dir.join("scratch2.data"), geometry()).unwrap();
+        let mut disk = LayeredDisk::new(vec![base, reopened], fresh_scratch).unwrap();
+
+        // The written span survives the seal.
+        let mut got = vec![0u8; payload.len()];
+        disk.read_at(offset, &mut got).unwrap();
+        assert_eq!(got, payload, "sealed layer lost the bytes written over NBD");
+
+        // The untouched head of block 1 still shows the base through the
+        // sealed layer, proving the partial-block merge kept the old bytes.
+        let mut head = vec![0u8; 6];
+        disk.read_at(u64::from(BS), &mut head).unwrap();
+        assert_eq!(head, vec![0xB1; 6], "read-modify-write clobbered the head");
+
+        // A block the write never reached still reads from the base.
+        let mut untouched = vec![0u8; BS as usize];
+        disk.read_at(4 * u64::from(BS), &mut untouched).unwrap();
+        assert_eq!(untouched, vec![0xB4; BS as usize]);
+
         let _ = fs::remove_dir_all(&dir);
     }
 

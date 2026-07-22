@@ -787,7 +787,19 @@ mod tests {
     fn layer_id_hex_roundtrips_length() {
         let dir = TestDir::new();
         let id = seal_with(&dir, "x", 0x42, &[]).content_id().unwrap();
-        assert_eq!(id.to_hex().len(), 64);
-        assert_eq!(id.to_hex(), format!("{id}"));
+        let hex = id.to_hex();
+        assert_eq!(hex.len(), 64);
+        assert_eq!(hex, format!("{id}"));
+
+        // The case is load-bearing, not cosmetic: LayerStore names layer files
+        // after this string, so flipping it orphans every layer already on
+        // disk under a case-sensitive filesystem. `from_hex` accepts either
+        // case, so a round-trip test alone cannot catch a change here.
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase()),
+            "layer ids must render as lowercase hex, got {hex}"
+        );
+        assert_eq!(LayerId::from_hex(&hex), Some(id));
     }
 }
