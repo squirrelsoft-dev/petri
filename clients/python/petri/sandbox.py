@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol, overload
 
 from petri._cli import Runner, check_cli_result, make_default_runner
 from petri.errors import (
@@ -368,9 +368,14 @@ class Sandbox:
     # ------------------------------------------------------------------
     # Instance lifecycle
     # ------------------------------------------------------------------
-    # NOTE: ``kill`` is injected by ``_KillDescriptor`` after the class body
-    # so it can act as *both* a classmethod (``Sandbox.kill("id")``) and an
-    # instance method (``sandbox.kill()``). Do not define ``kill`` here.
+    # ``kill`` is installed by ``_KillDescriptor`` after the class body so it
+    # can act as *both* a classmethod (``Sandbox.kill("id")``) and an instance
+    # method (``sandbox.kill()``). Do not assign it here — but the annotation
+    # below is required: it is what lets type checkers see the attribute at
+    # all, and it binds the descriptor's overloads to both call forms. An
+    # annotation creates no attribute at runtime, so the assignment at the
+    # bottom of the module remains the only definition.
+    kill: _KillDescriptor
 
     def get_info(
         self,
@@ -547,13 +552,46 @@ def _kill_sandbox(
     check_cli_result(stdout_text, stderr_text, returncode)
 
 
+class _ClassKill(Protocol):
+    """``Sandbox.kill("sb-1")`` — the sandbox id is required."""
+
+    def __call__(
+        self,
+        sandbox_id: str,
+        *,
+        petri_path: str | None = ...,
+        runner: Runner | None = ...,
+    ) -> None: ...
+
+
+class _InstanceKill(Protocol):
+    """``sandbox.kill()`` — the id comes from the bound instance."""
+
+    def __call__(
+        self,
+        *,
+        petri_path: str | None = ...,
+        runner: Runner | None = ...,
+    ) -> None: ...
+
+
 class _KillDescriptor:
     """Descriptor that makes ``Sandbox.kill`` work as both a classmethod and
     an instance method.
 
     - ``Sandbox.kill(sandbox_id, ...)``  — class-level static kill
     - ``sandbox.kill(...)``              — kills this instance's sandbox
+
+    The overloads let a type checker tell those two forms apart, so the
+    class-level call still requires a sandbox id and the instance-level call
+    still rejects one.
     """
+
+    @overload
+    def __get__(self, obj: None, objtype: type | None = ...) -> _ClassKill: ...
+
+    @overload
+    def __get__(self, obj: Sandbox, objtype: type | None = ...) -> _InstanceKill: ...
 
     def __get__(
         self, obj: "Sandbox | None", objtype: type | None = None
@@ -585,7 +623,7 @@ class _KillDescriptor:
             return _instance_kill
 
 
-Sandbox.kill = _KillDescriptor()  # type: ignore[attr-defined]
+Sandbox.kill = _KillDescriptor()
 
 
 def _build_create_argv(

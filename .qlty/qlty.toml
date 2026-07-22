@@ -70,6 +70,9 @@ name = "bandit"
 [[plugin]]
 name = "gofmt"
 
+[[plugin]]
+name = "mypy"
+
 # ─── Why Rust is not linted by qlty ───────────────────────────────────────────
 # qlty pins its own Rust runtime at 1.77.2, which predates edition 2024
 # (stabilized in Rust 1.85). This workspace is edition 2024, so qlty's cargo
